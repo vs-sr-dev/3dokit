@@ -211,7 +211,8 @@ both discs:
   slot by the SDK's name, but implements only the beginning: `kprintf`, the
   AIF startup's slot -120 (the kernel's command-line parser), items
   (`FindItem` by type and name, `OpenItem`, `CloseItem`, `LookupItem`, the
-  folios registered as items), the File folio's `ChangeDirectory`, and
+  folios registered as items), `memset` and `memcpy` (a memmove, as the
+  1993 kernel's is), the File folio's `ChangeDirectory`, and
   memory: the MemHdrs, the OS's and the task's MemLists in `mem.h`'s
   layout, `AllocMemFromMemLists`, `FreeMemToMemLists`, `ScavengeMem`,
   `GetPageSize`, `FindMH` and `AllocMemBlocks` as the 1993 kernel does them

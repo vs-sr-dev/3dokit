@@ -61,6 +61,23 @@ static void k_kprintf(ArmCpu& c) {
 // command line (the word is 0), and then argc and argv go on untouched.
 static void k_startup(ArmCpu& c) { (void)c; }
 
+// Kernel -52: void* memset(void* p, int c, size_t n) -- the destination back
+static void k_memset(ArmCpu& c) {
+    uint32_t p = c.r[0], v = c.r[1] & 0xff;
+    for (uint32_t i = 0; i < c.r[2]; ++i) pf_w8(p + i, v);
+}
+
+// Kernel -56: void* memcpy(void* d, const void* s, size_t n) -- the 1993 kernel's (0x1130c)
+// copies backwards when the source is below the destination: a memmove. The destination back.
+static void k_memcpy(ArmCpu& c) {
+    uint32_t d = c.r[0], s = c.r[1], n = c.r[2];
+    if (s < d) {
+        for (uint32_t i = n; i-- > 0;) pf_w8(d + i, pf_r8(s + i));
+    } else if (s > d) {
+        for (uint32_t i = 0; i < n; ++i) pf_w8(d + i, pf_r8(s + i));
+    }
+}
+
 // ---- lists (list.h) ------------------------------------------------------------------------
 // What the kernel's own InitList, AddHead, AddTail, InsertNodeFromTail and RemNode do. The
 // anchor's two halves are pseudo-nodes: the first node's n_Prev is the list + 0x14, the last
@@ -175,6 +192,8 @@ void pf_kernel_init() {
     pf_on_swi(0x10008, k_closeitem);
     pf_on_slot(PF_KERNEL, -120, k_startup);
     pf_on_slot(PF_KERNEL, -48, k_lookupitem);
+    pf_on_slot(PF_KERNEL, -52, k_memset);
+    pf_on_slot(PF_KERNEL, -56, k_memcpy);
     // the folios a program finds by name: MKNODEID(KERNELNODE, FOLIONODE)
     for (int f = PF_GRAPHICS; f < PF_NFOLIOS; ++f)
         pf_item_new(pf_folio_base((PfFolio)f), 1, 4, g_pf_folio_names[f]);
