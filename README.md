@@ -73,6 +73,7 @@ python -m 3dokit.recomp --out build/recomp GAME=GAME --optest   # C++, one modul
 python -m 3dokit.recomp.selftest --image GAME=GAME --auto --out build/recomp/selftest/game.txt
 cmake -S build/recomp -B build/recomp-build -G Ninja -DCMAKE_CXX_COMPILER=clang++
 ninja -C build/recomp-build && build/recomp-build/selftest build/recomp/selftest/*.txt
+build/recomp-build/pfboot GAME [--trace 2] [--lenient]   # on the Portfolio runtime, OS calls traced
 python -m 3dokit.shapes library GAME --corpus 'build/disc/System/Programs/*'
 python -m 3dokit.shapes pair A B --names a.sym --out b.sym
 python -m 3dokit.cel FILE --png out/                  # frames as RGBA PNG
@@ -134,7 +135,7 @@ both discs:
 | 2. Extract | Turn standard formats into standard files | `disc --extract`, `cel` (every depth and coding, PLUTA, the hardware's transparency, `IMAG`), `stream`, `cinepak`, `audio` (SDX2, AIFF/AIFC, loops), `dsp`, `pixels` | the streamed-cel subscriber (`SCEL`); AIF decompression |
 | 3. Map code | What does the code do, where? | `arm` (functions, calls, tail calls, references, control flow, symbols, the compiler's embedded names), `portfolio` (SWIs and folio vectors, attributed and named), `sdk` (the SDK's names for every SWI and slot), `aof` (the SDK's ARM Object Format libraries), `shapes` (library proved against a corpus; two programs paired, names carried, a data map) | a corpus from the SDK's own libraries for `shapes` |
 | 4. Translate | Turn ARM60 code into C | `arm60` (the instruction set, ARMv3 exactly), `armemu` (an ARM60 interpreter: the reference), `recomp.discover` (functions, code and data, switches, indirect transfers), `recomp.emit` and `python -m 3dokit.recomp` (C++ per function, a module per program), `recomp.selftest` (the interpreter records, the C++ replays) | flags only where read; literal pools folded; returns that are not to their call (longjmp) |
-| 5. Runtime | What an engine links | `runtime/` (C99): `tdk_opera` (files out of a disc image), `tdk_cel` (cels to RGBA), `tdk_stream` (DataStream, Cinepak with an optional dither, SDX2); `tdkcheck`. For recompiled code (C++20): `arm60.h` (the CPU, memory, the shifter and the flags), `arm_core` (dispatch, the return check), `arm_stub` (no OS: the self-test), `arm_selftest` | Portfolio at the folio boundary (the SWIs, the folio tables); the CEL engine proper: quads, PIXC, the pixel processor |
+| 5. Runtime | What an engine links | `runtime/` (C99): `tdk_opera` (files out of a disc image), `tdk_cel` (cels to RGBA), `tdk_stream` (DataStream, Cinepak with an optional dither, SDX2); `tdkcheck`. For recompiled code (C++20): `arm60.h` (the CPU, memory, the shifter and the flags), `arm_core` (dispatch, the return check), `arm_stub` (no OS: the self-test), `arm_selftest`; `pf` (Portfolio's frame: the boot, the OS's memory above VRAM, folio tables of traps, SWI and slot dispatch by the SDK's names, the trace) and `pfboot` | Portfolio's functions: items, memory lists, signals and messages, tasks, the File folio and the CD device; the CEL engine proper: quads, PIXC, the pixel processor |
 
 ## Principles
 
@@ -200,9 +201,12 @@ both discs:
 * **`SCEL`**, the streamed-cel subscriber, and `CTRL`'s `GOTO`/`ALRM` are
   carried, not read. The `FHDR` scale word is not a reliable frame rate.
 * **The DSP's instructions** are carried, not read.
-* **The recompiled code runs only what needs no OS.** `arm_stub` stops on
-  every SWI and every call outside the program; Portfolio at the folio
-  boundary is the next layer. The emitter computes every flag it sets
+* **Portfolio is a frame, not yet an OS.** `pfboot` boots a program, lays
+  out KernelBase and the folio tables, and dispatches every SWI and vector
+  slot by the SDK's name, but implements only the Kernel's `kprintf` and the
+  AIF startup's slot -120: Crash 'n Burn's `launchme` runs to its first
+  `ChangeDirectory`. Items (`FindItem`, `OpenItem`, `LookupItem`) and the
+  folios found through them come first. The emitter computes every flag it sets
   (no liveness pass yet), reads literal pools from memory rather than
   folding them, and a return to anywhere but its call's next word stops
   (`arm_bad_return`): the startup's hand-over and any longjmp are still to

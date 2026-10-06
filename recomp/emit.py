@@ -338,7 +338,7 @@ class Body:
                 text = self._goto(i.target, a)
                 on = cond is not None
         elif k == 'swi':
-            text = 'arm_swi(c, %s);' % _h(i.imm)
+            text = 'arm_swi(c, %s, %s);' % (_h(i.imm), _h(a))
             self._count('swi')
             if i.imm == 0x11 and cond is None:
                 on = False

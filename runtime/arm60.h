@@ -41,7 +41,7 @@ struct ArmModule {
 enum : uint32_t { ARM_MEM_SIZE = 0x300000u };   // DRAM 0-0x1FFFFF, VRAM 0x200000-0x2FFFFF
 extern uint8_t g_arm_mem[];
 void     arm_call(ArmCpu& c, uint32_t addr);         // a call or jump through a register
-void     arm_swi(ArmCpu& c, uint32_t number);        // the OS's door
+void     arm_swi(ArmCpu& c, uint32_t number, uint32_t site);   // the OS's door; site: the swi's address
 void     arm_poll(ArmCpu& c);                        // the budget is spent: time, other threads
 void     arm_bad_return(ArmCpu& c, uint32_t expected);   // a return went elsewhere
 [[noreturn]] void arm_fault(ArmCpu& c, uint32_t addr, const char* why);

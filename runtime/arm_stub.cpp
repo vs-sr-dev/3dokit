@@ -12,10 +12,10 @@
     std::exit(3);
 }
 
-void arm_swi(ArmCpu& c, uint32_t number) {
+void arm_swi(ArmCpu& c, uint32_t number, uint32_t site) {
     char why[48];
     std::snprintf(why, sizeof why, "swi %#x with no OS", number);
-    arm_fault(c, c.r[15], why);
+    arm_fault(c, site, why);
 }
 
 void arm_call_unknown(ArmCpu& c, uint32_t addr) {
