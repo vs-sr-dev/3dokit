@@ -59,7 +59,10 @@ python -m 3dokit.arm GAME -c 3b118                    # who calls what
 python -m 3dokit.arm GAME -S game.sym -d fe30 -n 60   # disassembly, with names
 python -m 3dokit.arm GAME --stats                     # the call graph's reach
 python -m 3dokit.arm GAME --names > game.sym          # the compiler's embedded names
-python -m 3dokit.portfolio GAME --sites               # SWIs and folio vectors
+python -m 3dokit.portfolio GAME --sites               # SWIs and folio vectors, named
+python -m 3dokit.sdk                                  # the SDK's SWI and slot names
+python -m 3dokit.aof SDK/lib/3do/graphics.lib         # an SDK library's members
+python -m 3dokit.aof SDK/lib/3do/*.lib --glue         # folio slots its glue names
 python -m 3dokit.shapes library GAME --corpus 'build/disc/System/Programs/*'
 python -m 3dokit.shapes pair A B --names a.sym --out b.sym
 python -m 3dokit.cel FILE --png out/                  # frames as RGBA PNG
@@ -119,14 +122,14 @@ both discs:
 |---|---|---|---|
 | 1. Recognise | What is on this disc? | `disc` (Opera, copies, ROM tags, `--verify`), `aif` (AIF, the 3DO header, compressed or signed) | fonts in `System/Graphics/Fonts`; what the ROM tag of type 0x0c holds |
 | 2. Extract | Turn standard formats into standard files | `disc --extract`, `cel` (every depth and coding, PLUTA, the hardware's transparency, `IMAG`), `stream`, `cinepak`, `audio` (SDX2, AIFF/AIFC, loops), `dsp`, `pixels` | the streamed-cel subscriber (`SCEL`); AIF decompression |
-| 3. Map code | What does the code do, where? | `arm` (functions, calls, tail calls, references, control flow, symbols, the compiler's embedded names), `portfolio` (SWIs and folio vectors, attributed), `shapes` (library proved against a corpus; two programs paired, names carried, a data map) | more SWI and slot names; a corpus from a second game of the same SDK |
+| 3. Map code | What does the code do, where? | `arm` (functions, calls, tail calls, references, control flow, symbols, the compiler's embedded names), `portfolio` (SWIs and folio vectors, attributed and named), `sdk` (the SDK's names for every SWI and slot), `aof` (the SDK's ARM Object Format libraries), `shapes` (library proved against a corpus; two programs paired, names carried, a data map) | a corpus from the SDK's own libraries for `shapes` |
 | 4. Translate | Turn ARM60 code into C | - | a static recompiler: see *Known gaps* |
 | 5. Runtime | What an engine links | `runtime/` (C99): `tdk_opera` (files out of a disc image), `tdk_cel` (cels to RGBA), `tdk_stream` (DataStream, Cinepak with an optional dither, SDX2); `tdkcheck` | the CEL engine proper: quads, PIXC, the pixel processor |
 
 ## Principles
 
-* Pure Python 3.8+, no dependencies, except `arm`, `portfolio` and `shapes`
-  (capstone). The runtime is C99 with no dependencies.
+* Pure Python 3.8+, no dependencies, except `arm`, `portfolio`, `shapes`
+  and `aof --glue` (capstone). The runtime is C99 with no dependencies.
 * Every claim is checked on a real disc before it goes in. What no disc
   shows is refused with an error rather than guessed.
 * Game knowledge stays out. Where games differ -- a dither in a film
@@ -141,7 +144,9 @@ both discs:
 | `disc` | Immercenary (raw 2352, 747 files, 43 directories, 552.5 MiB) and OMF2097 (iso 2048, 1,502 files, 186 directories): the same 790 and 1,688 entries as the port's own reader. Every copy read and compared: Immercenary's 288 extra copies are 279 identical, 8 directories that differ only in the case of names and 1 `rom_tags` copy with its own relative offsets; OMF2097's 374 are 372 identical and 2 that really differ (its second label says one block fewer, its second `rom_tags` is the devkit's table before `3DOEncrypt` rewrote the first). The ROM tags land on `boot_code` and `os_code` on both, and on `misc_code`, `BannerScreen` and `LaunchMe` on OMF2097 |
 | `aif` | 57 images on Immercenary, 39 on OMF2097 and 34 on Crash 'n Burn: every uncompressed one ends exactly where its relocation list does, or its signature does when signed (12, 15 and 7 signed, 14, 20 and 4 compressed). The stub is where the BL at 0x04 points: `ro + rw` on the first two discs, 4 bytes on from it on Crash 'n Burn's three programs, whose extra word one of Orion's relocations points at. OMF2097's `LaunchMe` header carries the stack (16,384), name and time its Makefile gives `modbin`; the System images' node versions equal the `os_code` tag's |
 | `arm` | the same function starts, calls, tail calls, references and code end as the port's cross-referencer on all five of Immercenary's programs (`p` 1,308 functions, `p1e` 1,066, `launchme` 84, `CinepakSubroutine` 484, `SpeechSubroutine` 188). The compiler's embedded names: 292 on Crash 'n Burn's `launchme` (every one on an APCS prologue) and 47 on its `Orion`; 0 on Immercenary's five, OMF2097's `LaunchMe` and the 26 System programs |
-| `portfolio` | Immercenary's five programs: exactly the port's scanner's SWI count less one each -- `svcvs #0`, which is the string `"audio"` and which the port's notes had listed as an unidentified folio-0 call. 109 of 109 vector sites attributed in `p`, 104 of 104 in `p1e`. Counting only SWIs control flow reaches drops OMF2097's 7,000-odd `svc`s decoded from linked-in asset data to 134 |
+| `portfolio` | Immercenary's five programs: exactly the port's scanner's SWI count less one each -- `svcvs #0`, which is the string `"audio"` and which the port's notes had listed as an unidentified folio-0 call. 109 of 109 vector sites attributed in `p`, 104 of 104 in `p1e`. Counting only SWIs control flow reaches drops OMF2097's 7,000-odd `svc`s decoded from linked-in asset data to 134. Crash 'n Burn's 1993 SDK opens a folio differently (the item stored first, `LookupItem`'s pointer 0x68 bytes on) and shares one pool word between two globals (`ldr rN, [rN, #4]`): with both read, its `launchme` has 113 of 116 sites attributed (Graphics 38, Kernel 29, audio 42, File 4) where it had 75, and the other six programs' attribution is unchanged |
+| `sdk` | generated from the 1.2, 1.3 and 2.5 SDKs' headers and the 3do-devkit's libraries (`aof --glue`): 105 SWIs and 184 slots. The three header sets give no SWI two names; their slot lists agree with the libraries' glue on every slot both have. Every name Immercenary's reading had pinned is the SDK's function. On Crash 'n Burn every SWI is named but `0:0` (data decoded as `svcne`) and every slot but one (Kernel -120, used by the AIF startup and in no header); the SDK also corrects one guess in Immercenary's notes (0x10011 is `ReadHardwareRandomNumber`, not a timer) |
+| `aof` | every member of the 3do-devkit's 28 libraries read (632): areas, relocations of both forms, symbols; the glue of Graphics (46 slots), the Kernel, audio (46), File (14), Operamath (8), Compression, International and JString found by the global it reads |
 | `shapes` | on `p`: 60 functions proved library and 10 closed under it, as the port's own classifier; `p` against `p1e`: 938 pairs, 532 by shape, 211 by call, 79 by gap, 72 by alignment, 44 by string, 0 contradictions -- the port's own pairing, pass for pass. Across discs, OMF2097's System (24.225) proves 22 of `p`'s functions library, and its `LaunchMe` adds 2 to Immercenary's own corpus (the sound spooler): the devkit's libraries are not the 1995 SDK's shapes |
 | `cel` | every frame on both discs: 5,897 in 460 files on Immercenary, 1,308 on OMF2097 (1, 2, 4, 6, 8 and 16 bits, coded and uncoded, packed and literal, `IMAG`). The rules are the Opera emulator's MADAM decoder, and the discs agree with them in two ways that matter: every coded CCB on both has `LDPLUT` set and exactly one `PLUT` in its group, before or after its `PDAT`; and no index goes past its PLUT once they are paired that way (27 did the other way) |
 | `stream` | 48 streams on Immercenary, 4 of them led by a marker table: the same chunks as the port's own walker, 29,659 film frames, and `FILM`, `SNDS`, `CTRL` (`SYNC`, `STOP`, `GOTO`, `ALRM`), `DACQ`, `SCEL` and a game's own `FMOD` carried |
@@ -170,7 +175,8 @@ both discs:
   none in the files, the games do.
 * **Compressed AIF images** (most of the System tree) are recognised, not
   decompressed.
-* **`portfolio`'s names** come from one game's reading. On OMF2097 the
+* **`portfolio`'s names** come from the SDK's headers and libraries
+  (`sdk`), which a later OS may extend. On OMF2097 the
   devkit's glue caches the File folio's pointer another way and 19 of its
   slots go unattributed.
 * **The ROM tag of type 0x0c** holds a value in its offset field
@@ -216,4 +222,6 @@ version 1.
 MIT -- see [LICENSE](LICENSE). 3dokit contains no game data and no 3DO
 code; it reads and replaces, it does not include. The Opera emulator
 (libretro, LGPL) was read as a reference for the CEL decoder's rules; none
-of its code is here.
+of its code is here. `sdk_tables.py` holds the numbers and names of the
+OS's binary interface as the 3DO SDK declares them -- no header text and
+no library code.

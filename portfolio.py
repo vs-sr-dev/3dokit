@@ -22,11 +22,14 @@ global it stores the pointer in, and the global every wrapper reads before
 its tail call.  Node types 0x104 (folio), 0x10a (message port) and 0x10f
 (device) are the ones seen; only a folio has vectors behind it.
 
-`SWI_NAMES` and `SLOT_NAMES` are the entry points pinned so far, each by what
+Names come from the SDK (`sdk`: its headers and its libraries' glue).
+`SWI_NAMES` and `SLOT_NAMES` are the entry points pinned besides, each by what
 a game's own code does with it -- read in Immercenary's `p` (OS 23.10) --
-never by the company it keeps.  Folio slots and SWI numbers are the OS's
-binary interface, so the same numbers mean the same calls in any program;
-what is not named here is listed with its call sites.
+never by the company it keeps; where a pinned name and the SDK's differ the
+report shows both. Every one of Immercenary's pinnings turned out to be the
+SDK's function, and they are now spelt as the SDK spells them. Folio slots
+and SWI numbers are the OS's binary interface, so the same numbers mean the
+same calls in any program; what is not named is listed with its call sites.
 
     python -m 3dokit.portfolio GAME             # the surface, by folio
     python -m 3dokit.portfolio GAME --sites     # and every call site
@@ -38,8 +41,10 @@ import struct
 import sys
 
 from .arm import Image, LITPOOL, pcrel_target
+from .sdk_tables import SWIS as SDK_SWIS, SLOTS as SDK_SLOTS
 
 VECTOR = re.compile(r'^pc, \[(\w+), #(-?(?:0x[0-9a-fA-F]+|\d+))\]$')
+DISP = re.compile(r'^(\w+), \[(\w+), #(0x[0-9a-fA-F]+|\d+)\]$')
 
 FIND_NAMED_ITEM = 0x10004
 OPEN_ITEM = 0x10005
@@ -48,33 +53,55 @@ FOLIO_NODE = 0x104
 MAX_FOLIO, MAX_FUNC = 15, 255
 
 # Direct SWI folios, by number, as the calls into them show.
-SWI_FOLIO = {1: 'Kernel', 3: 'file / C runtime glue', 4: 'audio',
+SWI_FOLIO = {0: 'the C runtime', 1: 'Kernel', 3: 'file / C runtime glue', 4: 'audio',
              5: 'Operamath'}
 
 SWI_NAMES = {
+    0x00011: 'exit (the AIF header has it at 0x10)',
     0x10001: 'WaitSignal(mask)',
     0x10002: 'SendSignal(task, mask)',
-    0x10004: 'FindNamedItem(type, tags)',
+    0x10004: 'FindItem(type, tags)',
     0x10005: 'OpenItem(item, tags)',
     0x10009: 'Yield()',
-    0x1000e: 'debug print (a format string in r0)',
+    0x1000e: 'kprintf(format, ...)',
     0x10012: 'ReplyMsg(msg, result, data, size)',
     0x10015: 'AllocSignal(0)',
     0x10016: 'FreeSignal(mask)',
-    0x50009: 'matrix times many vectors (dst, src, mat, count)',
+    0x50009: 'MulManyVec4Mat44_F16(dst, src, mat, count)',
 }
 
 SLOT_NAMES = {
     ('Kernel', -48): 'LookupItem',
-    ('Kernel', -56): 'block copy',
+    ('Kernel', -56): 'memcpy',
     ('Graphics', -4): 'MapCel',
     ('Graphics', -160): 'DisplayScreen',
     ('Operamath', -8): 'MulSF16',
     ('Operamath', -12): 'DivUF16',
     ('Operamath', -20): 'DivSF16',
-    ('Operamath', -28): '16.16 reciprocal',
-    ('Operamath', -32): '16.16 reciprocal',
+    ('Operamath', -28): 'RecipUF16',
+    ('Operamath', -32): 'RecipSF16',
 }
+
+
+def _agree(pinned, sdk):
+    head = re.split(r'[^\w]', pinned)[0]
+    return head and head in sdk.split('/')
+
+
+def swi_label(v):
+    """The SDK's name for a SWI; a name pinned by a game's code beside it
+    when the two differ."""
+    pinned, sdk = SWI_NAMES.get(v), SDK_SWIS.get(v)
+    if pinned and sdk and not _agree(pinned, sdk):
+        return '%s  [pinned: %s]' % (sdk, pinned)
+    return sdk or pinned or ''
+
+
+def slot_label(folio, slot):
+    pinned, sdk = SLOT_NAMES.get((folio, slot)), SDK_SLOTS.get((folio, slot))
+    if pinned and sdk and not _agree(pinned, sdk):
+        return '%s  [pinned: %s]' % (sdk, pinned)
+    return sdk or pinned or ''
 
 
 def _node_type(im, a, back=0x40):
@@ -175,13 +202,15 @@ class Surface:
             opens_at.append((a, f, name))
         openers = {f: n for f, n, t in self.opens if n and t == FOLIO_NODE}
 
-        # The global each opener caches its folio pointer in.
+        # The global each opener caches its folio pointer in: the first
+        # `str r0` after the OpenItem -- 0x68 bytes on in the 1993 SDK's
+        # opener, which stores the item first and LookupItem's pointer after.
         ptr_global = {}
         store = re.compile(r'^r0, \[(\w+)(?:, #(\d+))?\]!?$')
         for a, f, name in opens_at:
             if f not in openers:
                 continue
-            for b in range(a + 4, a + 0x60, 4):
+            for b in range(a + 4, a + 0xa0, 4):
                 i = im.insns.get(b)
                 if not i or not i.mnemonic.startswith('str'):
                     continue
@@ -232,8 +261,18 @@ class Surface:
                     except ValueError:
                         pass
             if folio is None:
+                # the pointer's global, or a neighbour's literal plus the
+                # `ldr rN, [rN, #d]` just before the jump that steps to it
+                # (two globals sharing one pool word, as the 1993 glue does)
+                d = 0
+                j = im.insns.get(a - 4)
+                dm = j and j.mnemonic == 'ldr' and DISP.match(j.op_str)
+                if dm and dm.group(1) == dm.group(2) == m.group(1):
+                    d = int(dm.group(3), 0)
                 for v in _pool_values(im, f, a + 4):
                     folio = ptr_global.get(v, folio)
+                    if d and folio is None:
+                        folio = ptr_global.get(v + d)
             self.vectors[folio or '(unknown)'][slot].add(f)
 
     def report(self, sites=False):
@@ -255,7 +294,7 @@ class Surface:
                     fs = sorted({im.func_of(s) for s in self.swis[v]} - {None})
                     out.append('      %d:%-3d x%-4d %-36s %s' % (
                         fo, v & 0xffff, len(self.swis[v]),
-                        SWI_NAMES.get(v, ''),
+                        swi_label(v),
                         ' '.join('%#x' % f for f in fs[:6]) +
                         (' ...' if len(fs) > 6 else '')))
         out.append('')
@@ -271,13 +310,13 @@ class Surface:
             self.vector_sites, total))
         for folio in sorted(self.vectors):
             slots = self.vectors[folio]
-            named = sum(1 for s in slots if (folio, s) in SLOT_NAMES)
+            named = sum(1 for s in slots if slot_label(folio, s))
             out.append('  %-10s %3d slots, %d named' % (folio, len(slots),
                                                           named))
             if sites:
                 for s in sorted(slots, reverse=True):
-                    out.append('      %5d  %-18s %s' % (
-                        s, SLOT_NAMES.get((folio, s), ''),
+                    out.append('      %5d  %-24s %s' % (
+                        s, slot_label(folio, s),
                         ' '.join('%#x' % w for w in sorted(slots[s]))))
         return '\n'.join(out)
 
