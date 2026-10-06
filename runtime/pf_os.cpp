@@ -189,9 +189,35 @@ void arm_call_unknown(ArmCpu& c, uint32_t addr) {
 
 void arm_poll(ArmCpu& c) { c.budget = 1 << 20; }
 
+// ---- the OS's own access to memory: not traced ---------------------------------------------
+uint32_t pf_r32(uint32_t a) { return in_os(a, 4) ? os_get(a, 4) : ld32(a); }
+uint32_t pf_r8(uint32_t a) { return in_os(a, 1) ? os_get(a, 1) : ld8(a); }
+void pf_w32(uint32_t a, uint32_t v) { if (in_os(a, 4)) os_put(a, v, 4); else st32(a, v); }
+void pf_w8(uint32_t a, uint32_t v) { if (in_os(a, 1)) os_put(a, v, 1); else st8(a, v); }
+
+static uint32_t g_os_free;                      // the OS's own allocations, upward
+
+uint32_t pf_os_alloc(uint32_t size) {
+    uint32_t a = g_os_free;
+    g_os_free = (g_os_free + size + 3) & ~3u;
+    if (g_os_free > PF_OS_BASE + PF_OS_SIZE) {
+        std::fprintf(stderr, "the OS's memory is full\n");
+        std::exit(3);
+    }
+    return a;
+}
+
+uint32_t pf_os_string(const char* s) {
+    size_t n = std::strlen(s) + 1;
+    uint32_t a = pf_os_alloc((uint32_t)n);
+    std::memcpy(g_os + (a - PF_OS_BASE), s, n);
+    return a;
+}
+
 // ---- the boot ------------------------------------------------------------------------------
 static void build_folios() {
     std::memset(g_os, 0, sizeof g_os);
+    g_os_free = PF_OS_BASE + 0x10000;           // above the folios' pages
     for (int f = 0; f < PF_NFOLIOS; ++f) {
         uint32_t base = pf_folio_base((PfFolio)f);
         for (int i = 0; i < PF_SLOTS; ++i)
@@ -217,6 +243,7 @@ int pf_run(const uint8_t* image, size_t size, uint32_t bss_end, uint32_t entry) 
     build_folios();
     pf_on_swi(0x11, pf_exit_swi);
     pf_kernel_init();
+    pf_file_init();
     // argv: the program's name, in the OS's memory
     const uint32_t argv = PF_OS_BASE + 0x100, name = PF_OS_BASE + 0x110;
     os_put(argv, name, 4);

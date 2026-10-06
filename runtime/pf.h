@@ -55,8 +55,27 @@ uint32_t pf_arg(const ArmCpu& c, int n);                    // the n-th argument
 size_t   pf_cstring(uint32_t addr, char* out, size_t max);   // a C string from guest memory
 [[noreturn]] void pf_stop(ArmCpu& c, const char* why);
 
-// Kernel handlers (pf_kernel.cpp) register themselves here.
+// The OS's own reads and writes (of its memory or the program's), untraced,
+// and its allocations in its memory.
+uint32_t pf_r32(uint32_t a);
+uint32_t pf_r8(uint32_t a);
+void     pf_w32(uint32_t a, uint32_t v);
+void     pf_w8(uint32_t a, uint32_t v);
+uint32_t pf_os_alloc(uint32_t size);
+uint32_t pf_os_string(const char* s);
+
+// Items (pf_kernel.cpp): numbers for nodes in guest memory. A node starts
+// with the SDK's ItemNode (nodes.h): n_SubsysType at +8, n_Type +9,
+// n_Flags +11, n_Size +12, n_Name +16, n_Item +24, n_Owner +28; 36 bytes.
+enum : uint32_t { PF_ITEMNODE_SIZE = 36 };
+int32_t  pf_item_new(uint32_t node, int subsys, int type, const char* name);
+uint32_t pf_item_node(int32_t item);            // 0 if no such item
+// An Err: negative, as Portfolio's are (the bits are not yet the OS's own).
+enum : int32_t { PF_ERR_NOTFOUND = -1, PF_ERR_BADITEM = -2 };
+
+// The folios' handlers register themselves here.
 void     pf_kernel_init();
+void     pf_file_init();
 
 // The SDK's names (generated: pf_names.cpp).
 struct PfSwiName { uint32_t number; const char* name; };
