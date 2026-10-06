@@ -65,6 +65,7 @@ void     pf_w32(uint32_t a, uint32_t v);
 void     pf_w8(uint32_t a, uint32_t v);
 uint32_t pf_os_alloc(uint32_t size);
 uint32_t pf_os_string(const char* s);
+uint32_t pf_os_next();                          // where the OS's next allocation will be
 
 // Items (pf_kernel.cpp): numbers for nodes in guest memory. A node starts
 // with the SDK's ItemNode (nodes.h): n_SubsysType at +8, n_Type +9,
@@ -72,6 +73,8 @@ uint32_t pf_os_string(const char* s);
 enum : uint32_t { PF_ITEMNODE_SIZE = 36 };
 int32_t  pf_item_new(uint32_t node, int subsys, int type, const char* name);
 uint32_t pf_item_node(int32_t item);            // 0 if no such item
+uint32_t pf_check_item(int32_t item, int subsys, int type);    // CheckItem: 0 unless of that kind
+int32_t  pf_item_count();                       // items are 1 to this, less one
 // An Err: negative, as Portfolio's are (the bits are not yet the OS's own).
 enum : int32_t { PF_ERR_NOTFOUND = -1, PF_ERR_BADITEM = -2 };
 
@@ -90,8 +93,9 @@ enum : uint32_t {
     PF_TASK_SIZE = 0xdc, T_STACKBASE = 0x3c, T_STACKSIZE = 0x40, T_FREEMEMORYLISTS = 0xa8,
     // GrafFolio (graphics.h)
     GF_VBLNUMBER = 0x74, GF_ZEROPAGE = 0x78, GF_VIRSPAGE = 0x7c, GF_VRAMPAGESIZE = 0x80,
-    GF_DEFAULTDISPLAYWIDTH = 0x84, GF_DEFAULTDISPLAYHEIGHT = 0x88, GF_VBLTIME = 0xc4,
-    GF_VBLFREQ = 0xc8,
+    GF_DEFAULTDISPLAYWIDTH = 0x84, GF_DEFAULTDISPLAYHEIGHT = 0x88, GF_VDLFORCEDFIRST = 0x9c,
+    GF_VDLPREDISPLAY = 0xa0, GF_VDLPOSTDISPLAY = 0xa4, GF_VDLBLANK = 0xa8, GF_CURRENTVDLEVEN = 0xac,
+    GF_CURRENTVDLODD = 0xb0, GF_VDLDISPLAYLINK = 0xb4, GF_VBLTIME = 0xc4, GF_VBLFREQ = 0xc8,
 };
 
 // Lists (pf_kernel.cpp), as the kernel's own functions link them.
@@ -121,6 +125,8 @@ void     pf_free_mem(uint32_t lists, uint32_t p, int32_t size);
 uint32_t pf_page_size(uint32_t flags);              // GetPageSize
 uint32_t pf_find_mh(uint32_t p);                    // FindMH
 int32_t  pf_scavenge(bool user);                    // ScavengeMem, SystemScavengeMem
+// 0 when every page of [p, p + size) is writable by `task`, else the kernel's BADPTR
+int32_t  pf_task_can_write(uint32_t task, uint32_t p, int32_t size);
 
 // A test of the allocator (pf_memtest.cpp): after the boot, `ops` random allocations, frees
 // and scavenges from `seed`, written to DIR as ops.txt with the guest memory before and
@@ -128,6 +134,16 @@ int32_t  pf_scavenge(bool user);                    // ScavengeMem, SystemScaven
 // replay on the 1993 kernel's own code.
 int      pf_memtest(const char* dir, int ops, uint32_t seed);
 const uint8_t* pf_os_memory();
+
+// A snapshot of one OS call (pf_memtest.cpp), the g_pf_snap_call-th as the trace counts them:
+// before its handler runs, the guest memory to DIR/before.bin and the call, the registers, the
+// task, the items and where the OS allocates next to DIR/call.txt; after it, the memory to
+// after.bin and the result to call.txt, and the run ends. python -m 3dokit.pfcheck replays the
+// call on the 1993 OS's own code over the memory before.
+extern unsigned long long g_pf_snap_call;
+extern const char* g_pf_snap_dir;
+void     pf_snap_before(const ArmCpu& c, const char* call);
+[[noreturn]] void pf_snap_after(const ArmCpu& c);
 
 // The folios' handlers register themselves here.
 void     pf_kernel_init();

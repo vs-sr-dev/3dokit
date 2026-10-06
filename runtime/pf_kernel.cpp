@@ -140,6 +140,8 @@ uint32_t pf_item_node(int32_t item) {
     return item > 0 && item < (int32_t)g_items.size() ? g_items[item] : 0;
 }
 
+int32_t pf_item_count() { return (int32_t)g_items.size(); }
+
 static bool same_name(uint32_t a, const char* b) {
     for (;; ++a, ++b) {
         int x = std::tolower((int)pf_r8(a)), y = std::tolower((unsigned char)*b);
@@ -184,6 +186,15 @@ static void k_closeitem(ArmCpu& c) {
 // Kernel -48: void* LookupItem(Item) -- the node, or NULL
 static void k_lookupitem(ArmCpu& c) { c.r[0] = pf_item_node((int32_t)c.r[0]); }
 
+// Kernel -64: void* CheckItem(Item, uint8 subsys, uint8 type) -- LookupItem, then NULL unless
+// the node's n_SubsysType and n_Type are those (os_code 0x12bf8)
+uint32_t pf_check_item(int32_t item, int subsys, int type) {
+    uint32_t n = pf_item_node(item);
+    return n && pf_r8(n + 8) == (uint32_t)(subsys & 0xFF) && pf_r8(n + 9) == (uint32_t)(type & 0xFF) ? n : 0;
+}
+
+static void k_checkitem(ArmCpu& c) { c.r[0] = pf_check_item((int32_t)c.r[0], (int)c.r[1], (int)c.r[2]); }
+
 void pf_kernel_init() {
     g_items.assign(1, 0);
     pf_on_swi(0x1000e, k_kprintf);
@@ -194,6 +205,7 @@ void pf_kernel_init() {
     pf_on_slot(PF_KERNEL, -48, k_lookupitem);
     pf_on_slot(PF_KERNEL, -52, k_memset);
     pf_on_slot(PF_KERNEL, -56, k_memcpy);
+    pf_on_slot(PF_KERNEL, -64, k_checkitem);
     // the folios a program finds by name: MKNODEID(KERNELNODE, FOLIONODE)
     for (int f = PF_GRAPHICS; f < PF_NFOLIOS; ++f)
         pf_item_new(pf_folio_base((PfFolio)f), 1, 4, g_pf_folio_names[f]);

@@ -132,36 +132,38 @@ void pf_on_slot(PfFolio folio, int slot, PfFn fn) {
     g_slots[folio][idx] = fn;
 }
 
-static void trace_call(const char* what, const ArmCpu& c, uint32_t site) {
-    pf_log("[%5llu] %06X %-40s r0=%08X r1=%08X r2=%08X r3=%08X\n", ++g_ncalls, site, what,
-           c.r[0], c.r[1], c.r[2], c.r[3]);
-}
-
-// Not implemented: stop, or with --lenient return 0 and go on (a preview of
-// what a program calls next, not a run to trust).
-static void missing(ArmCpu& c, const char* what) {
-    if (g_pf_lenient) {
-        pf_log("        (not implemented: returns 0)\n");
-        c.r[0] = 0;
-        return;
+// One OS call: counted and traced, then its handler -- or, not implemented, a stop, or with
+// --lenient 0 and on (a preview of what a program calls next, not a run to trust). `call` is the
+// call as a snapshot names it (pf_snap_before).
+static void os_call(ArmCpu& c, PfFn fn, const char* what, uint32_t site, const char* call) {
+    ++g_ncalls;
+    if (g_pf_trace)
+        pf_log("[%5llu] %06X %-40s r0=%08X r1=%08X r2=%08X r3=%08X\n", g_ncalls, site, what,
+               c.r[0], c.r[1], c.r[2], c.r[3]);
+    if (g_pf_max_calls && g_ncalls >= g_pf_max_calls) pf_stop(c, "--max-calls reached");
+    if (!fn) {
+        if (g_pf_lenient) {
+            pf_log("        (not implemented: returns 0)\n");
+            c.r[0] = 0;
+            return;
+        }
+        char why[112];
+        std::snprintf(why, sizeof why, "%s: not implemented", what);
+        pf_stop(c, why);
     }
-    char why[112];
-    std::snprintf(why, sizeof why, "%s: not implemented", what);
-    pf_stop(c, why);
+    bool snap = g_ncalls == g_pf_snap_call;
+    if (snap) pf_snap_before(c, call);
+    fn(c);
+    if (g_pf_trace) pf_log("        -> %08X\n", c.r[0]);
+    if (snap) pf_snap_after(c);
 }
 
 void arm_swi(ArmCpu& c, uint32_t number, uint32_t site) {
-    char what[64];
+    char what[64], call[32];
     std::snprintf(what, sizeof what, "swi %#x %s", number, pf_swi_name(number));
-    if (g_pf_trace) trace_call(what, c, site);
-    if (g_pf_max_calls && g_ncalls >= g_pf_max_calls) pf_stop(c, "--max-calls reached");
+    std::snprintf(call, sizeof call, "swi %#x", number);
     auto it = g_swis.find(number);
-    if (it == g_swis.end()) {
-        missing(c, what);
-        return;
-    }
-    it->second(c);
-    if (g_pf_trace) pf_log("        -> %08X\n", c.r[0]);
+    os_call(c, it == g_swis.end() ? nullptr : it->second, what, site, call);
 }
 
 void arm_call_unknown(ArmCpu& c, uint32_t addr) {
@@ -169,18 +171,12 @@ void arm_call_unknown(ArmCpu& c, uint32_t addr) {
         uint32_t off = addr - PF_TRAP_BASE;
         int folio = off >> 10, idx = (off >> 2) & 255;
         int slot = -4 * (idx + 1);
-        char what[80];
         if (folio < PF_NFOLIOS && idx < PF_SLOTS) {
+            char what[80], call[32];
             std::snprintf(what, sizeof what, "%s %d %s", g_pf_folio_names[folio], slot,
                           pf_slot_name((PfFolio)folio, slot));
-            if (g_pf_trace) trace_call(what, c, c.r[14] - 4);
-            if (g_pf_max_calls && g_ncalls >= g_pf_max_calls) pf_stop(c, "--max-calls reached");
-            if (PfFn fn = g_slots[folio][idx]) {
-                fn(c);
-                if (g_pf_trace) pf_log("        -> %08X\n", c.r[0]);
-            } else {
-                missing(c, what);
-            }
+            std::snprintf(call, sizeof call, "slot %s %d", g_pf_folio_names[folio], slot);
+            os_call(c, g_slots[folio][idx], what, c.r[14] - 4, call);
             c.pc = c.r[14] & ~3u;               // the folio's function returns to lr
             return;
         }
@@ -207,6 +203,8 @@ uint32_t pf_os_alloc(uint32_t size) {
     }
     return a;
 }
+
+uint32_t pf_os_next() { return g_os_free; }
 
 uint32_t pf_os_string(const char* s) {
     size_t n = std::strlen(s) + 1;

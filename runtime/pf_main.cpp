@@ -7,7 +7,9 @@
 // in this build). --trace 0 is quiet, 1 (the default) every OS call, 2 also
 // every access to the OS's memory. --lenient lets an OS call that is not
 // implemented return 0 instead of stopping: a preview of what the program
-// calls next, not a run to trust.
+// calls next, not a run to trust. --snap N DIR stops after the N-th OS call,
+// with the memory before and after it and the call in DIR (pf_memtest.cpp;
+// python -m 3dokit.pfcheck replays it on the 1993 OS).
 //
 //     pfboot PROGRAM --memtest DIR [--ops N] [--seed S]
 //
@@ -34,7 +36,7 @@ static uint32_t bl_target(const std::vector<uint8_t>& d, uint32_t at) {
 
 int main(int argc, char** argv) {
     if (argc < 2) {
-        std::fprintf(stderr, "usage: pfboot PROGRAM [--trace N] [--lenient] [--max-calls N]\n"
+        std::fprintf(stderr, "usage: pfboot PROGRAM [--trace N] [--lenient] [--max-calls N] [--snap N DIR]\n"
                              "       pfboot PROGRAM --memtest DIR [--ops N] [--seed S]\n");
         return 2;
     }
@@ -45,6 +47,10 @@ int main(int argc, char** argv) {
         if (!std::strcmp(argv[i], "--trace") && i + 1 < argc) g_pf_trace = std::atoi(argv[++i]);
         else if (!std::strcmp(argv[i], "--max-calls") && i + 1 < argc) g_pf_max_calls = std::strtoull(argv[++i], nullptr, 0);
         else if (!std::strcmp(argv[i], "--lenient")) g_pf_lenient = true;
+        else if (!std::strcmp(argv[i], "--snap") && i + 2 < argc) {
+            g_pf_snap_call = std::strtoull(argv[++i], nullptr, 0);
+            g_pf_snap_dir = argv[++i];
+        }
         else if (!std::strcmp(argv[i], "--memtest") && i + 1 < argc) memtest = argv[++i];
         else if (!std::strcmp(argv[i], "--ops") && i + 1 < argc) ops = std::atoi(argv[++i]);
         else if (!std::strcmp(argv[i], "--seed") && i + 1 < argc) seed = (uint32_t)std::strtoul(argv[++i], nullptr, 0);

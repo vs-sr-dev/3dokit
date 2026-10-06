@@ -1,4 +1,5 @@
-// 3dokit runtime -- a test of the allocator against the OS it reimplements.
+// 3dokit runtime -- tests of the runtime against the OS it reimplements: the allocator's, and a
+// snapshot of any one OS call.
 //
 // After the boot, a random run of the memory calls a program and the OS make -- allocations
 // of every kind and alignment, in user mode from the task's lists and in supervisor mode from
@@ -8,6 +9,7 @@
 // the memory after, byte for byte.
 #include "pf.h"
 #include <cstdio>
+#include <cstdlib>
 #include <string>
 #include <vector>
 
@@ -84,4 +86,45 @@ int pf_memtest(const char* dir, int ops, uint32_t seed) {
     std::printf("memtest: %d allocations, %d frees, %d scavenges, %zu blocks live, in %s\n",
                 allocs, frees, scav, live.size(), dir);
     return 0;
+}
+
+// ---- one call ------------------------------------------------------------------------------
+unsigned long long g_pf_snap_call;
+const char* g_pf_snap_dir;
+
+static FILE* snap_file(const char* name, const char* mode) {
+    std::string path = std::string(g_pf_snap_dir) + "/" + name;
+    FILE* f = std::fopen(path.c_str(), mode);
+    if (!f) {
+        std::fprintf(stderr, "cannot write %s\n", path.c_str());
+        std::exit(2);
+    }
+    return f;
+}
+
+void pf_snap_before(const ArmCpu& c, const char* call) {
+    if (!dump(std::string(g_pf_snap_dir) + "/before.bin")) {
+        std::fprintf(stderr, "cannot write %s/before.bin\n", g_pf_snap_dir);
+        std::exit(2);
+    }
+    FILE* f = snap_file("call.txt", "w");
+    std::fprintf(f, "call %s\n", call);
+    std::fprintf(f, "regs");
+    for (int i = 0; i < 16; ++i) std::fprintf(f, " %08X", c.r[i]);
+    uint32_t task = pf_current_task();
+    std::fprintf(f, "\ntask %08X %d\nosnext %08X\n", task, (int)pf_r32(task + 24), pf_os_next());
+    for (int32_t i = 1; i < pf_item_count(); ++i) std::fprintf(f, "item %d %08X\n", (int)i, pf_item_node(i));
+    std::fclose(f);
+}
+
+void pf_snap_after(const ArmCpu& c) {
+    if (!dump(std::string(g_pf_snap_dir) + "/after.bin")) {
+        std::fprintf(stderr, "cannot write %s/after.bin\n", g_pf_snap_dir);
+        std::exit(2);
+    }
+    FILE* f = snap_file("call.txt", "a");
+    std::fprintf(f, "result %08X\n", c.r[0]);
+    std::fclose(f);
+    pf_log("snapshot of OS call %llu in %s\n", g_pf_snap_call, g_pf_snap_dir);
+    std::exit(0);
 }

@@ -47,7 +47,9 @@ follows the header is not code, and the BL calls the decompressor appended to
 the image. `decompress` runs that decompressor, the image's own code, in
 `armemu`: it unpacks the image in place at its base, turns the BL into a NOP
 and returns to the header, and the image is then `ro + rw` bytes from the
-base. The folios, tasks and drivers of every System tree seen are compressed;
+base. `relocated` goes on as the loader does: the relocation list follows the
+unpacked image, and its words are moved to wherever the image is put. The
+folios, tasks and drivers of every System tree seen are compressed;
 the games' own programs are not. `System/Kernel/os_code` is an AIF image after
 a 16-byte boot header (its second word is the file's length less 0x40), linked
 at its own base (0x10000 on Crash 'n Burn's 1993 kernel).
@@ -205,11 +207,35 @@ def decompress(data, max_steps=50_000_000):
 
     Returns (base, image): the image as it lies from its base once the
     decompressor has returned to the header, `ro + rw` bytes."""
+    base, out = _unpack(unwrap(data), max_steps)
+    im = AIF(out)
+    return base, out[:im.ro + im.rw]
+
+
+def relocated(data, at, max_steps=50_000_000):
+    """An image linked at 0 as the loader leaves it at `at`: unpacked when it
+    is compressed (its relocation list follows the unpacked image), each word
+    the list names moved by `at`, and its zero-initialised data cleared.
+
+    Returns the bytes from `at` to the end of that data."""
+    out = _unpack(unwrap(data), max_steps)[1]
+    im = AIF(out)
+    if im.base:
+        raise ValueError('%s: linked at %#x, not 0' % (im.path or 'image', im.base))
+    img = bytearray(out[:im.stub])
+    img += bytes(max(0, im.ro + im.rw + im.bss - len(img)))
+    for r in im.relocs:
+        struct.pack_into('>I', img, r, (struct.unpack_from('>I', img, r)[0] + at) & 0xffffffff)
+    return bytes(img)
+
+
+def _unpack(data, max_steps):
+    """(base, the bytes from the base on): the image itself, or once its
+    decompressor has unpacked it and returned to the header."""
     from . import armemu
-    data = unwrap(data)
     im = AIF(data)
     if not im.compressed:
-        return im.base, data[:im.ro + im.rw]
+        return im.base, data
     base, top = im.base, 0x400000
     mem = armemu.Memory()
     mem.add(0, top)
@@ -235,10 +261,9 @@ def decompress(data, max_steps=50_000_000):
         raise RuntimeError('%s: the decompressor did not return in %d steps'
                            % (im.path or 'image', max_steps))
     out = bytes(mem.regions[0][2][base:])
-    after = AIF(out)
-    if after.compressed:
+    if AIF(out).compressed:
         raise RuntimeError('the decompressor left the header compressed')
-    return base, out[:after.ro + after.rw]
+    return base, out
 
 
 def scan(root):

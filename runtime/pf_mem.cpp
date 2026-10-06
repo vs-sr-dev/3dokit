@@ -83,6 +83,25 @@ uint32_t pf_find_mh(uint32_t p) {
     return 0;
 }
 
+// Kernel -168 of the 1993 kernel (0x1617c; later headers put IsMemReadable in that slot), with
+// the task first: the pages of [p, p + size) from p's page on, each set in meml_WriteBits of the
+// task's MemList for p's MemHdr. The Graphics folio asks it of a bitmap's buffer.
+int32_t pf_task_can_write(uint32_t task, uint32_t p, int32_t size) {
+    const int32_t bad = (int32_t)0xD57B9009u;               // BADPTR
+    if (size <= 0) return bad;
+    uint32_t mh = pf_find_mh(p), lists = pf_r32(task + T_FREEMEMORYLISTS);
+    if (!mh || !lists) return bad;
+    uint32_t ml = memlist_for(lists, mh);
+    if (!ml) return bad;
+    uint32_t page = pf_r32(mh + MH_PAGESIZE), bits = pf_r32(ml + ML_WRITEBITS);
+    uint32_t off = p & pf_r32(mh + MH_PAGEMASK);
+    size += (int32_t)off;
+    p -= off;
+    for (; size > 0; p += page, size -= (int32_t)page)
+        if (!bit(bits, (uint32_t)((int32_t)(p - pf_r32(mh + MH_MEMBASE)) >> pf_r8(mh + MH_PAGESHIFT)))) return bad;
+    return 0;
+}
+
 // The unit an allocation is aligned to: the MemHdr's page, or for VRAM its VRAM page unless
 // MEMTYPE_SYSTEMPAGESIZE asks for the other.
 static uint32_t align_unit(uint32_t mh, uint32_t flags) {
