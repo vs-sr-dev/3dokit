@@ -42,13 +42,19 @@ The 3DO binary header at 0x80, as far as the discs read so far agree on it:
     +0x40  name, 32 bytes                   modbin --name
     +0x60  build time                       modbin --time
 
-An image whose first word is a BL rather than a NOP is **compressed**: its
-file is shorter than `ro + rw` and what follows the header is not code. The
-folios, tasks and drivers of both System trees seen are like this; the games'
-own programs are not. Nothing here decompresses them.
+An image whose first word is a BL rather than a NOP is **compressed**: what
+follows the header is not code, and the BL calls the decompressor appended to
+the image. `decompress` runs that decompressor, the image's own code, in
+`armemu`: it unpacks the image in place at its base, turns the BL into a NOP
+and returns to the header, and the image is then `ro + rw` bytes from the
+base. The folios, tasks and drivers of every System tree seen are compressed;
+the games' own programs are not. `System/Kernel/os_code` is an AIF image after
+a 16-byte boot header (its second word is the file's length less 0x40), linked
+at its own base (0x10000 on Crash 'n Burn's 1993 kernel).
 
     python -m 3dokit.aif FILE...                 # header, 3DO header, relocations
     python -m 3dokit.aif --scan extracted/       # every AIF image under a tree
+    python -m 3dokit.aif --decompress FILE OUT   # a compressed image, unpacked
 """
 import argparse
 import os
@@ -187,6 +193,54 @@ class AIF:
         return '\n'.join(s)
 
 
+def unwrap(data):
+    """The AIF image in a file: the file, or what follows os_code's boot header."""
+    if not is_aif(data) and is_aif(data[16:]):
+        return data[16:]
+    return data
+
+
+def decompress(data, max_steps=50_000_000):
+    """A compressed AIF image's bytes, unpacked by its own decompressor.
+
+    Returns (base, image): the image as it lies from its base once the
+    decompressor has returned to the header, `ro + rw` bytes."""
+    from . import armemu
+    data = unwrap(data)
+    im = AIF(data)
+    if not im.compressed:
+        return im.base, data[:im.ro + im.rw]
+    base, top = im.base, 0x400000
+    mem = armemu.Memory()
+    mem.add(0, top)
+    mem.regions[0][2][base:base + len(data)] = data
+    cpu = armemu.CPU(mem)
+
+    class Done(Exception):
+        pass
+
+    def back(c):
+        raise Done
+
+    cpu.traps[base + 4] = back             # the decompressor returns to the header
+    cpu.r[armemu.SP] = top - 0x100
+    cpu.r[armemu.LR] = base + 4
+    cpu.r[armemu.PC] = base + im._bl_target(0)
+    try:
+        while cpu.steps < max_steps:
+            cpu.step()
+    except Done:
+        pass
+    else:
+        raise RuntimeError('%s: the decompressor did not return in %d steps'
+                           % (im.path or 'image', max_steps))
+    out = bytes(mem.regions[0][2][base:])
+    after = AIF(out)
+    if after.compressed:
+        raise RuntimeError('the decompressor left the header compressed')
+    return base, out[:after.ro + after.rw]
+
+
 def scan(root):
     """Every AIF image under a directory."""
     for dp, dirs, files in os.walk(root):
@@ -209,7 +263,18 @@ def main(argv=None):
     ap.add_argument('paths', nargs='+', help='AIF files, or trees with --scan')
     ap.add_argument('--scan', action='store_true',
                     help='find and summarise every AIF image under each path')
+    ap.add_argument('--decompress', action='store_true',
+                    help='unpack a compressed image: FILE OUT')
     a = ap.parse_args(argv)
+    if a.decompress:
+        if len(a.paths) != 2:
+            ap.error('--decompress takes FILE OUT')
+        with open(a.paths[0], 'rb') as f:
+            base, out = decompress(f.read())
+        with open(a.paths[1], 'wb') as f:
+            f.write(out)
+        print('%s: %d bytes from base %#x' % (a.paths[1], len(out), base))
+        return 0
     bad = 0
     if a.scan:
         for root in a.paths:
