@@ -8,7 +8,8 @@
 set(_rt ${CMAKE_CURRENT_LIST_DIR})
 add_library(tdk_arm_core OBJECT ${_rt}/arm_core.cpp)
 add_library(tdk_arm_stub OBJECT ${_rt}/arm_stub.cpp)
-add_library(tdk_pf OBJECT ${_rt}/pf_os.cpp ${_rt}/pf_kernel.cpp ${_rt}/pf_file.cpp)
+add_library(tdk_pf OBJECT ${_rt}/pf_os.cpp ${_rt}/pf_kernel.cpp ${_rt}/pf_mem.cpp ${_rt}/pf_file.cpp
+            ${_rt}/pf_graphics.cpp ${_rt}/pf_memtest.cpp)
 foreach(t tdk_arm_core tdk_arm_stub tdk_pf)
   target_include_directories(${t} PUBLIC ${_rt})
 endforeach()

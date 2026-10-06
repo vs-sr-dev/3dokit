@@ -42,6 +42,8 @@ uint32_t pf_folio_base(PfFolio folio);                      // the folio's node 
 // image at 0, its zero-initialised data cleared, r7 = KernelBase, and the
 // entry called with lr at the exit sentinel. Returns the exit code.
 int      pf_run(const uint8_t* image, size_t size, uint32_t bss_end, uint32_t entry);
+// The same boot without the call: 0 when the program and the OS are in place.
+int      pf_boot(const uint8_t* image, size_t size, uint32_t bss_end);
 
 // The trace: every OS call with its arguments and result (level 1), and
 // every access to the OS's memory other than a vector table (level 2).
@@ -73,9 +75,64 @@ uint32_t pf_item_node(int32_t item);            // 0 if no such item
 // An Err: negative, as Portfolio's are (the bits are not yet the OS's own).
 enum : int32_t { PF_ERR_NOTFOUND = -1, PF_ERR_BADITEM = -2 };
 
+// Where the 1993 headers put the fields a program reads directly (the 1.2 and 1.3 SDKs
+// agree; the offsets are a compiler's over those headers, and each one used is checked
+// against a program's own reads).
+enum : uint32_t {
+    // List (list.h): a Node, then the anchor
+    PF_LIST_SIZE = 0x20,
+    PF_LIST_HEAD = 0x14,                // ListAnchor.head.links.flink: the first node
+    PF_LIST_TAIL = 0x18,                // the pseudo-node the last node's n_Next points at
+    PF_LIST_LAST = 0x1c,                // ListAnchor.tail.links.blink: the last node
+    // KernelBase (kernel.h)
+    KB_MEMFREELISTS = 0x74, KB_MEMHDRLIST = 0x78, KB_CURRENTTASK = 0x98,
+    // Task (task.h)
+    PF_TASK_SIZE = 0xdc, T_STACKBASE = 0x3c, T_STACKSIZE = 0x40, T_FREEMEMORYLISTS = 0xa8,
+    // GrafFolio (graphics.h)
+    GF_VBLNUMBER = 0x74, GF_ZEROPAGE = 0x78, GF_VIRSPAGE = 0x7c, GF_VRAMPAGESIZE = 0x80,
+    GF_DEFAULTDISPLAYWIDTH = 0x84, GF_DEFAULTDISPLAYHEIGHT = 0x88, GF_VBLTIME = 0xc4,
+    GF_VBLFREQ = 0xc8,
+};
+
+// Lists (pf_kernel.cpp), as the kernel's own functions link them.
+void     pf_list_init(uint32_t l, const char* name);
+void     pf_list_insert_before(uint32_t at, uint32_t n);
+void     pf_list_add_head(uint32_t l, uint32_t n);
+void     pf_list_add_tail(uint32_t l, uint32_t n);
+void     pf_list_insert_from_tail(uint32_t l, uint32_t n);   // by n_Priority
+void     pf_list_rem_node(uint32_t n);
+
+// Memory (pf_mem.cpp). The flags are mem.h's.
+enum : uint32_t {
+    MEMTYPE_FILL = 0x100, MEMTYPE_MYPOOL = 0x200, MEMTYPE_TASKMEM = 0x8000,
+    MEMTYPE_VRAM = 0x10000, MEMTYPE_DMA = 0x20000, MEMTYPE_CEL = 0x40000, MEMTYPE_DRAM = 0x80000,
+    MEMTYPE_INPAGE = 0x1000000, MEMTYPE_STARTPAGE = 0x2000000, MEMTYPE_SYSTEMPAGESIZE = 0x4000000,
+    MEMTYPE_BANK1 = 0x10000000, MEMTYPE_BANK2 = 0x20000000, MEMTYPE_BANKSELECT = 0x40000000,
+};
+// The MemHdrs, the OS's MemLists, the program's task and its MemLists: the program's image
+// [0, image_end) and its stack [stack_base, top of DRAM) are the task's pages already.
+void     pf_mem_init(const char* task_name, uint32_t image_end, uint32_t stack_base);
+uint32_t pf_current_task();
+uint32_t pf_kernel_lists();                         // KernelBase->kb_MemFreeLists
+// AllocMemFromMemLists and FreeMemToMemLists; `user` is the mode of the caller, which
+// decides where more pages come from (the task's, or the OS's from the top).
+uint32_t pf_alloc_mem(uint32_t lists, int32_t size, uint32_t flags, bool user);
+void     pf_free_mem(uint32_t lists, uint32_t p, int32_t size);
+uint32_t pf_page_size(uint32_t flags);              // GetPageSize
+uint32_t pf_find_mh(uint32_t p);                    // FindMH
+int32_t  pf_scavenge(bool user);                    // ScavengeMem, SystemScavengeMem
+
+// A test of the allocator (pf_memtest.cpp): after the boot, `ops` random allocations, frees
+// and scavenges from `seed`, written to DIR as ops.txt with the guest memory before and
+// after (before.bin, after.bin: DRAM and VRAM, then the OS's memory), for 3dokit.pfcheck to
+// replay on the 1993 kernel's own code.
+int      pf_memtest(const char* dir, int ops, uint32_t seed);
+const uint8_t* pf_os_memory();
+
 // The folios' handlers register themselves here.
 void     pf_kernel_init();
 void     pf_file_init();
+void     pf_graphics_init();
 
 // The SDK's names (generated: pf_names.cpp).
 struct PfSwiName { uint32_t number; const char* name; };

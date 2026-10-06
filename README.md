@@ -74,6 +74,9 @@ python -m 3dokit.recomp.selftest --image GAME=GAME --auto --out build/recomp/sel
 cmake -S build/recomp -B build/recomp-build -G Ninja -DCMAKE_CXX_COMPILER=clang++
 ninja -C build/recomp-build && build/recomp-build/selftest build/recomp/selftest/*.txt
 build/recomp-build/pfboot GAME [--trace 2] [--lenient]   # on the Portfolio runtime, OS calls traced
+build/recomp-build/pfboot GAME --memtest DIR --ops 4000  # the allocator, a random run written down
+python -m 3dokit.pfcheck DISC/System/Kernel/os_code DIR  # ...replayed on the 1993 kernel's own code
+python -m 3dokit.aif --decompress DISC/System/Folios/GRAPHIX graphix.bin   # by its own decompressor
 python -m 3dokit.shapes library GAME --corpus 'build/disc/System/Programs/*'
 python -m 3dokit.shapes pair A B --names a.sym --out b.sym
 python -m 3dokit.cel FILE --png out/                  # frames as RGBA PNG
@@ -135,7 +138,7 @@ both discs:
 | 2. Extract | Turn standard formats into standard files | `disc --extract`, `cel` (every depth and coding, PLUTA, the hardware's transparency, `IMAG`), `stream`, `cinepak`, `audio` (SDX2, AIFF/AIFC, loops), `dsp`, `pixels` | the streamed-cel subscriber (`SCEL`); AIF decompression |
 | 3. Map code | What does the code do, where? | `arm` (functions, calls, tail calls, references, control flow, symbols, the compiler's embedded names), `portfolio` (SWIs and folio vectors, attributed and named), `sdk` (the SDK's names for every SWI and slot), `aof` (the SDK's ARM Object Format libraries), `shapes` (library proved against a corpus; two programs paired, names carried, a data map) | a corpus from the SDK's own libraries for `shapes` |
 | 4. Translate | Turn ARM60 code into C | `arm60` (the instruction set, ARMv3 exactly), `armemu` (an ARM60 interpreter: the reference), `recomp.discover` (functions, code and data, switches, indirect transfers), `recomp.emit` and `python -m 3dokit.recomp` (C++ per function, a module per program), `recomp.selftest` (the interpreter records, the C++ replays) | flags only where read; literal pools folded; returns that are not to their call (longjmp) |
-| 5. Runtime | What an engine links | `runtime/` (C99): `tdk_opera` (files out of a disc image), `tdk_cel` (cels to RGBA), `tdk_stream` (DataStream, Cinepak with an optional dither, SDX2); `tdkcheck`. For recompiled code (C++20): `arm60.h` (the CPU, memory, the shifter and the flags), `arm_core` (dispatch, the return check), `arm_stub` (no OS: the self-test), `arm_selftest`; `pf` (Portfolio's frame: the boot, the OS's memory above VRAM, folio tables of traps, SWI and slot dispatch by the SDK's names, the trace; items) and `pfboot` | Portfolio's functions: items, memory lists, signals and messages, tasks, the File folio and the CD device; the CEL engine proper: quads, PIXC, the pixel processor |
+| 5. Runtime | What an engine links | `runtime/` (C99): `tdk_opera` (files out of a disc image), `tdk_cel` (cels to RGBA), `tdk_stream` (DataStream, Cinepak with an optional dither, SDX2); `tdkcheck`. For recompiled code (C++20): `arm60.h` (the CPU, memory, the shifter and the flags), `arm_core` (dispatch, the return check), `arm_stub` (no OS: the self-test), `arm_selftest`; `pf` (Portfolio's frame: the boot, the OS's memory above VRAM, folio tables of traps, SWI and slot dispatch by the SDK's names, the trace; items, lists, the memory lists and their allocator, the Graphics folio's node) and `pfboot`; `pfcheck` (the runtime against the 1993 OS's own code) | Portfolio's functions: screens, signals and messages, tasks, the File folio and the CD device; the CEL engine proper: quads, PIXC, the pixel processor |
 
 ## Principles
 
@@ -170,6 +173,8 @@ both discs:
 | `cinepak` | 120 frames of two films identical to the port's decoder, and 40 frames with Immercenary's dither identical to its console-colour path, which is itself checked against the colour table the game builds |
 | `audio` | 29 AIFF files on Immercenary and 37 on OMF2097, 8- and 16-bit, mono and stereo, 22,050 to 44,100 Hz: every one decodes, and the one sustain loop (`sinewave.aiff`, 833 to 3,393) is inside its sound. SDX2 through the streams below |
 | `dsp` | 64 instruments of 23.10, 77 of 24.225 and 53 of Crash 'n Burn's 1993 set: every file walks to its last byte and every structural claim holds. 60 of the 64 the first two share carry the same code; `splitexec` in 24.225 is format version 3, `dcsqxdstereo` and `timesplus` in 1993 format version 1 |
+| `aif --decompress` | the image's own decompressor, run in `armemu`: Crash 'n Burn's `os_code` (v0.16), `GRAPHIX` and `AUDIOFOLIO`, Immercenary's `os_code` and `graphix` unpack, each header turned to a NOP; the kernel unpacks to the same bytes as a run by hand, its strings and vector table read where its code points |
+| `pfcheck` | the runtime's memory allocator against the 1993 kernel's (`os_code` v0.16, its functions' addresses checked against its own vector and SWI tables): six random runs of 4,000 calls each from Crash 'n Burn's boot (12,174 allocations of every kind, alignment and bank, 1,494 of them in supervisor mode, 1,519 refused; frees; 2,001 scavenges, 916 of which returned pages) give the same result for every call and the same guest memory after, byte for byte; two faults put into the runtime by hand (no merge with the next free node; no length in an allocation's first word) are each caught |
 | `runtime/` | `tdkcheck` against `python -m 3dokit.check`, both reading the disc images directly: 0 lines differ over Immercenary (460 cel files, every frame's RGBA; 48 streams, the first 8 frames of every film and every sample of sound) and OMF2097 (1,308 cel files). The C decodes all of Immercenary's 29,659 film frames in 20 seconds. The dithered Cinepak path gives the same CRC in C and Python |
 
 ## Known gaps
@@ -204,10 +209,15 @@ both discs:
 * **Portfolio is a frame, not yet an OS.** `pfboot` boots a program, lays
   out KernelBase and the folio tables, and dispatches every SWI and vector
   slot by the SDK's name, but implements only the beginning: `kprintf`, the
-  AIF startup's slot -120, items (`FindItem` by type and name, `OpenItem`,
-  `CloseItem`, `LookupItem`, the folios registered as items) and the File
-  folio's `ChangeDirectory`. Crash 'n Burn's `launchme` finds and opens the
-  Graphics folio and stops at `FindMH`: the memory lists come next. The
+  AIF startup's slot -120 (the kernel's command-line parser), items
+  (`FindItem` by type and name, `OpenItem`, `CloseItem`, `LookupItem`, the
+  folios registered as items), the File folio's `ChangeDirectory`, and
+  memory: the MemHdrs, the OS's and the task's MemLists in `mem.h`'s
+  layout, `AllocMemFromMemLists`, `FreeMemToMemLists`, `ScavengeMem`,
+  `GetPageSize`, `FindMH` and `AllocMemBlocks` as the 1993 kernel does them
+  (`pfcheck`), and the Graphics folio's node as the folio fills it when it
+  starts. Crash 'n Burn's `launchme` gets the VRAM bank of the zero page and
+  stops at `CreateScreenGroup`: the screens come next. The
   emitter computes every flag it sets
   (no liveness pass yet), reads literal pools from memory rather than
   folding them, and a return to anywhere but its call's next word stops

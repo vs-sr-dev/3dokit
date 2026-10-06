@@ -21,6 +21,7 @@ unsigned long long g_pf_max_calls;
 struct PfExit { int code; };
 
 static const uint32_t kExitSentinel = 0xFFFFFFF0u;
+static const uint32_t kStackBase = 0x00200000u - 0x10000;   // the program's stack: 64 KB under the top of DRAM
 
 // ---- names -----------------------------------------------------------------------------
 const char* pf_swi_name(uint32_t number) {
@@ -227,14 +228,16 @@ static void build_folios() {
 
 static void pf_exit_swi(ArmCpu& c) { throw PfExit{(int)c.r[0]}; }
 
-int pf_run(const uint8_t* image, size_t size, uint32_t bss_end, uint32_t entry) {
+static const ArmModule* g_module;
+
+int pf_boot(const uint8_t* image, size_t size, uint32_t bss_end) {
     if (size > ARM_MEM_SIZE || bss_end > ARM_MEM_SIZE) {
         std::fprintf(stderr, "the program does not fit in DRAM\n");
         return 2;
     }
     std::memset(g_arm_mem, 0, ARM_MEM_SIZE);
     std::memcpy(g_arm_mem, image, size);
-    const ArmModule* m = arm_identify();
+    const ArmModule* m = g_module = arm_identify();
     if (!m) {
         std::fprintf(stderr, "no recompiled module matches this program\n");
         return 2;
@@ -243,18 +246,29 @@ int pf_run(const uint8_t* image, size_t size, uint32_t bss_end, uint32_t entry) 
     build_folios();
     pf_on_swi(0x11, pf_exit_swi);
     pf_kernel_init();
+    pf_mem_init(m->name, bss_end, kStackBase);
     pf_file_init();
+    pf_graphics_init();
     // argv: the program's name, in the OS's memory
     const uint32_t argv = PF_OS_BASE + 0x100, name = PF_OS_BASE + 0x110;
     os_put(argv, name, 4);
     os_put(argv + 4, 0, 4);
     std::memcpy(g_os + (name - PF_OS_BASE), m->name, std::strlen(m->name) + 1);
+    return 0;
+}
+
+const uint8_t* pf_os_memory() { return g_os; }
+
+int pf_run(const uint8_t* image, size_t size, uint32_t bss_end, uint32_t entry) {
+    if (int bad = pf_boot(image, size, bss_end)) return bad;
+    const ArmModule* m = g_module;
+    const uint32_t argv = PF_OS_BASE + 0x100;
     ArmCpu c{};
     c.r[5] = 1;                                 // argc
     c.r[6] = argv;
     c.r[7] = pf_folio_base(PF_KERNEL);          // KernelBase
     c.r[13] = 0x00200000u - 16;                 // the stack: the top of DRAM
-    c.r[10] = 0x00200000u - 0x10000;            // sl, 64 KB below
+    c.r[10] = kStackBase;                       // sl, 64 KB below
     c.r[14] = kExitSentinel;
     c.budget = 1 << 20;
     pf_log("boot %s: entry %08X, KernelBase %08X, bss to %08X\n", m->name, entry, c.r[7], bss_end);

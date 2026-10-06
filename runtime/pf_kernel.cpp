@@ -54,8 +54,53 @@ static void k_kprintf(ArmCpu& c) {
 
 // Kernel -120: what the AIF startup calls before main, with argc and argv
 // in r0 and r1, and whose r0 and r1 main then receives. No SDK header or
-// library names it; until a program shows it does more, it hands them on.
+// library names it. In the 1993 kernel (os_code v0.16, at 0x10ea0) it is the
+// command line's parser: when the word at the top of the stack is not 0 the
+// loader left the command line there, and it is split at spaces into argv
+// words built below it, sp moved down past them. The loader here leaves no
+// command line (the word is 0), and then argc and argv go on untouched.
 static void k_startup(ArmCpu& c) { (void)c; }
+
+// ---- lists (list.h) ------------------------------------------------------------------------
+// What the kernel's own InitList, AddHead, AddTail, InsertNodeFromTail and RemNode do. The
+// anchor's two halves are pseudo-nodes: the first node's n_Prev is the list + 0x14, the last
+// node's n_Next the list + 0x18, so linking before or after any node needs no special case.
+void pf_list_init(uint32_t l, const char* name) {
+    pf_w8(l + 8, 1);                                // KERNELNODE
+    pf_w8(l + 9, 2);                                // LISTNODE
+    pf_w8(l + 11, 0x80);                            // NODE_NAMEVALID
+    pf_w32(l + 12, PF_LIST_SIZE);
+    pf_w32(l + 16, name ? pf_os_string(name) : 0);
+    pf_w32(l + PF_LIST_HEAD, l + PF_LIST_TAIL);
+    pf_w32(l + PF_LIST_TAIL, 0);
+    pf_w32(l + PF_LIST_LAST, l + PF_LIST_HEAD);
+}
+
+void pf_list_insert_before(uint32_t at, uint32_t n) {
+    uint32_t prev = pf_r32(at + 4);
+    pf_w32(n, at);
+    pf_w32(n + 4, prev);
+    pf_w32(prev, n);
+    pf_w32(at + 4, n);
+}
+
+void pf_list_add_head(uint32_t l, uint32_t n) { pf_list_insert_before(pf_r32(l + PF_LIST_HEAD), n); }
+void pf_list_add_tail(uint32_t l, uint32_t n) { pf_list_insert_before(l + PF_LIST_TAIL, n); }
+
+// After the last node whose n_Priority is at least the new one's.
+void pf_list_insert_from_tail(uint32_t l, uint32_t n) {
+    uint32_t at = pf_r32(l + PF_LIST_LAST);
+    while (at != l + PF_LIST_HEAD && pf_r8(at + 10) < pf_r8(n + 10)) at = pf_r32(at + 4);
+    pf_list_insert_before(pf_r32(at), n);
+}
+
+void pf_list_rem_node(uint32_t n) {
+    uint32_t next = pf_r32(n), prev = pf_r32(n + 4);
+    if (!next) return;
+    pf_w32(prev, next);
+    pf_w32(next + 4, prev);
+    pf_w32(n, 0);
+}
 
 // ---- items ---------------------------------------------------------------------------------
 // An item number is an index into this table; 0 is no item. The node's
