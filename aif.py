@@ -17,10 +17,14 @@ image linked at address 0 and relocated by the loader:
     0x80  the 3DO binary header, 128 bytes
     0x100 code
 
-After `ro + rw` come a 184-byte self-relocation stub and a list of word
-offsets the loader relocates, ended by 0xffffffff -- the exact list of words
-in the image that are addresses rather than numbers. A signed image carries
-its signature after that: `signature` is its file offset and it is 64 bytes.
+Where the BL at 0x04 points comes a 184-byte self-relocation stub and a list
+of word offsets the loader relocates, ended by 0xffffffff -- the exact list
+of words in the image that are addresses rather than numbers. That is
+`ro + rw + debug` on every SDK image, but not on every game's: Crash 'n
+Burn's three programs (1993) put it 4 bytes further on, and that extra word
+is part of the image -- one of Orion's relocations points at it. So the BL
+is what is read, and the sum only when there is no BL. A signed image carries its
+signature after that: `signature` is its file offset and it is 64 bytes.
 
 The 3DO binary header at 0x80, as far as the discs read so far agree on it:
 
@@ -83,6 +87,9 @@ class AIF:
          self.max_usecs) = struct.unpack_from('>5I', h, 0x28)
         self.name = h[0x40:0x60].split(b'\0')[0].decode('latin1')
         self.time = struct.unpack_from('>I', h, 0x60)[0]
+        self.stub = self._bl_target(0x04)
+        if self.stub is None:
+            self.stub = self.ro + self.rw + self.debug
         self.relocs = [] if self.compressed else self._relocs()
 
     def _bl_target(self, at):
@@ -95,7 +102,7 @@ class AIF:
         return at + 8 + off * 4
 
     def _relocs(self):
-        out, o = [], self.ro + self.rw + STUB
+        out, o = [], self.stub + STUB
         while o + 4 <= len(self.d):
             v = struct.unpack_from('>I', self.d, o)[0]
             if v == 0xffffffff:
@@ -134,7 +141,7 @@ class AIF:
         bad = []
         if self.compressed:
             return bad
-        end = self.ro + self.rw + STUB + 4 * (len(self.relocs) + 1)
+        end = self.stub + STUB + 4 * (len(self.relocs) + 1)
         if self.signed:
             if self.signature < end or \
                     self.signature + self.signature_len != len(self.d):
@@ -146,7 +153,8 @@ class AIF:
             bad.append('file is %d bytes, relocations end at %d'
                        % (len(self.d), end))
         for r in self.relocs:
-            if r & 3 or r >= self.ro + self.rw:
+            # up to the stub, not to ro + rw: Orion's extra word is relocated
+            if r & 3 or r >= self.stub:
                 bad.append('relocation %#x outside the image' % r)
                 break
         if self.entry is None or not 0x80 <= self.entry < self.ro:

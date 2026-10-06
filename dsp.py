@@ -12,7 +12,9 @@ Each file is IFF:
       NAME                  the file's own name
       FORM DSPP
         DHDR                4 words: a catalogue number, a format version
-                            (2; 3 on `splitexec` in 24.225), then two zeros
+                            (2; 3 on `splitexec` in 24.225; 1 on
+                            `dcsqxdstereo` and `timesplus` in the 1993
+                            set), then two zeros
         DCOD                3 words -- 0, 12, and a code word count -- then
                             that many 16-bit DSP instructions
         DRSC                16 bytes a resource: type, count-or-offset, 0, 0
@@ -206,8 +208,8 @@ def verify(where):
             bad['the outer FORM does not cover the file'] += 1
         if d[:4] != b'FORM' or d[8:12] != b'3INS':
             bad['not a FORM 3INS'] += 1
-        if i.version not in (2, 3):
-            bad['DHDR version is not 2 or 3'] += 1
+        if i.version not in (1, 2, 3):
+            bad['DHDR version is not 1, 2 or 3'] += 1
         if struct.unpack_from('>2I', i.chunks['DHDR'], 8) != (0, 0):
             bad['DHDR does not end in two zeros'] += 1
         h = struct.unpack_from('>3I', i.chunks['DCOD'])

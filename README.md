@@ -34,13 +34,15 @@ settle a hardware question, the Opera emulator's MADAM was the reference.
 
 ## Using it
 
-For now 3dokit lives inside pc-immercenary, at `3dokit/`, the way ps2kit
-lives inside pc-extermination and jaguarkit inside pc-highlander: one game
-does not yet make a platform. When a second 3DO port begins it is split out
-with its history (`git subtree split --prefix=3dokit`) and every port then
-takes it as a git submodule at `3dokit/`.
+3dokit is its own repository. A port takes it as a git submodule at
+`3dokit/`:
 
-Either way it sits at the port's root, so that `python -m 3dokit.…` works
+```sh
+git submodule add <3dokit's URL> 3dokit
+git clone --recursive <a port's URL>       # or: git submodule update --init
+```
+
+It sits at the port's root, so that `python -m 3dokit.…` works
 from there and an engine can compile `3dokit/runtime/*.c`. The package name
 starts with a digit, so Python code imports it with
 `importlib.import_module('3dokit.cel')`.
@@ -136,7 +138,7 @@ both discs:
 | Module | Checked by |
 |---|---|
 | `disc` | Immercenary (raw 2352, 747 files, 43 directories, 552.5 MiB) and OMF2097 (iso 2048, 1,502 files, 186 directories): the same 790 and 1,688 entries as the port's own reader. Every copy read and compared: Immercenary's 288 extra copies are 279 identical, 8 directories that differ only in the case of names and 1 `rom_tags` copy with its own relative offsets; OMF2097's 374 are 372 identical and 2 that really differ (its second label says one block fewer, its second `rom_tags` is the devkit's table before `3DOEncrypt` rewrote the first). The ROM tags land on `boot_code` and `os_code` on both, and on `misc_code`, `BannerScreen` and `LaunchMe` on OMF2097 |
-| `aif` | 57 images on Immercenary and 39 on OMF2097: every uncompressed one ends exactly where its relocation list does, or its signature does when signed (12 and 15 signed, 14 and 20 compressed). OMF2097's `LaunchMe` header carries the stack (16,384), name and time its Makefile gives `modbin`; the System images' node versions equal the `os_code` tag's |
+| `aif` | 57 images on Immercenary, 39 on OMF2097 and 34 on Crash 'n Burn: every uncompressed one ends exactly where its relocation list does, or its signature does when signed (12, 15 and 7 signed, 14, 20 and 4 compressed). The stub is where the BL at 0x04 points: `ro + rw` on the first two discs, 4 bytes on from it on Crash 'n Burn's three programs, whose extra word one of Orion's relocations points at. OMF2097's `LaunchMe` header carries the stack (16,384), name and time its Makefile gives `modbin`; the System images' node versions equal the `os_code` tag's |
 | `arm` | the same function starts, calls, tail calls, references and code end as the port's cross-referencer on all five of Immercenary's programs (`p` 1,308 functions, `p1e` 1,066, `launchme` 84, `CinepakSubroutine` 484, `SpeechSubroutine` 188) |
 | `portfolio` | Immercenary's five programs: exactly the port's scanner's SWI count less one each -- `svcvs #0`, which is the string `"audio"` and which the port's notes had listed as an unidentified folio-0 call. 109 of 109 vector sites attributed in `p`, 104 of 104 in `p1e`. Counting only SWIs control flow reaches drops OMF2097's 7,000-odd `svc`s decoded from linked-in asset data to 134 |
 | `shapes` | on `p`: 60 functions proved library and 10 closed under it, as the port's own classifier; `p` against `p1e`: 938 pairs, 532 by shape, 211 by call, 79 by gap, 72 by alignment, 44 by string, 0 contradictions -- the port's own pairing, pass for pass. Across discs, OMF2097's System (24.225) proves 22 of `p`'s functions library, and its `LaunchMe` adds 2 to Immercenary's own corpus (the sound spooler): the devkit's libraries are not the 1995 SDK's shapes |
@@ -144,7 +146,7 @@ both discs:
 | `stream` | 48 streams on Immercenary, 4 of them led by a marker table: the same chunks as the port's own walker, 29,659 film frames, and `FILM`, `SNDS`, `CTRL` (`SYNC`, `STOP`, `GOTO`, `ALRM`), `DACQ`, `SCEL` and a game's own `FMOD` carried |
 | `cinepak` | 120 frames of two films identical to the port's decoder, and 40 frames with Immercenary's dither identical to its console-colour path, which is itself checked against the colour table the game builds |
 | `audio` | 29 AIFF files on Immercenary and 37 on OMF2097, 8- and 16-bit, mono and stereo, 22,050 to 44,100 Hz: every one decodes, and the one sustain loop (`sinewave.aiff`, 833 to 3,393) is inside its sound. SDX2 through the streams below |
-| `dsp` | 64 instruments of 23.10 and 77 of 24.225: every file walks to its last byte and every structural claim holds. 60 of the 64 they share carry the same code; `splitexec` in 24.225 is format version 3 |
+| `dsp` | 64 instruments of 23.10, 77 of 24.225 and 53 of Crash 'n Burn's 1993 set: every file walks to its last byte and every structural claim holds. 60 of the 64 the first two share carry the same code; `splitexec` in 24.225 is format version 3, `dcsqxdstereo` and `timesplus` in 1993 format version 1 |
 | `runtime/` | `tdkcheck` against `python -m 3dokit.check`, both reading the disc images directly: 0 lines differ over Immercenary (460 cel files, every frame's RGBA; 48 streams, the first 8 frames of every film and every sample of sound) and OMF2097 (1,308 cel files). The C decodes all of Immercenary's 29,659 film frames in 20 seconds. The dithered Cinepak path gives the same CRC in C and Python |
 
 ## Known gaps
@@ -200,6 +202,13 @@ launcher tag, signed and compressed AIFs, SWIs counted by control flow,
 The port's own tools still use their own copies; moving them onto the kit is
 the next step on the port's side, and `tdkcheck` and `--check` are what say
 it held.
+
+When the second 3DO port began, a static recompilation of Crash 'n Burn
+(1993), the kit was split out of pc-immercenary with `git subtree split
+--prefix=3dokit` into a repository of its own. Crash 'n Burn's disc is the
+kit's third: `disc`, `cel` and `audio` read it unchanged, `aif` learnt
+where the relocation stub really is, and `dsp` the instrument format's
+version 1.
 
 ## Licence
 
