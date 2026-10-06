@@ -24,7 +24,17 @@ The compiler parks string literals inside the code, so a linear sweep
 decodes them as instructions; `string_spans` maps every byte of every
 printable run so the disassembly can print the text instead.
 
-A symbol file is `hexaddr name  # note`, one a line; `-S` reads one.
+**Embedded names.** The ARM C compiler (Norcroft) can leave each function's
+name in the code just before it: the name, NUL-padded to a word, then a word
+`0xff000000 + the padded length`, then the function's first instruction.
+Debuggers walked back from a frame to read it. A game built that way names
+every function it compiled; the libraries it links, built otherwise, stay
+unnamed. `embedded_names` reads them, keeping only a marker whose next word
+is a function start.
+
+A symbol file is `hexaddr name  # note`, one a line; `-S` reads one, and
+`--names` writes the embedded names as one. Without `-S` the embedded names
+are used.
 
     python -m 3dokit.arm GAME -s 'regex'        # who references matching strings
     python -m 3dokit.arm GAME -a 89680          # who references an address
@@ -32,6 +42,7 @@ A symbol file is `hexaddr name  # note`, one a line; `-S` reads one.
     python -m 3dokit.arm GAME -d fe30 -n 60     # disassemble
     python -m 3dokit.arm GAME -S game.sym -d fe30
     python -m 3dokit.arm GAME --stats           # functions, calls, the call graph's reach
+    python -m 3dokit.arm GAME --names > game.sym  # the compiler's embedded names
 """
 import argparse
 import bisect
@@ -215,6 +226,19 @@ class Image:
         ops = i.op_str
         return ops.startswith('pc,') or ops.startswith('pc ')
 
+    def embedded_names(self):
+        """{function start: name} from the compiler's name markers."""
+        out = {}
+        for a in range(self.code_start, self.code_end - 4, 4):
+            w = struct.unpack_from('>I', self.d, a)[0]
+            n = w & 0xffffff
+            if w >> 24 != 0xff or not 0 < n <= 256 or n & 3 or                     a + 4 not in self.funcs:
+                continue
+            raw = self.d[a - n:a].rstrip(b'\0')
+            if raw and b'\0' not in raw and all(0x20 < c < 0x7f for c in raw):
+                out[a + 4] = raw.decode('latin1')
+        return out
+
     def func_of(self, addr):
         k = bisect.bisect_right(self.fstarts, addr) - 1
         return self.fstarts[k] if k >= 0 else None
@@ -284,10 +308,16 @@ def main(argv=None):
     ap.add_argument('-n', '--count', type=int, default=80)
     ap.add_argument('-S', '--symbols', help='a symbol file')
     ap.add_argument('--stats', action='store_true')
+    ap.add_argument('--names', action='store_true',
+                    help='print the embedded names as a symbol file')
     a = ap.parse_args(argv)
 
     im = Image(a.image)
-    sym = read_symbols(a.symbols) if a.symbols else {}
+    if a.names:
+        for f, n in sorted(im.embedded_names().items()):
+            print('%08x %s' % (f, n))
+        return 0
+    sym = read_symbols(a.symbols) if a.symbols else im.embedded_names()
     strs = im.strings()
 
     def name(f):
@@ -310,6 +340,7 @@ def main(argv=None):
               'the rest are reached some other way (a pointer handed to the '
               'OS) or not at all' % (len(reached), entry))
         print('%d distinct literal values' % len(im.litrefs))
+        print('%d functions named by the compiler' % len(im.embedded_names()))
 
     if a.string:
         rx = re.compile(a.string)
