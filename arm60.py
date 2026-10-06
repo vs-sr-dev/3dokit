@@ -22,8 +22,8 @@ that needs them is data, not code: the halfword and signed-byte transfers
 (`ldrh`, `ldrsb`... ARMv4), the long multiplies (`umull`... ARMv3M), `bx`
 (ARMv4T), a register-shifted single transfer (bit 4 set), every
 coprocessor instruction, and the NV condition (never emitted by a compiler;
-deprecated by ARM), and a data-processing word whose should-be-zero field
-(Rn of MOV/MVN, Rd of TST/TEQ/CMP/CMN) is not.
+deprecated by ARM), and a word whose should-be-zero field (Rn of MOV/MVN
+and of MUL, Rd of TST/TEQ/CMP/CMN) is not.
 
 An operand2 is `('imm', value, carry)` -- the 8-bit immediate rotated, and
 the shifter's carry out, None when the rotation is 0 and the carry is the
@@ -185,8 +185,9 @@ def decode(word, addr=0):
                 i.a, i.s = (word >> 21) & 1, (word >> 20) & 1
                 i.rd, i.rn = (word >> 16) & 15, (word >> 12) & 15
                 i.rs, i.rm = (word >> 8) & 15, word & 15
-                if i.rd == PC or i.rd == i.rm:
-                    i.kind = 'undefined'      # unpredictable: never compiled
+                if i.rd == PC or i.rd == i.rm or (not i.a and i.rn):
+                    # unpredictable, or MUL's should-be-zero Rn: never compiled
+                    i.kind = 'undefined'
                 return i
             if (word >> 23) & 0x1f == 2 and (word >> 20) & 3 == 0 and \
                     (word >> 4) & 0xff == 9:

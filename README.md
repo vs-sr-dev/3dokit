@@ -66,6 +66,9 @@ python -m 3dokit.aof SDK/lib/3do/*.lib --glue         # folio slots its glue nam
 python -m 3dokit.arm60 GAME --dis 100 -n 40         # ARMv3, decoded exactly
 python -m 3dokit.arm60 GAME --check                 # ...against capstone
 python -m 3dokit.recomp.discover GAME --report      # functions, code and data
+python -m 3dokit.armemu --test                      # the ARM60 interpreter's known answers
+python -m 3dokit.armemu --check                     # ...and random words against unicorn
+python -m 3dokit.armemu GAME --call 17418 --regs r0=100,r1=100   # run one function
 python -m 3dokit.shapes library GAME --corpus 'build/disc/System/Programs/*'
 python -m 3dokit.shapes pair A B --names a.sym --out b.sym
 python -m 3dokit.cel FILE --png out/                  # frames as RGBA PNG
@@ -126,13 +129,14 @@ both discs:
 | 1. Recognise | What is on this disc? | `disc` (Opera, copies, ROM tags, `--verify`), `aif` (AIF, the 3DO header, compressed or signed) | fonts in `System/Graphics/Fonts`; what the ROM tag of type 0x0c holds |
 | 2. Extract | Turn standard formats into standard files | `disc --extract`, `cel` (every depth and coding, PLUTA, the hardware's transparency, `IMAG`), `stream`, `cinepak`, `audio` (SDX2, AIFF/AIFC, loops), `dsp`, `pixels` | the streamed-cel subscriber (`SCEL`); AIF decompression |
 | 3. Map code | What does the code do, where? | `arm` (functions, calls, tail calls, references, control flow, symbols, the compiler's embedded names), `portfolio` (SWIs and folio vectors, attributed and named), `sdk` (the SDK's names for every SWI and slot), `aof` (the SDK's ARM Object Format libraries), `shapes` (library proved against a corpus; two programs paired, names carried, a data map) | a corpus from the SDK's own libraries for `shapes` |
-| 4. Translate | Turn ARM60 code into C | `arm60` (the instruction set, ARMv3 exactly), `recomp.discover` (functions, code and data, switches, indirect transfers) | the emitter, an ARM60 interpreter and the self-test: see *Known gaps* |
+| 4. Translate | Turn ARM60 code into C | `arm60` (the instruction set, ARMv3 exactly), `armemu` (an ARM60 interpreter: the reference), `recomp.discover` (functions, code and data, switches, indirect transfers) | the emitter and the self-test: see *Known gaps* |
 | 5. Runtime | What an engine links | `runtime/` (C99): `tdk_opera` (files out of a disc image), `tdk_cel` (cels to RGBA), `tdk_stream` (DataStream, Cinepak with an optional dither, SDX2); `tdkcheck` | the CEL engine proper: quads, PIXC, the pixel processor |
 
 ## Principles
 
 * Pure Python 3.8+, no dependencies, except `arm`, `portfolio`, `shapes`
-  and `aof --glue` (capstone). The runtime is C99 with no dependencies.
+  and `aof --glue` (capstone); `armemu --check` is checked against
+  unicorn. The runtime is C99 with no dependencies.
 * Every claim is checked on a real disc before it goes in. What no disc
   shows is refused with an error rather than guessed.
 * Game knowledge stays out. Where games differ -- a dither in a film
@@ -150,6 +154,7 @@ both discs:
 | `portfolio` | Immercenary's five programs: exactly the port's scanner's SWI count less one each -- `svcvs #0`, which is the string `"audio"` and which the port's notes had listed as an unidentified folio-0 call. 109 of 109 vector sites attributed in `p`, 104 of 104 in `p1e`. Counting only SWIs control flow reaches drops OMF2097's 7,000-odd `svc`s decoded from linked-in asset data to 134. Crash 'n Burn's 1993 SDK opens a folio differently (the item stored first, `LookupItem`'s pointer 0x68 bytes on) and shares one pool word between two globals (`ldr rN, [rN, #4]`): with both read, its `launchme` has 113 of 116 sites attributed (Graphics 38, Kernel 29, audio 42, File 4) where it had 75, and the other six programs' attribution is unchanged |
 | `arm60` | every word of the read-only area of five programs from three toolchains (Crash 'n Burn's `launchme` and `Orion`, Immercenary's `p` and `p1e`, OMF2097's `LaunchMe`) against capstone: 0 disagreements; what capstone decodes and `arm60` refuses is ARMv4 and later (`ldrh`, `ldrsb`, `strh`, `smlal`, `movt`...), coprocessors, and should-be-zero fields set -- data |
 | `recomp.discover` | five programs, 0 descents into data: Crash 'n Burn's `launchme` 553 functions (every one of its 292 embedded names among them), 43,783 code words, 16 switches (one with its last case's code after the table), the 45 functions its relocations point at, and hand-written code in the read-write area past `code_end`; its `Orion` 133 (47 names), 1 switch; Immercenary's `p` 1,240 and `p1e` 1,005, 38 and 28 switches (`arm`'s counts, 1,308 and 1,066, also take `bl`s decoded from data; the two are not yet reconciled); OMF2097's `LaunchMe` 346, where a `bne`/`beq` pair with a literal pool after it taught the descent to stop on inverse conditions |
+| `armemu` | 8 known-answer tests of what the ARM60 does and an ARMv5 does not (the unaligned `ldr`'s rotation, big-endian; `pc` read as +12 under a register shift and stored as +12; `ldm`/`stm` with the base in the list; the register shifter by 0, 32 and more; `msr` on the flags; user mode's unpredictables refused). 27,819 random ARMv3 data-processing, multiply and transfer words from random states, against unicorn's ARM926 in big-endian: 0 differences, those cases set aside. On Crash 'n Burn's `launchme`, `Arctan` and `Distance` run as the game's own code, through its division routine |
 | `sdk` | generated from the 1.2, 1.3 and 2.5 SDKs' headers and the 3do-devkit's libraries (`aof --glue`): 105 SWIs and 184 slots. The three header sets give no SWI two names; their slot lists agree with the libraries' glue on every slot both have. Every name Immercenary's reading had pinned is the SDK's function. On Crash 'n Burn every SWI is named but `0:0` (data decoded as `svcne`) and every slot but one (Kernel -120, used by the AIF startup and in no header); the SDK also corrects one guess in Immercenary's notes (0x10011 is `ReadHardwareRandomNumber`, not a timer) |
 | `aof` | every member of the 3do-devkit's 28 libraries read (632): areas, relocations of both forms, symbols; the glue of Graphics (46 slots), the Kernel, audio (46), File (14), Operamath (8), Compression, International and JString found by the global it reads |
 | `shapes` | on `p`: 60 functions proved library and 10 closed under it, as the port's own classifier; `p` against `p1e`: 938 pairs, 532 by shape, 211 by call, 79 by gap, 72 by alignment, 44 by string, 0 contradictions -- the port's own pairing, pass for pass. Across discs, OMF2097's System (24.225) proves 22 of `p`'s functions library, and its `LaunchMe` adds 2 to Immercenary's own corpus (the sound spooler): the devkit's libraries are not the 1995 SDK's shapes |
@@ -190,8 +195,7 @@ both discs:
   carried, not read. The `FHDR` scale word is not a reliable frame rate.
 * **The DSP's instructions** are carried, not read.
 * **No emitter yet.** `recomp.discover` finds the functions; the C++
-  emitter, the ARM60 interpreter for the self-test and the runtime are to
-  come. What the 3DO has going for it here is worth saying: on Immercenary the call graph closes with no jump table and no
+  emitter, the self-test against `armemu` and the runtime are to come. What the 3DO has going for it here is worth saying: on Immercenary the call graph closes with no jump table and no
   function-pointer table anywhere, every indirect call is a folio vector or
   a pointer handed to the OS, and the whole game is 88,000 ARM60
   instructions with no delay slots. A static recompiler in the
