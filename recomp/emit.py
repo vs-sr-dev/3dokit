@@ -303,7 +303,7 @@ class Body:
     def _pc_write(self, i, a, value):
         """Leave through pc = `value` (an expression of locals), as
         discovery classified the write."""
-        kind = self.p._pc_write(i, a)
+        kind = self.p._pc_write(i, a, self.f)
         if kind == 'return':
             self._count('return')
             return 'c.pc = %s & ~3u; return;' % value

@@ -26,8 +26,10 @@ word as code or data while it finds the functions:
    make a function (the read-only data decodes as plenty of them).
 4. **Indirect transfers**: `mov lr, pc` followed by a write to `pc` is a
    call and returns to the word after it; a folio vector is
-   `ldr pc, [rB, #-slot]` (`portfolio`); anything else that writes `pc` is
-   a jump through a pointer, listed.
+   `ldr pc, [rB, #-slot]` (`portfolio`); a load of `pc` from the word the
+   function stored `lr` in, both addresses computed from `pc`, is a return
+   (hand-written code that parks its return address in a word of its own);
+   anything else that writes `pc` is a jump through a pointer, listed.
 5. **The compiler's switch**: `cmp rI, #n` ... `addls pc, pc, rI, lsl #2`,
    then `b default`, then n+1 cases, each a `b case` word except perhaps the
    last, whose code can follow the table: every case is a code address.
@@ -200,7 +202,7 @@ class Program:
                     a += 4
                     continue
                 if i.writes_pc():
-                    kind = self._pc_write(i, a)
+                    kind = self._pc_write(i, a, f)
                     if kind == 'switch':
                         targets = self._switch(f, a)
                         if targets is None:
@@ -235,7 +237,7 @@ class Program:
         taken.add(cond)
         return cond ^ 1 in taken
 
-    def _pc_write(self, i, a):
+    def _pc_write(self, i, a, f=None):
         if i.kind == 'dp' and i.op == 4 and i.rn == PC and i.op2[0] == 'reg' \
                 and i.op2[2] == 'lsl' and i.op2[3] == 2 and i.cond == 9:
             return 'switch'                                  # addls pc, pc, rI, lsl #2
@@ -245,11 +247,61 @@ class Program:
             return 'return'                                  # ldm ..., pc
         if i.kind == 'sdt' and i.l and i.rn == SP and not i.p and i.u:
             return 'return'                                  # ldr pc, [sp], #4
+        if f is not None and self._parked_lr(f, i, a):
+            return 'return'                                  # ldr pc, [the word lr was stored in]
         prev = self.at(a - 4) if a - 4 >= self.start else None
         if prev is not None and prev.kind == 'dp' and prev.op == 13 and \
                 prev.rd == LR and prev.op2 == ('reg', PC, 'lsl', 0):
             return 'call'                                    # mov lr, pc first
         return 'jump'
+
+    def _pc_relative(self, f, a, reg, cond):
+        """The value of `reg` before the instruction at `a`, if the straight
+        line just before it computes it from pc: `add/sub reg, pc, #k`, then
+        any number of `add/sub reg, reg, #k`, each unconditional or under
+        `cond`, all in f's code. None otherwise."""
+        more, b = 0, a - 4
+        while b in f.code and a - b <= 32:
+            j = self.at(b)
+            if reg in j.writes():
+                if j.kind != 'dp' or j.op not in (2, 4) or j.op2[0] != 'imm' or \
+                        j.cond not in (14, cond):
+                    return None
+                k = j.op2[1] if j.op == 4 else -j.op2[1]
+                if j.rn == PC:
+                    return (b + 8 + k + more) & 0xFFFFFFFF
+                if j.rn != reg:
+                    return None
+                more += k
+            b -= 4
+        return None
+
+    def _transfer_address(self, f, i, a):
+        """The constant address a single transfer at `a` uses, or None."""
+        if i.offset[0] != 'imm' or i.rn == PC:
+            return None
+        base = self._pc_relative(f, a, i.rn, i.cond)
+        if base is None:
+            return None
+        off = i.offset[1] if i.u else -i.offset[1]
+        return (base + off) & 0xFFFFFFFF if i.p else base
+
+    def _parked_lr(self, f, i, a):
+        """A load of pc from a word the function stored lr in, both
+        addresses computed from pc: hand-written code that parks its return
+        address in a word of its own (Crash 'n Burn's 0x41fd8 and 0x42120)
+        and returns through it."""
+        if i.kind != 'sdt' or not i.l or i.rd != PC or i.b:
+            return False
+        at = self._transfer_address(f, i, a)
+        if at is None:
+            return False
+        for b in f.code:
+            j = self.at(b)
+            if j.kind == 'sdt' and not j.l and not j.b and j.rd == LR and \
+                    self._transfer_address(f, j, b) == at:
+                return True
+        return False
 
     def _indirect_kind(self, i):
         if i.kind == 'sdt' and i.l and i.offset[0] == 'imm' and not i.u and i.p:

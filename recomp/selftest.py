@@ -12,8 +12,7 @@ executable of a generated build replays them on the recompiled code.
 
 Game functions: `--funcs` names them; `--auto` takes every function that,
 on a few random register states, returns without an OS call, without a
-fault, and writing nothing below the end of the read-only area (its code
-and constants): the arithmetic, the fixed-point and table helpers, and
+fault, and writing to none of its code: the arithmetic, the fixed-point and table helpers, and
 with r0-r3 pointing into random data, the routines on vectors and
 structures. The stack is at the top of DRAM with sl below it, as the APCS
 stack check wants. A vector that faults in the interpreter is left out, and
@@ -53,17 +52,18 @@ PC, LR, SP = 15, 14, 13
 
 class JournalMemory(armemu.Memory):
     """armemu's memory with an undo journal, so a vector that faults leaves
-    no trace (the recompiled side never runs it). A write below `protect`
-    (the program's code and constants) faults too: the interpreter would run
-    the changed code, the recompiled C++ cannot."""
+    no trace (the recompiled side never runs it). A write to a word of
+    `protect` (the program's code) faults too: the interpreter would run the
+    changed code, the recompiled C++ cannot. Data words among the code may
+    be written (hand-written routines park their return address there)."""
 
-    def __init__(self, protect=0):
+    def __init__(self, protect=frozenset()):
         super().__init__()
         self.journal = []
         self.protect = protect
 
     def write(self, addr, size, value):
-        if (addr & M32) < self.protect:
+        if (addr & ~3 & M32) in self.protect:
             raise armemu.MemoryError_('a write into the code at %08X' % (addr & M32))
         buf, o = self._find(addr & M32, size)
         self.journal.append((buf, o, bytes(buf[o:o + size])))
@@ -75,7 +75,7 @@ class JournalMemory(armemu.Memory):
         self.journal = []
 
 
-def new_memory(images, protect=0):
+def new_memory(images, protect=frozenset()):
     """Guest memory, zero, with the images (data, base) copied in: what
     arm_selftest.cpp starts from."""
     mem = JournalMemory(protect)
@@ -159,13 +159,13 @@ def image_bytes(aif):
     return aif.d[:aif.stub]
 
 
-def pure_functions(images, prog, rng, ro, trials=5, max_steps=20_000):
+def pure_functions(images, prog, rng, trials=5, max_steps=20_000):
     """{entry: mode} of the functions that return on random states without
-    a fault and without writing below `ro`."""
+    a fault and without writing to the program's code."""
     out = {}
     for e in sorted(prog.funcs):
         for mode in ('game', 'args'):
-            mem = new_memory(images, ro)
+            mem = new_memory(images, prog.code)
             ok = True
             for _ in range(trials):
                 try:
@@ -472,7 +472,7 @@ def write_optest(out_dir, seed=1, vectors=12):
     with open(paths['optest.img'], 'wb') as f:
         f.write(loaded)
     rng = random.Random(seed + 1)
-    mem = new_memory([(loaded, 0), (blob, BLOB)], aif.ro)
+    mem = new_memory([(loaded, 0), (blob, BLOB)], frozenset(range(OPTEST_CODE, aif.ro, 4)))
     lines = ['# 3dokit instruction test: %d functions' % len(funcs),
              'image 00000000 %s' % paths['optest.img'],
              'image %08X %s' % (BLOB, paths['optest_blob.bin']),
@@ -515,7 +515,7 @@ def main(argv=None):
     rng = random.Random(a.seed)
     funcs = {int(x, 16): 'game' for x in a.funcs.split(',') if x}
     if a.auto:
-        found = pure_functions(images, prog, rng, aif.ro)
+        found = pure_functions(images, prog, rng)
         n_args = sum(1 for m in found.values() if m == 'args')
         print('%s: %d of %d functions run without the OS, %d of them with pointer arguments'
               % (name, len(found), len(prog.funcs), n_args))
@@ -525,7 +525,7 @@ def main(argv=None):
              'image 00000000 %s.img' % base,
              'image %08X %s.scratch.bin' % (SCRATCH, base),
              'module %s' % name]
-    mem = new_memory(images, aif.ro)
+    mem = new_memory(images, prog.code)
     total = 0
     for e, mode in sorted(funcs.items()):
         if e not in prog.funcs:
