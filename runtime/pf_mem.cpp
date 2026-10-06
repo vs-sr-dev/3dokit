@@ -403,6 +403,7 @@ void pf_mem_init(const char* task_name, uint32_t image_end, uint32_t stack_base)
     pf_list_add_head(tl, tdram);
     pf_w32(task + T_STACKBASE, stack_base);
     pf_w32(task + T_STACKSIZE, DRAM_TOP - stack_base);
+    pf_w32(task + T_ALLOCATEDSIGS, 0xff);           // the system's eight, as CreateTask (0x16ce4)
     pf_w32(kbase + KB_CURRENTTASK, task);
 
     // the program's memory: its pages, and what its last page holds past it free

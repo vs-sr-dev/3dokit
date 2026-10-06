@@ -245,6 +245,7 @@ int pf_boot(const uint8_t* image, size_t size, uint32_t bss_end) {
     pf_on_swi(0x11, pf_exit_swi);
     pf_kernel_init();
     pf_mem_init(m->name, bss_end, kStackBase);
+    pf_io_init();
     pf_file_init();
     pf_graphics_init();
     // argv: the program's name, in the OS's memory

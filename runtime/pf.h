@@ -90,7 +90,8 @@ enum : uint32_t {
     // KernelBase (kernel.h)
     KB_MEMFREELISTS = 0x74, KB_MEMHDRLIST = 0x78, KB_CURRENTTASK = 0x98,
     // Task (task.h)
-    PF_TASK_SIZE = 0xdc, T_STACKBASE = 0x3c, T_STACKSIZE = 0x40, T_FREEMEMORYLISTS = 0xa8,
+    PF_TASK_SIZE = 0xdc, T_WAITBITS = 0x30, T_SIGBITS = 0x34, T_ALLOCATEDSIGS = 0x38,
+    T_STACKBASE = 0x3c, T_STACKSIZE = 0x40, T_FREEMEMORYLISTS = 0xa8,
     // GrafFolio (graphics.h)
     GF_VBLNUMBER = 0x74, GF_ZEROPAGE = 0x78, GF_VIRSPAGE = 0x7c, GF_VRAMPAGESIZE = 0x80,
     GF_DEFAULTDISPLAYWIDTH = 0x84, GF_DEFAULTDISPLAYHEIGHT = 0x88, GF_VDLFORCEDFIRST = 0x9c,
@@ -145,8 +146,16 @@ extern const char* g_pf_snap_dir;
 void     pf_snap_before(const ArmCpu& c, const char* call);
 [[noreturn]] void pf_snap_after(const ArmCpu& c);
 
+// Devices and IOReqs (pf_io.cpp). A device is a node of devices.h's layout with an item; its
+// driver is a native function that starts an IOReq and calls pf_complete_io when it is done.
+typedef void (*PfDispatchIO)(uint32_t ior);
+uint32_t pf_device_new(const char* name, int max_unit, PfDispatchIO dispatch);
+void     pf_complete_io(uint32_t ior);
+int32_t  pf_signal(uint32_t task, uint32_t bits);   // the kernel's own SendSignal
+
 // The folios' handlers register themselves here.
 void     pf_kernel_init();
+void     pf_io_init();
 void     pf_file_init();
 void     pf_graphics_init();
 

@@ -173,14 +173,24 @@ static void k_finditem(ArmCpu& c) {
     c.r[0] = (uint32_t)PF_ERR_NOTFOUND;
 }
 
+// A device counts its openers (dev_OpenCnt, +0x28: the kernel's OpenDevice and CloseDevice,
+// 0x14b08 and 0x14b54).
+static void count_opens(uint32_t n, int by) {
+    if (pf_r8(n + 8) == 1 && pf_r8(n + 9) == 15) pf_w32(n + 0x28, pf_r32(n + 0x28) + (uint32_t)by);
+}
+
 // swi 0x10005: Item OpenItem(Item found, void* args) -- the item, opened
 static void k_openitem(ArmCpu& c) {
-    if (!pf_item_node((int32_t)c.r[0])) c.r[0] = (uint32_t)PF_ERR_BADITEM;
+    uint32_t n = pf_item_node((int32_t)c.r[0]);
+    if (!n) c.r[0] = (uint32_t)PF_ERR_BADITEM;
+    else count_opens(n, 1);
 }
 
 // swi 0x10008: Err CloseItem(Item)
 static void k_closeitem(ArmCpu& c) {
-    c.r[0] = pf_item_node((int32_t)c.r[0]) ? 0 : (uint32_t)PF_ERR_BADITEM;
+    uint32_t n = pf_item_node((int32_t)c.r[0]);
+    if (n) count_opens(n, -1);
+    c.r[0] = n ? 0 : (uint32_t)PF_ERR_BADITEM;
 }
 
 // Kernel -48: void* LookupItem(Item) -- the node, or NULL
