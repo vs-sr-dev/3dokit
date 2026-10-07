@@ -146,6 +146,8 @@ static void os_call(ArmCpu& c, PfFn fn, const char* what, uint32_t site, const c
         pf_log("[%5llu] %06X %-40s r0=%08X r1=%08X r2=%08X r3=%08X\n", g_ncalls, site, what,
                c.r[0], c.r[1], c.r[2], c.r[3]);
     if (g_pf_max_calls && g_ncalls >= g_pf_max_calls) pf_stop(c, "--max-calls reached");
+    bool snap = g_ncalls == g_pf_snap_call;
+    if (snap) pf_snap_before(c, call);          // a call not implemented yet too: what it is given
     if (!fn) {
         if (g_pf_lenient) {
             pf_log("        (not implemented: returns 0)\n");
@@ -156,8 +158,6 @@ static void os_call(ArmCpu& c, PfFn fn, const char* what, uint32_t site, const c
         std::snprintf(why, sizeof why, "%s: not implemented", what);
         pf_stop(c, why);
     }
-    bool snap = g_ncalls == g_pf_snap_call;
-    if (snap) pf_snap_before(c, call);
     fn(c);
     if (g_pf_trace) pf_log("        -> %08X\n", c.r[0]);
     if (snap) pf_snap_after(c);
