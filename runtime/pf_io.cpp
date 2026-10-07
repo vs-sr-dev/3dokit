@@ -6,7 +6,6 @@
 #include <cstdio>
 #include <cstdlib>
 #include <map>
-#include <utility>
 #include <vector>
 
 enum : uint32_t {
@@ -156,26 +155,36 @@ static void k_sendio(ArmCpu& c) {
     pf_w32(ior + IO_FLAGS, flags);
     auto d = g_drivers.find(dev);
     if (d == g_drivers.end()) pf_stop(c, "SendIO: a device without a driver");
-    d->second(ior);
-    c.r[0] = 0;
+    // the kernel's dispatch (0x1468c): a command done at once is completed here, and SendIO is 1
+    if (d->second(ior)) {
+        pf_complete_io(ior);
+        c.r[0] = 1;
+    } else {
+        c.r[0] = 0;
+    }
 }
 
-// ---- SPORT ----------------------------------------------------------------------------------
-// The VRAM's serial port: copies and clones of whole VRAM pages under a mask, and a fill. Its
-// driver is not on the disc (the 1993 kernel names no device; the console's ROM brings it), so
-// this is the SDK's documentation of it ("The SPORT Device"): SPORTCMD_CLONE (4) repeats the
-// page at ioi_Send over ioi_Recv's length, SPORTCMD_COPY (5) copies ioi_Recv's length from
-// ioi_Send, both keeping the destination's bits where the mask ioi_Offset is clear;
-// FLASHWRITE_CMD (6) writes the value ioi_Offset under the mask ioi_CmdOptions. A copy or clone
-// waits for the vertical blank, when the VRAM's serial port is free ("The copy operation always
-// occurs during vertical blanking"); a FLASHWRITE happens at once.
-static std::vector<uint32_t> g_sport_waiting;   // copies and clones, for the next blank
-
-// A request a driver cannot complete at once: it clears IO_QUICK, so that its completion tells
-// the task. The kernel's SendIO ends by jumping to the driver (0x142e4) and leaves io_Flags to it
-// from there, and a program's WaitIO returns at once while IO_QUICK is set ("If quick I/O was not
-// successful, the kernel performs normal asynchronous I/O and notifies the task").
+// ---- the Operator's devices ----------------------------------------------------------------
+// The SPORT and timer drivers are not on the disc: the 1993 kernel names no device, and the
+// console's ROM brings them, in its Operator (the FZ-1's, built 3 August 1993, an AIF image at the
+// ROM's 0xa830 linked at 0x20000: python -m 3dokit.rom). Each is a command table under the
+// kernel's own dispatch; the addresses are the Operator's.
+//
+// A request a driver cannot complete at once is queued with IO_QUICK cleared, so that its
+// completion tells the task: the kernel's SendIO ends by jumping to the driver (0x142e4) and
+// leaves io_Flags to it, and a program's WaitIO returns at once while IO_QUICK is set.
 static void defer(uint32_t ior) { pf_w32(ior + IO_FLAGS, pf_r32(ior + IO_FLAGS) & ~IO_QUICK); }
+
+// ---- SPORT ----------------------------------------------------------------------------------
+// The VRAM's serial port (0x23188, commands 4 to 6; 0 to 3 are BADCOMMAND): SPORTCMD_CLONE (4)
+// repeats the page at ioi_Send over ioi_Recv's length, SPORTCMD_COPY (5) copies ioi_Recv's length
+// from ioi_Send, both keeping the destination's bits where the mask ioi_Offset is clear; they are
+// queued (0x233ec) and done by the SPORT FIRQ at the vertical blank (0x22f80), in order.
+// FLASHWRITE_CMD (6) writes the value ioi_Offset under the mask ioi_CmdOptions at once (0x2337c).
+// What the hardware does with the words the driver hands it is the SDK's documentation ("The
+// SPORT Device"). The driver's own range checks (BADIOARG) are not made: a request outside whole
+// VRAM pages stops the run.
+static std::vector<uint32_t> g_sport_waiting;   // copies and clones, for the next blank
 
 static void sport_do(uint32_t ior) {
     uint32_t cmd = pf_r8(ior + IOI_COMMAND), page = pf_page_size(MEMTYPE_VRAM);
@@ -186,69 +195,92 @@ static void sport_do(uint32_t ior) {
         uint32_t v = cmd == 6 ? pf_r32(ior + IOI_OFFSET) : pf_r32(src + (cmd == 4 ? i % page : i));
         pf_w32(dst + i, (v & mask) | (pf_r32(dst + i) & ~mask));
     }
-    pf_complete_io(ior);
 }
 
-static void sport_dispatch(uint32_t ior) {
+static int32_t sport_dispatch(uint32_t ior) {
     uint32_t cmd = pf_r8(ior + IOI_COMMAND), page = pf_page_size(MEMTYPE_VRAM);
     uint32_t src = pf_r32(ior + IOI_SEND_BUF), dst = pf_r32(ior + IOI_RECV_BUF);
     uint32_t len = pf_r32(ior + IOI_RECV_LEN);
     auto in_vram = [&](uint32_t a, uint32_t n) { return a >= 0x200000u && a + n <= 0x300000u && !(a % page); };
     if (cmd < 4 || cmd > 6) {
         pf_w32(ior + IO_ERROR, KERR_BADCOMMAND);
-        pf_complete_io(ior);
-    } else if (!in_vram(dst, len) || len % page || (cmd != 6 && !in_vram(src, cmd == 4 ? page : len))) {
+        return 1;
+    }
+    if (!in_vram(dst, len) || len % page || (cmd != 6 && !in_vram(src, cmd == 4 ? page : len))) {
         std::fprintf(stderr, "SPORT: command %u from %08X to %08X, %u bytes: not whole VRAM pages\n",
                      cmd, src, dst, len);
         std::exit(3);
-    } else if (cmd == 6) {
-        sport_do(ior);
-    } else {
-        defer(ior);
-        g_sport_waiting.push_back(ior);
     }
+    if (cmd == 6) {
+        sport_do(ior);
+        return 1;
+    }
+    defer(ior);
+    g_sport_waiting.push_back(ior);
+    return 0;
 }
 
 static void sport_vbl(uint64_t) {
     std::vector<uint32_t> now;
     now.swap(g_sport_waiting);
-    for (uint32_t ior : now) sport_do(ior);
+    for (uint32_t ior : now) {
+        sport_do(ior);
+        pf_complete_io(ior);
+    }
 }
 
 // ---- the timer ------------------------------------------------------------------------------
-// Not on the disc either (the 1993 kernel names no "timer"; the console's ROM brings it), so this
-// is the SDK's documentation ("The Timer Device"): unit 0 counts vertical blanks, unit 1
-// microseconds. On the vertical-blank unit TIMERCMD_DELAY (3) completes when the count has gone up
-// by ioi_Offset -- "if you ask the timer to wait for 1 vblank while the beam is near the trigger
-// location, the I/O request will be returned in less than 1/60th" -- and TIMERCMD_DELAYUNTIL (4)
-// when it reaches ioi_Offset; a count already reached completes at once. The count starts at the
-// boot. What no program run so far asks for (CMD_READ, the microsecond unit) stops the run.
+// Unit 0 counts vertical blanks, unit 1 microseconds; five commands (0x25de0). On unit 0:
+// TIMERCMD_DELAY (3, 0x21694) queues the request -- always, IO_QUICK cleared -- in order of
+// ioi_Offset, and at each blank (0x213a8) the timer's 64-bit count goes up by 1 and every queued
+// request's io_Actual by 1, a request completing once io_Actual reaches ioi_Offset (unsigned): so
+// a delay of n completes at the n-th blank after it is sent, and of 0 at the next one.
+// TIMERCMD_DELAYUNTIL (4, 0x217d4) first makes ioi_Offset the count less ioi_Offset -- the wrong
+// way round, so a time to come waits about 2^32 blanks -- and is then a DELAY. CMD_READ (1,
+// 0x21548) writes the count, high word first, to an aligned ioi_Recv of 8 bytes or more (else
+// BADIOARG); CMD_WRITE (0) is BADCOMMAND. Unit 1 and CMD_STATUS (2) stop the run: not yet.
 enum : uint32_t { TIMER_UNIT_VBLANK = 0, TIMERCMD_DELAY = 3, TIMERCMD_DELAYUNTIL = 4 };
 
-static uint32_t g_vbl_count;
-static std::vector<std::pair<uint32_t, uint32_t>> g_timer_waiting;   // (count to reach, IOReq)
+static uint64_t g_vbl_count;
+static std::vector<uint32_t> g_timer_waiting;   // by ioi_Offset, as the Operator's list
 
-static void timer_dispatch(uint32_t ior) {
-    uint32_t cmd = pf_r8(ior + IOI_COMMAND), unit = pf_r8(ior + IOI_UNIT), n = pf_r32(ior + IOI_OFFSET);
-    if (unit != TIMER_UNIT_VBLANK || (cmd != TIMERCMD_DELAY && cmd != TIMERCMD_DELAYUNTIL)) {
+static int32_t timer_dispatch(uint32_t ior) {
+    uint32_t cmd = pf_r8(ior + IOI_COMMAND), unit = pf_r8(ior + IOI_UNIT);
+    if (cmd == 0) {
+        pf_w32(ior + IO_ERROR, KERR_BADCOMMAND);
+        return 1;
+    }
+    if (unit != TIMER_UNIT_VBLANK || cmd == 2 || cmd > 4) {
         std::fprintf(stderr, "timer: command %u on unit %u: not yet\n", cmd, unit);
         std::exit(3);
     }
-    uint32_t until = cmd == TIMERCMD_DELAY ? g_vbl_count + n : n;
-    if ((int32_t)(until - g_vbl_count) <= 0) pf_complete_io(ior);
-    else {
-        defer(ior);
-        g_timer_waiting.push_back({until, ior});
+    if (cmd == 1) {
+        uint32_t buf = pf_r32(ior + IOI_RECV_BUF);
+        if ((buf & 3) || (int32_t)pf_r32(ior + IOI_RECV_LEN) < 8) {
+            pf_w32(ior + IO_ERROR, KERR_BADIOARG);
+            return 1;
+        }
+        pf_w32(buf, (uint32_t)(g_vbl_count >> 32));
+        pf_w32(buf + 4, (uint32_t)g_vbl_count);
+        pf_w32(ior + IO_ACTUAL, 8);
+        return 1;
     }
+    if (cmd == TIMERCMD_DELAYUNTIL) pf_w32(ior + IOI_OFFSET, (uint32_t)g_vbl_count - pf_r32(ior + IOI_OFFSET));
+    int32_t n = (int32_t)pf_r32(ior + IOI_OFFSET);
+    size_t at = 0;
+    while (at < g_timer_waiting.size() && (int32_t)pf_r32(g_timer_waiting[at] + IOI_OFFSET) <= n) ++at;
+    g_timer_waiting.insert(g_timer_waiting.begin() + (long)at, ior);
+    defer(ior);
+    return 0;
 }
 
 static void timer_vbl(uint64_t) {
     ++g_vbl_count;
-    std::vector<std::pair<uint32_t, uint32_t>> later;
-    std::vector<uint32_t> done;
-    for (auto [until, ior] : g_timer_waiting) {
-        if ((int32_t)(until - g_vbl_count) <= 0) done.push_back(ior);
-        else later.push_back({until, ior});
+    std::vector<uint32_t> later, done;
+    for (uint32_t ior : g_timer_waiting) {
+        uint32_t n = pf_r32(ior + IO_ACTUAL) + 1;
+        pf_w32(ior + IO_ACTUAL, n);
+        (n >= pf_r32(ior + IOI_OFFSET) ? done : later).push_back(ior);
     }
     g_timer_waiting.swap(later);
     for (uint32_t ior : done) pf_complete_io(ior);

@@ -194,8 +194,10 @@ int32_t  pf_lock_item(int32_t item, uint32_t flags);   // LockItem: 1 locked, 0 
 int32_t  pf_unlock_item(int32_t item);                 // UnlockItem
 
 // Devices and IOReqs (pf_io.cpp). A device is a node of devices.h's layout with an item; its
-// driver is a native function that starts an IOReq and calls pf_complete_io when it is done.
-typedef void (*PfDispatchIO)(uint32_t ior);
+// driver is a native function that starts an IOReq, as a command of a 1993 driver does: 1 when
+// the request is done (the kernel's dispatch then completes it, and SendIO returns 1), 0 when it
+// is queued (the driver clears IO_QUICK, and calls pf_complete_io when it is done).
+typedef int32_t (*PfDispatchIO)(uint32_t ior);
 uint32_t pf_device_new(const char* name, int max_unit, PfDispatchIO dispatch);
 void     pf_complete_io(uint32_t ior);
 int32_t  pf_signal(uint32_t task, uint32_t bits);   // the kernel's own SendSignal (pf_task.cpp)

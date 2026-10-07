@@ -52,6 +52,7 @@ python -m 3dokit.disc GAME.cue                        # volume, ROM tags, size
 python -m 3dokit.disc GAME.img --list                 # every file and its copies
 python -m 3dokit.disc GAME.img --extract build/disc   # every file
 python -m 3dokit.disc GAME.img --verify               # every copy, compared
+python -m 3dokit.rom BIOS.bin [--unpack DIR]          # a console ROM: its volume, its programs
 python -m 3dokit.aif --scan build/disc                # every executable
 python -m 3dokit.aif build/disc/LaunchMe              # headers, relocations
 python -m 3dokit.arm GAME -s 'regex'                  # who references a string
@@ -137,7 +138,7 @@ both discs:
 
 | Layer | Question it answers | Now | Next |
 |---|---|---|---|
-| 1. Recognise | What is on this disc? | `disc` (Opera, copies, ROM tags, `--verify`), `aif` (AIF, the 3DO header, compressed or signed) | fonts in `System/Graphics/Fonts`; what the ROM tag of type 0x0c holds |
+| 1. Recognise | What is on this disc? | `disc` (Opera, copies, ROM tags, `--verify`), `aif` (AIF, the 3DO header, compressed or signed), `rom` (a console ROM's Opera volume, blocks of 4 bytes, and its programs, unpacked by their own decompressors: the boot's kernel, the Operator, the File folio) | fonts in `System/Graphics/Fonts`; what the ROM tag of type 0x0c holds |
 | 2. Extract | Turn standard formats into standard files | `disc --extract`, `cel` (every depth and coding, PLUTA, the hardware's transparency, `IMAG`), `stream`, `cinepak`, `audio` (SDX2, AIFF/AIFC, loops), `dsp`, `pixels` | the streamed-cel subscriber (`SCEL`); AIF decompression |
 | 3. Map code | What does the code do, where? | `arm` (functions, calls, tail calls, references, control flow, symbols, the compiler's embedded names), `portfolio` (SWIs and folio vectors, attributed and named), `sdk` (the SDK's names for every SWI and slot), `aof` (the SDK's ARM Object Format libraries), `shapes` (library proved against a corpus; two programs paired, names carried, a data map) | a corpus from the SDK's own libraries for `shapes` |
 | 4. Translate | Turn ARM60 code into C | `arm60` (the instruction set, ARMv3 exactly), `armemu` (an ARM60 interpreter: the reference), `recomp.discover` (functions, code and data, switches, indirect transfers), `recomp.emit` and `python -m 3dokit.recomp` (C++ per function, a module per program), `recomp.selftest` (the interpreter records, the C++ replays) | flags only where read; literal pools folded; returns that are not to their call (longjmp) |
@@ -161,6 +162,7 @@ both discs:
 | Module | Checked by |
 |---|---|
 | `disc` | Immercenary (raw 2352, 747 files, 43 directories, 552.5 MiB) and OMF2097 (iso 2048, 1,502 files, 186 directories): the same 790 and 1,688 entries as the port's own reader. Every copy read and compared: Immercenary's 288 extra copies are 279 identical, 8 directories that differ only in the case of names and 1 `rom_tags` copy with its own relative offsets; OMF2097's 374 are 372 identical and 2 that really differ (its second label says one block fewer, its second `rom_tags` is the devkit's table before `3DOEncrypt` rewrote the first). The ROM tags land on `boot_code` and `os_code` on both, and on `misc_code`, `BannerScreen` and `LaunchMe` on OMF2097 |
+| `rom` | the FZ-1's ROM (1 MB): its volume `rom` at 0x28000 (blocks of 4 bytes, 87 files: the ROM's own folios in `bin/` and applications in `apps/`) and 15 AIF images, 12 compressed, all unpacked by their own decompressors in `armemu`: ahead of the volume the boot's kernel (0x20a0, linked at 0x10000), the Operator (0xa830, at 0x20000, built 3 August 1993: the timer, SPORT, the expansion bus and CD-ROM drivers) and the File folio (0x188a0) |
 | `aif` | 57 images on Immercenary, 39 on OMF2097 and 34 on Crash 'n Burn: every uncompressed one ends exactly where its relocation list does, or its signature does when signed (12, 15 and 7 signed, 14, 20 and 4 compressed). The stub is where the BL at 0x04 points: `ro + rw` on the first two discs, 4 bytes on from it on Crash 'n Burn's three programs, whose extra word one of Orion's relocations points at. OMF2097's `LaunchMe` header carries the stack (16,384), name and time its Makefile gives `modbin`; the System images' node versions equal the `os_code` tag's |
 | `arm` | the same function starts, calls, tail calls, references and code end as the port's cross-referencer on all five of Immercenary's programs (`p` 1,308 functions, `p1e` 1,066, `launchme` 84, `CinepakSubroutine` 484, `SpeechSubroutine` 188). The compiler's embedded names: 292 on Crash 'n Burn's `launchme` (every one on an APCS prologue) and 47 on its `Orion`; 0 on Immercenary's five, OMF2097's `LaunchMe` and the 26 System programs |
 | `portfolio` | Immercenary's five programs: exactly the port's scanner's SWI count less one each -- `svcvs #0`, which is the string `"audio"` and which the port's notes had listed as an unidentified folio-0 call. 109 of 109 vector sites attributed in `p`, 104 of 104 in `p1e`. Counting only SWIs control flow reaches drops OMF2097's 7,000-odd `svc`s decoded from linked-in asset data to 134. Crash 'n Burn's 1993 SDK opens a folio differently (the item stored first, `LookupItem`'s pointer 0x68 bytes on) and shares one pool word between two globals (`ldr rN, [rN, #4]`): with both read, its `launchme` has 113 of 116 sites attributed (Graphics 38, Kernel 29, audio 42, File 4) where it had 75, and the other six programs' attribution is unchanged |
@@ -223,11 +225,13 @@ both discs:
   read but stop), `AddScreenGroup`, `Enable`/`DisableHAVG` and `VAVG`, and
   the kernel's `CheckItem`; devices and IOReqs as the 1993 kernel makes and
   runs them (`CreateSizedItem` of an IOReq, `SendIO`, `CompleteIO`,
-  `SIGF_IODONE`), and the SPORT and timer devices, whose drivers are not on
-  the disc (the console's ROM brings them) and are written from the SDK's
-  documentation -- SPORT's copies and clones at the vertical blank, the
-  timer's vertical-blank unit (`TIMERCMD_DELAY`, `_DELAYUNTIL`), a driver
-  that queues a request clearing `IO_QUICK` as the kernel leaves it to; the
+  `SIGF_IODONE`, `SendIO` 1 when the driver is done at once), and the SPORT
+  and timer devices, whose drivers are not on the disc but in the console
+  ROM's Operator (`rom`) and are made as it runs them -- SPORT's copies and
+  clones at the vertical blank, its fill at once, the timer's vertical-blank
+  unit (`TIMERCMD_DELAY` counting blanks in `io_Actual`, `_DELAYUNTIL` with
+  the 1993 driver's subtraction the wrong way round, `CMD_READ`), a request
+  queued with `IO_QUICK` cleared; the
   kernel's `vfprintf` (the C library's printf core, every character
   through the program's own `putc`) and `ItemOpened`; and the audio
   folio's items as the 1993 folio makes and checks them -- `LoadInsTemplate`
