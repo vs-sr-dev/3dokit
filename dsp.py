@@ -22,7 +22,7 @@ Each file is IFF:
                             code word to patch
         DNMS                the resource names, NUL-separated, in the same
                             order as DRSC
-        DKNB                a linked list of 68-byte knob records
+        DKNB                a linked list of knob records (below)
       FORM ATNV / ENVL      attenuation and envelope tables, on three files
 
 The resource types are not documented here from an SDK header; they are what
@@ -53,6 +53,20 @@ A relocation names a code word that the loader patches with a resource's
 address once it has been placed. Every word a relocation points at has its
 top bit set, and the low fifteen bits are an addend, so the code as shipped
 carries `0x8000 | offset` wherever an address belongs.
+
+A knob record is what the 1993 audio folio (`System/Folios/AUDIOFOLIO`,
+V20.19) reads in place: the offset of the next record from the start of
+DKNB (0 for the last), the minimum, the maximum and the default, a count
+of targets, a 32-byte name, then per target 16 bytes -- the resource it
+writes, a calculation type and two operands `a` and `b`. Every knob in the
+three libraries has one target, its own resource, so a record is 68 bytes.
+`TweakKnob` passes the value through each target's calculation (0: as it
+is; 1: `v * a + b`; 2: `v * a / b`; 3: `v / 44100`, the folio's sample
+rate -- a frequency in 16.16 Hz to a phase step), clamps the first
+target's result to [min, max], and writes it; `TweakRawKnob` skips the
+calculation, and a new instrument's knobs start at their defaults that
+way. Type 3 is the oscillators' `Frequency`; the 24.225 library's type 4
+(`square_lfo`, `triangle_lfo`, `pulse_lfo`) is one the 1993 folio refuses.
 
 Usage
 -----
@@ -94,12 +108,19 @@ class Resource:
 
 
 class Knob:
-    __slots__ = ('name', 'lo', 'hi', 'default', 'resource', 'hint')
+    """A DKNB record: its range, its default, and its targets, each
+    (resource, calculation type, a, b)."""
+    __slots__ = ('name', 'lo', 'hi', 'default', 'targets', 'next')
+
+    @property
+    def resource(self):
+        return self.targets[0][0] if self.targets else None
 
     def __str__(self):
-        h = '  hint %s' % (self.hint,) if any(self.hint) else ''
-        return '%-18s %6d .. %-6d default %-6d -> resource %d%s' % (
-            self.name, self.lo, self.hi, self.default, self.resource, h)
+        calc = ''.join('  calc %d (%d, %d)' % t[1:] for t in self.targets if any(t[1:]))
+        return '%-18s %6d .. %-6d default %-6d -> resource %s%s' % (
+            self.name, self.lo, self.hi, self.default,
+            ', '.join(str(t[0]) for t in self.targets), calc)
 
 
 class Instrument:
@@ -129,12 +150,13 @@ class Instrument:
         k = g.get(b'DKNB')
         o = 0
         while k:
-            nxt, lo, hi, dflt, _ = struct.unpack_from('>IiiiI', k, o)
+            nxt, lo, hi, dflt, n = struct.unpack_from('>IiiiI', k, o)
             kn = Knob()
             kn.name = k[o + 20:o + 52].split(b'\0')[0].decode()
             kn.lo, kn.hi, kn.default = lo, hi, dflt
-            kn.resource = struct.unpack_from('>I', k, o + 52)[0]
-            kn.hint = struct.unpack_from('>2i', k, o + 56)
+            kn.targets = [struct.unpack_from('>Iiii', k, o + 52 + 16 * t)
+                          for t in range(n) if o + 68 + 16 * t <= len(k)]
+            kn.next = (o + 52 + 16 * n, nxt)    # where its targets end, its link
             self.knobs.append(kn)
             if not nxt:
                 break
@@ -227,8 +249,13 @@ def verify(where):
             bad['knob count does not match the type-1 resources'] += 1
         for k in i.knobs:
             knobs += 1
-            if i.resources[k.resource].name != k.name:
+            end, nxt = k.next
+            if end > len(i.chunks['DKNB']) or nxt not in (0, end):
+                bad['a knob record is not its targets long'] += 1
+            if not k.targets or i.resources[k.resource].name != k.name:
                 bad['a knob does not name its own resource'] += 1
+            if any(i.resources[t[0]].type != 1 for t in k.targets):
+                bad['a knob writes a resource that is not a knob'] += 1
             if not k.lo <= k.default <= k.hi:
                 bad['a knob default is outside its range'] += 1
         for mask, z, idx, off in i.relocs:
