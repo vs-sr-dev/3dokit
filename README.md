@@ -83,6 +83,7 @@ build/recomp-build/pfboot GAME --frames DIR              # what the display show
 build/recomp-build/pfboot GAME --frames DIR --frames-at 39000-41000/10   # ...of those fields only
 build/recomp-build/pfboot GAME --pad a@1300x1            # the first pad's A at field 1300 (BUTTONS@FIELD[xN][/E][+H])
 build/recomp-build/pfboot GAME --pad a@7600+600          # ...or held, from field 7600 for 600 fields
+build/recomp-build/pfboot GAME --trace 0 --window --record pad.txt   # in a window (SDL3), real time, keyboard/gamepad as the pad
 python -m 3dokit.pfcheck DISC/System/Kernel/os_code DIR --graphix DISC/System/Folios/GRAPHIX   # ...on the folio's
 python -m 3dokit.aif --decompress DISC/System/Folios/GRAPHIX graphix.bin   # by its own decompressor
 python -m 3dokit.shapes library GAME --corpus 'build/disc/System/Programs/*'

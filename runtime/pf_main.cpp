@@ -3,6 +3,7 @@
 //
 //     pfboot PROGRAM [--trace N] [--lenient] [--max-calls N] [--snap N DIR] [--disc DIR]
 //                    [--frames DIR [--frames-at FIRST[-LAST][/EVERY]]] [--pad BUTTONS@FIELD[xN][/E][+H]]...
+//                    [--window [--record FILE]]
 //
 // PROGRAM is the AIF file the build was recompiled from (its module must be
 // in this build). --trace 0 is quiet, 1 (the default) every OS call, 2 also
@@ -20,7 +21,10 @@
 // joined by +) at field FIELD (gf_VBLNumber), N times (4 by default), every E
 // fields (30, half a second), each held for H fields (6 by default) and then
 // released; given +H and no xN it is one press (a@7600+600: A held from field
-// 7600 to 8199). --pad may be given more than once (pf_event.cpp).
+// 7600 to 8199). --pad may be given more than once (pf_event.cpp). --window
+// (a pfboot built with SDL3) shows the display in a window, in real time, with
+// the keyboard and a gamepad as the pad as well (pf_window.cpp); --record FILE
+// writes the presses made there as --pad options that replay them.
 //
 //     pfboot PROGRAM --memtest DIR [--ops N] [--seed S]
 //
@@ -31,7 +35,12 @@
 #include <cstdlib>
 #include <cstring>
 #include <fstream>
+#include <functional>
 #include <vector>
+
+#ifdef TDK_WINDOW
+int pf_window_run(const char* title, const char* record, const std::function<int()>& run);   // pf_window.cpp
+#endif
 
 static uint32_t be32(const std::vector<uint8_t>& d, size_t o) {
     return (uint32_t)d[o] << 24 | (uint32_t)d[o + 1] << 16 | (uint32_t)d[o + 2] << 8 | d[o + 3];
@@ -39,11 +48,6 @@ static uint32_t be32(const std::vector<uint8_t>& d, size_t o) {
 
 // --pad BUTTONS@FIELD[xN][/E][+H]: the buttons' bits (event.h's ControlPadEventData), scheduled.
 static bool pad_option(const char* spec) {
-    static const struct { const char* name; uint32_t bit; } kButtons[] = {
-        {"down", 0x80000000u}, {"up", 0x40000000u}, {"right", 0x20000000u}, {"left", 0x10000000u},
-        {"a", 0x08000000u}, {"b", 0x04000000u}, {"c", 0x02000000u}, {"start", 0x01000000u},
-        {"x", 0x00800000u}, {"r", 0x00400000u}, {"l", 0x00200000u},
-    };
     std::string s = spec;
     size_t at = s.find('@');
     if (at == std::string::npos) return false;
@@ -53,8 +57,8 @@ static bool pad_option(const char* spec) {
         if (e == std::string::npos || e > at) e = at;
         std::string name = s.substr(b, e - b);
         bool known = false;
-        for (const auto& k : kButtons)
-            if (name == k.name) { bits |= k.bit; known = true; }
+        for (uint32_t bit = 0x80000000u; bit; bit >>= 1)
+            if (*pf_pad_button_name(bit) && name == pf_pad_button_name(bit)) { bits |= bit; known = true; }
         if (!known) return false;
         b = e + 1;
     }
@@ -99,12 +103,14 @@ int main(int argc, char** argv) {
     if (argc < 2) {
         std::fprintf(stderr, "usage: pfboot PROGRAM [--trace N] [--lenient] [--max-calls N] [--snap N DIR] [--disc DIR]\n"
                              "                      [--frames DIR [--frames-at FIRST[-LAST][/EVERY]]]\n"
-                             "                      [--pad BUTTONS@FIELD[xN][/E][+H]]...\n"
+                             "                      [--pad BUTTONS@FIELD[xN][/E][+H]]... [--window [--record FILE]]\n"
                              "       pfboot PROGRAM --memtest DIR [--ops N] [--seed S]\n");
         return 2;
     }
     const char* memtest = nullptr;
     const char* disc = nullptr;
+    const char* record = nullptr;
+    bool window = false;
     int ops = 2000;
     uint32_t seed = 1;
     for (int i = 2; i < argc; ++i) {
@@ -129,6 +135,8 @@ int main(int argc, char** argv) {
                 return 2;
             }
         }
+        else if (!std::strcmp(argv[i], "--window")) window = true;
+        else if (!std::strcmp(argv[i], "--record") && i + 1 < argc) record = argv[++i];
         else if (!std::strcmp(argv[i], "--memtest") && i + 1 < argc) memtest = argv[++i];
         else if (!std::strcmp(argv[i], "--ops") && i + 1 < argc) ops = std::atoi(argv[++i]);
         else if (!std::strcmp(argv[i], "--seed") && i + 1 < argc) seed = (uint32_t)std::strtoul(argv[++i], nullptr, 0);
@@ -154,6 +162,18 @@ int main(int argc, char** argv) {
     if (memtest) {
         if (int bad = pf_boot(d.data(), stub, ro + rw + bss)) return bad;
         return pf_memtest(memtest, ops, seed);
+    }
+    if (window) {
+#ifdef TDK_WINDOW
+        return pf_window_run(argv[1], record, [&] { return pf_run(d.data(), stub, ro + rw + bss, entry); });
+#else
+        std::fprintf(stderr, "--window: this pfboot was built without SDL3\n");
+        return 2;
+#endif
+    }
+    if (record) {
+        std::fprintf(stderr, "--record: only with --window\n");
+        return 2;
     }
     return pf_run(d.data(), stub, ro + rw + bss, entry);
 }

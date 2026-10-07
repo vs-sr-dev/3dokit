@@ -6,7 +6,8 @@
 // The broker reads the Control Port through a device ("controlport", CONTROLPORTCMD_READWRITE once
 // a field) whose driver is on neither the disc nor in the ROM's Operator; the pads it decodes from
 // the port's bits are here simply the runtime's pad: the first Control Pad on the port (pod 1,
-// position 1, the first pad of its kind), whose buttons pf_pad_press schedules. So what is modelled
+// position 1, the first pad of its kind), whose buttons pf_pad_press schedules and pf_pad_live
+// adds from the host (pfboot's window), read once a field at the vertical blank. So what is modelled
 // is the broker above its driverlets: its port, its listeners, the focus, the event records.
 //
 // * Its port, "eventbroker" (0x650); the broker task runs at priority 199 (0x5e8), above any
@@ -37,9 +38,11 @@
 //   one that comes back is free again (0xdb4) and the listener has one fewer in transit; a new one
 //   is made only when no free one is big enough (sizes in 16s).
 #include "pf.h"
+#include <atomic>
 #include <cstdio>
 #include <cstdlib>
 #include <map>
+#include <mutex>
 #include <vector>
 
 enum : uint32_t {
@@ -90,8 +93,61 @@ void pf_pad_press(uint32_t bits, uint64_t first, int count, int every, int hold)
     g_presses.push_back({bits, first, count, every, hold});
 }
 
+// The pad from the host (pf_pad_live), and the record of its presses.
+static std::atomic<uint32_t> g_live{0};
+static std::mutex g_record_lock;
+static FILE* g_record;
+static uint32_t g_record_was, g_record_field;
+static uint32_t g_record_since[32];
+
+const char* pf_pad_button_name(uint32_t bit) {
+    static const struct { const char* name; uint32_t bit; } kButtons[] = {
+        {"down", 0x80000000u}, {"up", 0x40000000u}, {"right", 0x20000000u}, {"left", 0x10000000u},
+        {"a", 0x08000000u}, {"b", 0x04000000u}, {"c", 0x02000000u}, {"start", 0x01000000u},
+        {"x", 0x00800000u}, {"r", 0x00400000u}, {"l", 0x00200000u},
+    };
+    for (const auto& k : kButtons)
+        if (k.bit == bit) return k.name;
+    return "";
+}
+
+void pf_pad_live(uint32_t bits) { g_live.store(bits); }
+
+bool pf_pad_record_open(const char* path) {
+    std::lock_guard<std::mutex> l(g_record_lock);
+    g_record = std::fopen(path, "w");
+    return g_record != nullptr;
+}
+
+// The live buttons at `field`: each one that came up written as the press it was.
+static void record(uint32_t now, uint32_t field, bool all_up) {
+    std::lock_guard<std::mutex> l(g_record_lock);
+    if (!g_record) return;
+    if (all_up) field = g_record_field;
+    g_record_field = field;
+    for (int i = 0; i < 32; ++i) {
+        uint32_t bit = 1u << i;
+        if ((now & bit) && !(g_record_was & bit) && !all_up) g_record_since[i] = field;
+        if ((g_record_was & bit) && (!(now & bit) || all_up)) {
+            std::fprintf(g_record, "--pad %s@%u+%u\n", pf_pad_button_name(bit), g_record_since[i],
+                         field - g_record_since[i] ? field - g_record_since[i] : 1);
+            std::fflush(g_record);
+        }
+    }
+    g_record_was = all_up ? 0 : now;
+}
+
+void pf_pad_record_close() {
+    record(0, 0, true);
+    std::lock_guard<std::mutex> l(g_record_lock);
+    if (g_record) std::fclose(g_record);
+    g_record = nullptr;
+}
+
 static uint32_t pad_at(uint64_t field) {
-    uint32_t bits = 0;
+    uint32_t live = g_live.load();
+    record(live, (uint32_t)field, false);
+    uint32_t bits = live;
     for (const Press& p : g_presses)
         for (int k = 0; k < p.count; ++k) {
             uint64_t at = p.first + (uint64_t)k * (uint64_t)p.every;

@@ -58,12 +58,15 @@ static void system_vdls();
 // gf_VDLDisplayLink points at.
 static void write_frame(uint32_t vbl);
 
-static void graphics_vbl(uint64_t) {
+PfTimeFn g_pf_display_vbl;
+
+static void graphics_vbl(uint64_t when) {
     uint32_t g = pf_folio_base(PF_GRAPHICS), n = pf_r32(g + GF_VBLNUMBER) + 1;
     pf_w32(g + GF_VBLNUMBER, n);
     pf_w32(pf_r32(g + GF_VDLDISPLAYLINK), pf_r32(g + (n & 1 ? GF_CURRENTVDLODD : GF_CURRENTVDLEVEN)));
     if (g_pf_frames_dir && n >= g_pf_frames_first && n <= g_pf_frames_last && (n - g_pf_frames_first) % g_pf_frames_every == 0)
         write_frame(n);
+    if (g_pf_display_vbl) g_pf_display_vbl(when);
 }
 
 // ---- what the display shows (pfboot --frames) --------------------------------------------------
@@ -116,6 +119,8 @@ static bool display_field(std::vector<uint8_t>& rgb, int& lines) {
     }
     return false;
 }
+
+bool pf_display_field(std::vector<uint8_t>& rgb, int& lines) { return display_field(rgb, lines); }
 
 static void write_frame(uint32_t vbl) {
     std::vector<uint8_t> rgb;

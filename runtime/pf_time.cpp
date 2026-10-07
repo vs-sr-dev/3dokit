@@ -7,8 +7,9 @@
 // events that have come due and lets a higher-priority task that one of them made ready take
 // over. When every task waits (pf_task.cpp's block), the clock jumps straight to the next event.
 // Nothing here looks at the host's time, so a run is the same on any host and at any speed: the
-// trace of one run is the trace of every run. A run in real time (a window, sound) will hold the
-// guest back to the host's clock where it jumps ahead -- not yet.
+// trace of one run is the trace of every run. A run in real time (pfboot's window) holds the
+// guest back to the host's clock at each vertical blank, which changes when the guest's events
+// happen in the host's time but not in the guest's: the run is still the same for the same pad.
 //
 // What a safe point is worth is an estimate: the ARM60 runs at 12.5 MHz, and a safe point comes
 // every few instructions, so 1 us (about 12 cycles) is the default. It sets how much work fits
@@ -67,8 +68,10 @@ void pf_time_init() {
     pf_at(kFieldNs, vbl);
 }
 
+bool g_pf_wait_forever;
+
 bool pf_time_idle(bool (*someone_ready)()) {
-    uint64_t limit = g_now + kIdleLimitNs;
+    uint64_t limit = g_pf_wait_forever ? ~0ull : g_now + kIdleLimitNs;
     while (!g_events.empty() && g_events.top().when <= limit) {
         run_until(g_events.top().when);
         if (someone_ready()) return true;

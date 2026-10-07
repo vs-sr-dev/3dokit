@@ -19,6 +19,7 @@
 #pragma once
 #include "arm60.h"
 #include <string>
+#include <vector>
 
 enum : uint32_t {
     PF_OS_BASE = 0x00400000u,           // the OS's memory, 1 MB
@@ -198,8 +199,10 @@ void     pf_time_init();
 uint64_t pf_now();
 void     pf_at(uint64_t when, PfTimeFn fn);         // fn(when) at that time (or now, if past)
 // Every task waits: the clock jumps to the next event and runs it. False when, after 10 s of
-// guest time, no event has made a task ready (or there is no event at all).
+// guest time, no event has made a task ready (or there is no event at all) -- unless
+// g_pf_wait_forever is set (a run in real time, where a player may take their time).
 bool     pf_time_idle(bool (*someone_ready)());
+extern bool g_pf_wait_forever;
 // The vertical blank: 59.94 fields a second (NTSC), each one running these, in this order.
 void     pf_on_vbl(PfTimeFn fn);
 
@@ -258,6 +261,15 @@ int32_t  pf_get_msg(int32_t port);
 // pf_pad_press schedules: `bits` down from field `first` (gf_VBLNumber, the fields counted from the
 // boot) for `hold` fields, then up; `count` times, every `every` fields.
 void     pf_pad_press(uint32_t bits, uint64_t first, int count, int every, int hold);
+// The pad from the host (a window's keyboard), any thread: these buttons are down as well, from
+// the next field the broker looks at. With a record file open, each live press is written to it
+// as the --pad option that replays it (BUTTON@FIELD+HELD, one a line), at its release -- or at
+// pf_pad_record_close, held to the field the broker last looked at.
+void     pf_pad_live(uint32_t bits);
+bool     pf_pad_record_open(const char* path);
+void     pf_pad_record_close();
+// A button's name as --pad takes it (up down left right a b c start x l r), "" for none.
+const char* pf_pad_button_name(uint32_t bit);
 
 // Files (pf_file.cpp). The disc is a directory on the host, `g_pf_disc_root` (pfboot: the
 // program's own directory unless --disc says otherwise); a program's path is walked there as the
@@ -282,6 +294,10 @@ void     pf_math_init();
 // g_pf_frames_first to g_pf_frames_last, every g_pf_frames_every-th of them, are looked at.
 extern const char* g_pf_frames_dir;
 extern uint32_t g_pf_frames_first, g_pf_frames_last, g_pf_frames_every;
+// The field the VDLs describe now, as rows of 320 RGB pixels (false when the VDLs are of a kind
+// not read yet); and a function the vertical blank runs after the graphics' own (pfboot's window).
+bool     pf_display_field(std::vector<uint8_t>& rgb, int& lines);
+extern PfTimeFn g_pf_display_vbl;
 
 // The SDK's names (generated: pf_names.cpp).
 struct PfSwiName { uint32_t number; const char* name; };
