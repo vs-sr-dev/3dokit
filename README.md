@@ -143,7 +143,7 @@ both discs:
 | 2. Extract | Turn standard formats into standard files | `disc --extract`, `cel` (every depth and coding, PLUTA, the hardware's transparency, `IMAG`), `stream`, `cinepak`, `audio` (SDX2, AIFF/AIFC, loops), `dsp`, `pixels` | the streamed-cel subscriber (`SCEL`); AIF decompression |
 | 3. Map code | What does the code do, where? | `arm` (functions, calls, tail calls, references, control flow, symbols, the compiler's embedded names), `portfolio` (SWIs and folio vectors, attributed and named), `sdk` (the SDK's names for every SWI and slot), `aof` (the SDK's ARM Object Format libraries), `shapes` (library proved against a corpus; two programs paired, names carried, a data map) | a corpus from the SDK's own libraries for `shapes` |
 | 4. Translate | Turn ARM60 code into C | `arm60` (the instruction set, ARMv3 exactly), `armemu` (an ARM60 interpreter: the reference), `recomp.discover` (functions, code and data, switches, indirect transfers), `recomp.emit` and `python -m 3dokit.recomp` (C++ per function, a module per program), `recomp.selftest` (the interpreter records, the C++ replays) | flags only where read; literal pools folded; returns that are not to their call (longjmp) |
-| 5. Runtime | What an engine links | `runtime/` (C99): `tdk_opera` (files out of a disc image), `tdk_cel` (cels to RGBA), `tdk_stream` (DataStream, Cinepak with an optional dither, SDX2); `tdkcheck`. For recompiled code (C++20): `arm60.h` (the CPU, memory, the shifter and the flags), `arm_core` (dispatch, the return check), `arm_stub` (no OS: the self-test), `arm_selftest`; `pf` (Portfolio's frame: the boot, the OS's memory above VRAM, folio tables of traps, SWI and slot dispatch by the SDK's names, the trace; items, lists, the memory lists and their allocator, devices, IOReqs, `SendIO` and `CompleteIO`, the SPORT device, the Graphics folio's node, its system VDLs, its screen groups, their colours and the screen displayed, the audio folio's templates, instruments, knobs and samples (their info), the kernel's `vfprintf` writing through the program's own `putc`, the disc as a host directory walked as the File folio walks it (aliases from the disc's own scripts), open files and their driver, the byte streams, `DeleteItem`, threads -- each on a host thread, one running at a time -- with signals and the kernel's priority switch, semaphores, the guest's clock and its events: the vertical blank, the timer device, the audio clock) and `pfboot`; `pfcheck` (the runtime against the 1993 OS's own code: the kernel's allocator, any one Graphics call) | Portfolio's functions: the audio folio's cues and playback (a native mixer for its instruments), the display, messages, tasks, the kernel's quantum, the timer's microseconds, the CD device, the File folio's other calls (directories, `CreateFile`, `DeleteFile`), running in real time; the CEL engine proper: quads, PIXC, the pixel processor |
+| 5. Runtime | What an engine links | `runtime/` (C99): `tdk_opera` (files out of a disc image), `tdk_cel` (cels to RGBA), `tdk_stream` (DataStream, Cinepak with an optional dither, SDX2); `tdkcheck`. For recompiled code (C++20): `arm60.h` (the CPU, memory, the shifter and the flags), `arm_core` (dispatch, the return check), `arm_stub` (no OS: the self-test), `arm_selftest`; `pf` (Portfolio's frame: the boot, the OS's memory above VRAM, folio tables of traps, SWI and slot dispatch by the SDK's names, the trace; items, lists, the memory lists and their allocator, devices, IOReqs, `SendIO` and `CompleteIO`, the SPORT device, the Graphics folio's node, its system VDLs, its screen groups, their colours and the screen displayed, the cel engine behind `DrawCels` (square cels), the audio folio's templates, instruments, knobs and samples (their info), the kernel's `vfprintf` writing through the program's own `putc`, the disc as a host directory walked as the File folio walks it (aliases from the disc's own scripts), open files and their driver, the byte streams, `DeleteItem`, threads -- each on a host thread, one running at a time -- with signals and the kernel's priority switch, semaphores, the guest's clock and its events: the vertical blank, the timer device, the audio clock) and `pfboot`; `pfcheck` (the runtime against the 1993 OS's own code: the kernel's allocator, any one Graphics call) | Portfolio's functions: the audio folio's cues and playback (a native mixer for its instruments), the display, messages, tasks, the kernel's quantum, the timer's microseconds, the CD device, the File folio's other calls (directories, `CreateFile`, `DeleteFile`), running in real time; the CEL engine's projector beyond square cels |
 
 ## Principles
 
@@ -188,12 +188,15 @@ both discs:
 * **One game.** Two discs and an emulator say these rules are the 3DO's; one
   game's programs are all that say the code-side tools generalise. The
   second 3DO port is the real test, and the interfaces will move for it.
-* **The CEL engine is decoded, not drawn.** `cel` and `tdk_cel` turn a
-  cel's pixels into colours with the hardware's transparency; nothing here
-  yet maps a cel onto a quadrilateral (HDX, HDY, VDX, VDY, HDDX, HDDY), runs
-  the pixel processor (PIXC, the PPMP blends, the multipliers the 8- and
-  16-bit coded formats carry), or clips. That is the Graphics folio, and
-  the largest piece of work in any 3DO port.
+* **The CEL engine draws only square cels.** `cel` and `tdk_cel` turn a
+  cel's pixels into colours with the hardware's transparency; the
+  runtime's `pf_cel` runs `DrawCels` as MADAM does -- the CCB list, the
+  decoder, the pixel processor, the V and H bits, clipping -- but projects
+  only a cel that lands square on the frame buffer's pixels (HDX 1, VDY 1,
+  the rest 0, the origin on a whole pixel). How the projector fills a
+  stretched, turned or bent cel (HDX, HDY, VDX, VDY, HDDX, HDDY) is not
+  read yet, nor `PXOR`, `USEAV` and the pixel processor's MS 10 and 11.
+  That is the largest piece of work left in any 3DO port.
 * **Refused rather than guessed**: preamble words in the pixel data
   (`CCBPRE` clear), `LRFORM` on a literal cel, `SKIPX`. No disc read so far
   has one. A packed cel ignores `LRFORM`, as the hardware does, which is what
@@ -226,7 +229,8 @@ both discs:
   read but stop), `AddScreenGroup`, `Enable`/`DisableHAVG` and `VAVG`,
   `SetScreenColor`, `SetScreenColors`, `ResetScreenColors`, `DisplayScreen`
   (each blank then links the field's VDL in, as the folio's interrupt does),
-  `pfboot --frames` writing what the VDLs show, and
+  `pfboot --frames` writing what the VDLs show, `DrawCels` on the cel
+  engine (`pf_cel`: square cels only), and
   the kernel's `CheckItem`; devices and IOReqs as the 1993 kernel makes and
   runs them (`CreateSizedItem` of an IOReq, `SendIO`, `CompleteIO`,
   `SIGF_IODONE`, `SendIO` 1 when the driver is done at once), and the SPORT
@@ -246,7 +250,8 @@ both discs:
   frames and bytes, their loops' bounds, their base frequency from the
   folio's default tuning and Operamath's `MulUF16`, checked against its
   code), `AttachSample` (to the FIFO the hook names), `DetachSample`,
-  `LinkAttachments`, `DeleteItem` of a knob, an attachment or an
+  `LinkAttachments`, `StopInstrument` and the attachments' states as the
+  folio keeps them, `DeleteItem` of a knob, an attachment, a sample or an
   instrument (its knobs and attachments with it) --
   without the DSP: what the folio would load into it and
   write to it is kept for a native mixer, and nothing plays yet; threads
