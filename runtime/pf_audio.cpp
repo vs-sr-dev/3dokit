@@ -26,8 +26,14 @@ enum : uint32_t {
     TEMPLATE_NODE = 1, INSTRUMENT_NODE = 2, KNOB_NODE = 3, SAMPLE_NODE = 4,
     // audio.h's tags (enum audio_folio_tags)
     AF_TAG_AMPLITUDE = 10, AF_TAG_RATE = 11, AF_TAG_NAME = 12, AF_TAG_PITCH = 14,
-    AF_TAG_VELOCITY = 15, AF_TAG_TEMPLATE = 16, AF_TAG_INSTRUMENT = 17, AF_TAG_PRIORITY = 39,
-    AF_TAG_SET_FLAGS = 40, AF_TAG_FREQUENCY = 42,
+    AF_TAG_VELOCITY = 15, AF_TAG_TEMPLATE = 16, AF_TAG_INSTRUMENT = 17, AF_TAG_WIDTH = 22,
+    AF_TAG_CHANNELS = 23, AF_TAG_FRAMES = 24, AF_TAG_BASENOTE = 25, AF_TAG_DETUNE = 26,
+    AF_TAG_LOWNOTE = 27, AF_TAG_HIGHNOTE = 28, AF_TAG_LOWVELOCITY = 29, AF_TAG_HIGHVELOCITY = 30,
+    AF_TAG_SUSTAINBEGIN = 31, AF_TAG_SUSTAINEND = 32, AF_TAG_RELEASEBEGIN = 33,
+    AF_TAG_RELEASEEND = 34, AF_TAG_NUMBYTES = 35, AF_TAG_ADDRESS = 36, AF_TAG_SAMPLE = 37,
+    AF_TAG_PRIORITY = 39, AF_TAG_SET_FLAGS = 40, AF_TAG_FREQUENCY = 42, AF_TAG_SAMPLE_RATE = 46,
+    AF_TAG_COMPRESSIONRATIO = 47, AF_TAG_COMPRESSIONTYPE = 48, AF_TAG_NUMBITS = 49,
+    AF_TAG_DELAY_LINE = 57,
     AF_INSF_LEGALFLAGS = 1,
     // a DSP resource's type (3dokit.dsp): what a knob writes, what a connection joins
     RSRC_KNOB = 1, RSRC_VARIABLE = 2,
@@ -41,11 +47,23 @@ static const uint32_t kNodeFlags = 0x90;
 enum : uint32_t {
     AF_ERR_BADITEM = 0xD52BF001u, AF_ERR_BADTAG = 0xD52BF002u, AF_ERR_BADTAGVAL = 0xD52BF003u,
     AF_ERR_NOKNOBS = 0xD52BF104u, AF_ERR_BADNAME = 0xD52BF105u, AF_ERR_BADCALCTYPE = 0xD52BF107u,
-    AF_ERR_BADKNOBRSRC = 0xD52BF108u, AF_ERR_AUDIOCLOSED = 0xD52BF11Du,
+    AF_ERR_BADKNOBRSRC = 0xD52BF108u, AF_ERR_OUTOFRANGE = 0xD52BF117u,
+    AF_ERR_UNIMPLEMENTED = 0xD52BF118u, AF_ERR_SECURITY = 0xD52BF11Bu, AF_ERR_AUDIOCLOSED = 0xD52BF11Du,
 };
 
 // The sample rate the folio converts frequencies with (its globals +0x48, set when it starts).
 static const int32_t kSampleRate = 44100;
+
+// Operamath's DivUF16 (its slot -12, 0x2420), which the folio calls for its rates: (n << 16) / d,
+// or 0xFFFFFFFF when that does not fit in 32 bits or d is 0. Checked against the 1993 code.
+static uint32_t div_uf16(uint32_t n, uint32_t d) {
+    if (!d) return 0xFFFFFFFFu;
+    uint64_t q = ((uint64_t)n << 16) / d;
+    return q > 0xFFFFFFFFu ? 0xFFFFFFFFu : (uint32_t)q;
+}
+// Operamath's MulUF16 (its slot -4, 0x2840): (a * b) >> 16, its low 32 bits -- the 1993 code's
+// three partial products, summed modulo 2^32, are exactly that.
+static uint32_t mul_uf16(uint32_t a, uint32_t b) { return (uint32_t)((uint64_t)a * b >> 16); }
 
 // ---- instruments, as their .dsp files describe them ----------------------------------------
 // FORM 3INS { NAME, FORM DSPP { DHDR, DCOD, DRSC, DRLC, DNMS, DKNB } }: the resources (DRSC, 16
@@ -136,11 +154,36 @@ struct Knob {
     int32_t ins;
     int knob;                               // index in the template's knobs
 };
+// A sample's info, the fields the folio keeps in its node (the offsets are its own; GetAudioItemInfo,
+// 0x37d8, reads them back by tag), at the folio's defaults (0x2c04). The node's other words (+0x3c,
+// +0x40, +0x60, +0x64, +0x90) start at 0 and nothing here changes them; its list of attachments
+// (+0x6c, "SampleRefs") and its place on the folio's "AudioSamples" (+0x31c) are not made.
+struct Sample {
+    uint32_t address = 0;                   // +0x24 AF_TAG_ADDRESS
+    uint32_t frames = 0;                    // +0x28 AF_TAG_FRAMES
+    int32_t sustain_begin = -1;             // +0x2c
+    int32_t sustain_end = -1;               // +0x30
+    int32_t release_begin = -1;             // +0x34
+    int32_t release_end = -1;               // +0x38
+    uint32_t numbytes = 0;                  // +0x48 AF_TAG_NUMBYTES
+    uint32_t base_freq = 440u << 16;        // +0x4c AF_TAG_BASEFREQ: the frequency that plays it at its pitch
+    uint8_t flags = 0;                      // +0x50: bits 0 and 1 set for a delay line's memory
+    uint8_t numbits = 16;                   // +0x51
+    uint8_t width = 2;                      // +0x52 bytes
+    uint8_t channels = 1;                   // +0x53
+    uint8_t basenote = 60;                  // +0x54
+    uint8_t detune = 0;                     // +0x55 (read back signed)
+    uint8_t lownote = 0, highnote = 127;    // +0x56, +0x57
+    uint8_t lowvelocity = 0, highvelocity = 127;    // +0x58, +0x59
+    uint8_t compression_ratio = 1;          // +0x5a
+    uint32_t compression_type = 0;          // +0x68
+    uint32_t rate = (uint32_t)kSampleRate << 16;    // +0x8c AF_TAG_SAMPLE_RATE, frac16 Hz
+};
 
 static std::map<int32_t, Template> g_templates;
 static std::map<int32_t, Instrument> g_instruments;
 static std::map<int32_t, Knob> g_knobs;
-static std::map<int32_t, int> g_samples;    // their info: the folio's defaults (0x2c04), unread yet
+static std::map<int32_t, Sample> g_samples;
 
 static uint32_t task_item() { return pf_r32(pf_current_task() + 24); }
 static int32_t audio_folio_item() { return (int32_t)pf_r32(pf_folio_base(PF_AUDIO) + 24); }
@@ -280,11 +323,143 @@ static uint32_t create_knob(ArmCpu& c, const Tags& tags) {
     return (uint32_t)item;
 }
 
-// A sample (0x3a3c), as yet only without tags: the folio's defaults, which nothing reads yet.
+// A sample's bytes from its frames (0x9898) and its frames from its bytes (0x98d4): a frame is
+// channels * width bytes, compressed by the ratio -- 1 as is, 2 a shift, else a division.
+static uint32_t udiv(ArmCpu& c, uint32_t n, uint32_t d) {
+    if (!d) pf_stop(c, "a sample's size divided by zero (the folio's division has no check)");
+    return n / d;
+}
+static uint32_t frames_to_bytes(ArmCpu& c, const Sample& s, uint32_t frames) {
+    uint32_t b = frames * s.channels * s.width;
+    return s.compression_ratio == 1 ? b : s.compression_ratio == 2 ? b >> 1 : udiv(c, b, s.compression_ratio);
+}
+static uint32_t bytes_to_frames(ArmCpu& c, const Sample& s, uint32_t bytes) {
+    uint32_t d = (uint32_t)s.channels * s.width;
+    if (s.compression_ratio == 1) return udiv(c, bytes, d);
+    if (s.compression_ratio == 2) return udiv(c, bytes, d) << 1;
+    return udiv(c, s.compression_ratio * bytes, d);
+}
+
+// The folio's default tuning (0x68e8, the node at 0xc1c8 that its node +0x33c points at): twelve
+// notes an octave from note 69 at 440 Hz, the frequencies of 69 to 80 at 0xc1fc (frac16).
+static const uint32_t kTuning[12] = {
+    0x1b80000, 0x1d229ec, 0x1ede220, 0x20b404a, 0x22a5d82, 0x24b545c,
+    0x26e4104, 0x293414f, 0x2ba74db, 0x2e3fd25, 0x30ffdaa, 0x33e9c01,
+};
+
+// A note's frequency in that tuning (0x6980): its octave's entry, shifted up or down an octave at
+// a time. Above, the folio stops at an index of 12 or less, so 93, 105 and the like read the word
+// past the table (0xc22c, a variable of the folio's): not done here.
+static uint32_t note_freq(ArmCpu& c, uint8_t note) {
+    int n = note - 69, shift = 0;
+    if (n >= 12) {
+        do { ++shift; n -= 12; } while (n > 12);
+        if (n == 12) pf_stop(c, "a sample's base note reads past the folio's tuning table");
+        return kTuning[n] << shift;
+    }
+    if (n >= 0) return kTuning[n];
+    do { ++shift; n += 12; } while (n < 0);
+    return kTuning[n] >> shift;
+}
+
+// The sample's base frequency (0x396c): its base note's, times 44100 / its rate.
+static void sample_base_freq(ArmCpu& c, Sample& s) {
+    s.base_freq = mul_uf16(note_freq(c, s.basenote), div_uf16((uint32_t)kSampleRate << 16, s.rate));
+}
+
+// A sample's tags (0x347c, for creation and SetAudioItemInfo), each stored as it comes; a bad one
+// returns at once, what came before it kept. WIDTH (0 to 2), CHANNELS (1 to 255) and NUMBITS (1 to
+// 32, the width then its bytes rounded up) mean the frames are counted again from the bytes; FRAMES
+// sets the bytes, NUMBYTES the frames, and given both they must agree. FRAMES, NUMBYTES and ADDRESS
+// are refused for a delay line's (AF_ERR_SECURITY). Then a kernel check that the data lies below
+// the top of memory (vector 40, 0x125c4), whose 0 or 1 the folio tests as an Err -- so never
+// refuses; a sustain or release loop that begins past 0 must end at or before the last frame and
+// not before it begins; and the base frequency again if the note or the rate came.
+static uint32_t sample_set(ArmCpu& c, Sample& s, uint32_t tags) {
+    bool refigure = false, have_frames = false, have_bytes = false, retune = false;
+    uint32_t frames = 0, bytes = 0;
+    for (uint32_t p = tags; p; p += 8) {
+        uint32_t tag = pf_r32(p), v = pf_r32(p + 4);
+        if (!tag) break;
+        switch (tag) {
+        case AF_TAG_NAME: case AF_TAG_SAMPLE: case AF_TAG_DELAY_LINE: break;
+        case AF_TAG_WIDTH:
+            if (v > 2) return AF_ERR_BADTAGVAL;
+            s.width = (uint8_t)v;
+            refigure = true;
+            break;
+        case AF_TAG_NUMBITS:
+            if (v < 1 || v > 32) return AF_ERR_BADTAGVAL;
+            s.numbits = (uint8_t)v;
+            s.width = (uint8_t)((v + 7) >> 3);
+            refigure = true;
+            break;
+        case AF_TAG_CHANNELS:
+            if (v < 1 || v > 255) return AF_ERR_BADTAGVAL;
+            s.channels = (uint8_t)v;
+            refigure = true;
+            break;
+        case AF_TAG_FRAMES:
+            if (s.flags & 2) return AF_ERR_SECURITY;
+            frames = v;
+            have_frames = true;
+            break;
+        case AF_TAG_NUMBYTES:
+            if (s.flags & 2) return AF_ERR_SECURITY;
+            bytes = v;
+            have_bytes = true;
+            break;
+        case AF_TAG_ADDRESS:
+            if (s.flags & 2) return AF_ERR_SECURITY;
+            s.address = v;
+            s.flags &= (uint8_t)~1u;
+            break;
+        case AF_TAG_BASENOTE: s.basenote = (uint8_t)v; retune = true; break;
+        case AF_TAG_SAMPLE_RATE: s.rate = v; retune = true; break;
+        case AF_TAG_DETUNE: s.detune = (uint8_t)v; break;
+        case AF_TAG_LOWNOTE: s.lownote = (uint8_t)v; break;
+        case AF_TAG_HIGHNOTE: s.highnote = (uint8_t)v; break;
+        case AF_TAG_LOWVELOCITY: s.lowvelocity = (uint8_t)v; break;
+        case AF_TAG_HIGHVELOCITY: s.highvelocity = (uint8_t)v; break;
+        case AF_TAG_SUSTAINBEGIN: s.sustain_begin = (int32_t)v; break;
+        case AF_TAG_SUSTAINEND: s.sustain_end = (int32_t)v; break;
+        case AF_TAG_RELEASEBEGIN: s.release_begin = (int32_t)v; break;
+        case AF_TAG_RELEASEEND: s.release_end = (int32_t)v; break;
+        case AF_TAG_COMPRESSIONRATIO: s.compression_ratio = (uint8_t)v; break;
+        case AF_TAG_COMPRESSIONTYPE: s.compression_type = v; break;
+        default: return AF_ERR_BADTAG;
+        }
+    }
+    if (have_frames) {
+        s.frames = frames;
+        s.numbytes = frames_to_bytes(c, s, frames);
+        refigure = false;
+    }
+    if (have_bytes) {
+        s.numbytes = bytes;
+        s.frames = bytes_to_frames(c, s, bytes);
+        refigure = false;
+    }
+    if (refigure) s.frames = bytes_to_frames(c, s, s.numbytes);
+    if (have_frames && have_bytes && s.frames != frames) return AF_ERR_BADTAGVAL;
+    int32_t last = (int32_t)s.frames;
+    if (s.sustain_begin > 0 && (s.sustain_begin > s.sustain_end || s.sustain_end > last)) return AF_ERR_OUTOFRANGE;
+    if (s.release_begin > 0 && (s.release_begin > s.release_end || s.release_end > last)) return AF_ERR_OUTOFRANGE;
+    if (retune) sample_base_freq(c, s);
+    return 0;
+}
+
+// A sample (0x3a3c): the kernel's item tags (vector 38, 0x1acf4), the folio's defaults, a first
+// look for AF_TAG_SAMPLE (another sample's info copied) and AF_TAG_DELAY_LINE (memory of the
+// folio's), the frames from the bytes, the tags as SetAudioItemInfo takes them, and the base
+// frequency. Only made without tags so far.
 static uint32_t create_sample(ArmCpu& c, const Tags& tags) {
-    if (!tags.empty()) pf_stop(c, "a sample's tags: not yet");
+    if (!tags.empty()) pf_stop(c, "a sample's tags at its creation: not yet");
+    Sample s;
+    s.frames = bytes_to_frames(c, s, s.numbytes);
+    sample_base_freq(c, s);
     int32_t item = audio_item(SAMPLE_NODE);
-    g_samples[item] = 0;
+    g_samples[item] = s;
     return (uint32_t)item;
 }
 
@@ -399,6 +574,35 @@ static void a_connectinstruments(ArmCpu& c) {
     c.r[0] = 0;
 }
 
+// swi 0x4001b: Err SetAudioItemInfo(Item item, TagArg* tags) -- 0x120c: the folio open; an item
+// of the folio's (LocateItem, else AF_ERR_BADITEM); the kernel's check of 8 bytes at the tags
+// (vector 40 again, never refusing); then by its node type: a sample's tags (0x347c), an
+// envelope's (0x4fac), an attachment's (0x6088), a tuning's (0x6754); a template, an instrument,
+// a knob or a cue AF_ERR_UNIMPLEMENTED. For a number that names no item the folio goes on with a
+// null node and reads its type at address 9: stopped here.
+static void a_setaudioiteminfo(ArmCpu& c) {
+    if (!audio_open()) { c.r[0] = AF_ERR_AUDIOCLOSED; return; }
+    int32_t item = (int32_t)c.r[0];
+    uint32_t n = pf_item_node(item);
+    if (!n) pf_stop(c, "SetAudioItemInfo of no item (the folio reads a null node)");
+    if (pf_r8(n + 8) != NST_AUDIO) { c.r[0] = AF_ERR_BADITEM; return; }
+    switch (pf_r8(n + 9)) {
+    case TEMPLATE_NODE: case INSTRUMENT_NODE: case KNOB_NODE: case 5: c.r[0] = AF_ERR_UNIMPLEMENTED; break;
+    case SAMPLE_NODE: {
+        Sample& s = g_samples[item];
+        c.r[0] = sample_set(c, s, c.r[1]);
+        if (g_pf_trace)
+            pf_log("        sample %d: %u frames, %u bytes at 0x%x, %u bits, %u channel(s), note %u, rate 0x%x, "
+                   "sustain %d to %d, base frequency 0x%x -> 0x%x\n", item, s.frames, s.numbytes, s.address,
+                   (unsigned)s.numbits, (unsigned)s.channels, (unsigned)s.basenote, s.rate, s.sustain_begin,
+                   s.sustain_end, s.base_freq, c.r[0]);
+        break;
+    }
+    case 6: case 7: case 8: pf_stop(c, "SetAudioItemInfo of an envelope, attachment or tuning: not yet");
+    default: c.r[0] = AF_ERR_BADITEM;
+    }
+}
+
 // ---- the audio clock --------------------------------------------------------------------------
 // The DSP counts sample frames down from head.dsp's CountDown knob and interrupts at 0; the
 // folio's handler (0x3e90, the FIRQ "AudioTimer" on interrupt 11) adds 1 to the audio time and,
@@ -412,20 +616,12 @@ static void a_connectinstruments(ArmCpu& c) {
 // SetAudioDuration lets through.
 enum : uint32_t {
     AF_TIME = 0x9c, AF_TIMERLIST = 0xb0, AF_LISTSEM = 0xd0, AF_RATESEM = 0xd8, AF_DURATION = 0xe0,
-    AF_ERR_INUSE = 0xD52BF10Fu, AF_ERR_OUTOFRANGE = 0xD52BF117u,
+    AF_ERR_INUSE = 0xD52BF10Fu,
 };
 static const uint32_t kDefaultRate = 240u << 16;
 static uint64_t g_tick_frame;                   // the sample frame of the next tick, from the boot
 
 static uint32_t folio() { return pf_folio_base(PF_AUDIO); }
-
-// Operamath's DivUF16 (its slot -12, 0x2420), which the folio calls for its rates: (n << 16) / d,
-// or 0xFFFFFFFF when that does not fit in 32 bits or d is 0. Checked against the 1993 code.
-static uint32_t div_uf16(uint32_t n, uint32_t d) {
-    if (!d) return 0xFFFFFFFFu;
-    uint64_t q = ((uint64_t)n << 16) / d;
-    return q > 0xFFFFFFFFu ? 0xFFFFFFFFu : (uint32_t)q;
-}
 
 static void tick(uint64_t) {
     pf_w32(folio() + AF_TIME, pf_r32(folio() + AF_TIME) + 1);
@@ -507,4 +703,5 @@ void pf_audio_init() {
     pf_on_swi(0x40001, a_startinstrument);
     pf_on_swi(0x40008, a_connectinstruments);
     pf_on_swi(0x40011, a_tweakrawknob);
+    pf_on_swi(0x4001b, a_setaudioiteminfo);
 }
