@@ -62,7 +62,8 @@ static void graphics_vbl(uint64_t) {
     uint32_t g = pf_folio_base(PF_GRAPHICS), n = pf_r32(g + GF_VBLNUMBER) + 1;
     pf_w32(g + GF_VBLNUMBER, n);
     pf_w32(pf_r32(g + GF_VDLDISPLAYLINK), pf_r32(g + (n & 1 ? GF_CURRENTVDLODD : GF_CURRENTVDLEVEN)));
-    if (g_pf_frames_dir) write_frame(n);
+    if (g_pf_frames_dir && n >= g_pf_frames_first && n <= g_pf_frames_last && (n - g_pf_frames_first) % g_pf_frames_every == 0)
+        write_frame(n);
 }
 
 // ---- what the display shows (pfboot --frames) --------------------------------------------------
@@ -77,6 +78,7 @@ static void graphics_vbl(uint64_t) {
 // display control words (interpolation, the background and transparency, bit 15 of a pixel),
 // other widths, a relative link.
 const char* g_pf_frames_dir;
+uint32_t g_pf_frames_first = 0, g_pf_frames_last = 0xFFFFFFFFu, g_pf_frames_every = 1;
 static std::vector<uint8_t> g_last_frame;
 
 static bool display_field(std::vector<uint8_t>& rgb, int& lines) {

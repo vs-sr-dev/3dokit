@@ -670,6 +670,20 @@ static void a_releaseinstrument(ArmCpu& c) { c.r[0] = release_instrument((int32_
 // DSP memory.
 static int32_t audio_delete(ArmCpu& c, int type, int32_t item, uint32_t) {
     switch (type) {
+    case TEMPLATE_NODE: {
+        // 0x24b0: unless its word at +0x24 is above 0 (0 from its creation, 0x230c, and nothing
+        // here changes it), the attachments made to the template (its DSP side's list at +0x2c;
+        // none are made here) and then its instruments (the node's list at +0x34, in the order
+        // made: AddTail) deleted as by their owners until one fails (0x6a6c); its DSP side and
+        // memory freed, and off the folio's list of templates. 0 whatever happened.
+        std::vector<int32_t> doomed;
+        for (const auto& [i, v] : g_instruments)
+            if (v.tmpl == item) doomed.push_back(i);
+        for (int32_t i : doomed)
+            if (pf_delete_item_as_owner(c, i) < 0) break;
+        g_templates.erase(item);
+        return 0;
+    }
     case KNOB_NODE: g_knobs.erase(item); return 0;
     case INSTRUMENT_NODE: {
         std::vector<int32_t> doomed;
@@ -731,6 +745,15 @@ static void a_loadinstemplate(ArmCpu& c) {
     t.path = name;
     if (!parse_dsp(d, t)) pf_stop(c, "LoadInsTemplate: not a DSP instrument this runtime can read");
     c.r[0] = (uint32_t)make_template(std::move(t));
+}
+
+// audio -92: Err UnloadInsTemplate(Item template) -- 0x1578: a template (else AF_ERR_BADITEM);
+// each attachment made to it detached (a sample's, 0x3c78, or an envelope's, 0x5768; a hook of
+// another kind ends it with AF_ERR_BADITEM) -- none are made here --; then DeleteItem, whose
+// result is the call's.
+static void a_unloadinstemplate(ArmCpu& c) {
+    if (!pf_check_item((int32_t)c.r[0], NST_AUDIO, TEMPLATE_NODE)) { c.r[0] = AF_ERR_BADITEM; return; }
+    c.r[0] = (uint32_t)pf_delete_item(c, (int32_t)c.r[0]);
 }
 
 // audio -8: Item AllocInstrument(Item template, uint8 priority) -- 0x1af0:
@@ -1123,6 +1146,7 @@ void pf_audio_init() {
     pf_on_slot(PF_AUDIO, -4, a_loadinstemplate);
     pf_on_slot(PF_AUDIO, -8, a_allocinstrument);
     pf_on_slot(PF_AUDIO, -16, a_grabknob);
+    pf_on_slot(PF_AUDIO, -92, a_unloadinstemplate);
     pf_on_slot(PF_AUDIO, -144, a_attachsample);
     pf_on_slot(PF_AUDIO, -148, a_detachsample);
     pf_on_swi(0x40000, a_tweakknob);

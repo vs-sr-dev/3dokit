@@ -180,6 +180,9 @@ struct PfExit { int code; };
 void     pf_task_init();
 void     pf_task_reschedule();
 uint32_t pf_create_task(ArmCpu& c, uint32_t tags);  // CreateSizedItem of a TASKNODE
+int32_t  pf_delete_task(ArmCpu& c, uint32_t task);  // DeleteItem's own part for a TASKNODE
+// A deleted task's opened items closed and its semaphores unlocked (pf_kernel.cpp).
+void     pf_task_release(int32_t task);
 
 // Time (pf_time.cpp): the guest's clock, in nanoseconds since the boot. It is not the host's:
 // it moves on by a fixed amount at each safe point the recompiled code passes (backward branches
@@ -275,8 +278,10 @@ void     pf_math_init();
 
 // What the display shows (pf_graphics.cpp): with g_pf_frames_dir set, at each vertical blank
 // the field the VDLs describe, as a PPM in that directory whenever it differs from the last one
-// written (vblNNNNNN.ppm, by gf_VBLNumber). A diagnostic, not the display.
+// written (vblNNNNNN.ppm, by gf_VBLNumber). A diagnostic, not the display. Only the fields from
+// g_pf_frames_first to g_pf_frames_last, every g_pf_frames_every-th of them, are looked at.
 extern const char* g_pf_frames_dir;
+extern uint32_t g_pf_frames_first, g_pf_frames_last, g_pf_frames_every;
 
 // The SDK's names (generated: pf_names.cpp).
 struct PfSwiName { uint32_t number; const char* name; };

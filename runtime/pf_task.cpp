@@ -25,7 +25,7 @@ enum : uint32_t {
     T_THREADTASK = 0x24, T_REGS = 0x44, T_SP = 0x78, T_LK = 0x7c, T_PC = 0x80, T_PSR = 0x84,
     // n_Flags of a task
     TASK_READY = 1, TASK_WAITING = 2, TASK_SUPER = 8,
-    SIGF_ABORT = 4,
+    SIGF_ABORT = 4, SIGF_DEADTASK = 0x10,
     // CREATETASK_TAG_* (task.h), TAG_NOP (types.h)
     TAG_NAME = 1, TAG_PRI = 2, TAG_PC = 10, TAG_MAXQ = 11, TAG_STACKSIZE = 12, TAG_ARGC = 13,
     TAG_ARGP = 14, TAG_SP = 15, TAG_BASE = 16, TAG_NOP = 255,
@@ -45,7 +45,7 @@ struct Task {
     bool started, dead;
 };
 
-static std::vector<Task*> g_tasks;              // every task made; never freed
+static std::vector<Task*> g_tasks;              // every task alive; never freed
 static std::vector<Task*> g_ready;              // kb_TaskReadyQ: by priority, highest first
 static Task* g_running;
 static bool g_reschedule;                       // kb_PleaseReschedule
@@ -341,6 +341,38 @@ uint32_t pf_create_task(ArmCpu& c, uint32_t tags) {
     if (p > pf_r8(me + 10)) g_reschedule = true;
     if (g_pf_trace) pf_log("        thread \"%s\" at %06X, priority %u, stack %08X-%08X\n", s, pc, p, stack_base, sp);
     return (uint32_t)item;
+}
+
+// ---- deleting a task (DeleteItem of a TASKNODE, 0x167cc) ----------------------------------------
+// What the task holds goes first (0x16760): its resource table from the last entry back, each item
+// it made deleted as by the task, each it opened closed; then every semaphore it holds is unlocked
+// (0x165fc), its owner gets SIGF_DEADTASK, and it leaves the queue it is ready or waiting on; then
+// its per-folio data, supervisor stack, resource table and name are freed (0x16658), and the OS's
+// lists scavenged (0x157c4, ScavengeMem in supervisor mode). The runtime keeps no resource table:
+// the items whose n_Owner is the task, the last made first, then those it has open -- the table's
+// order for a task that opens before it makes, as the threads run so far do. It makes no per-folio
+// data or supervisor stack. The task's host thread is left waiting for a turn that never comes. A
+// task deleting itself stops the run: not yet.
+int32_t pf_delete_task(ArmCpu& c, uint32_t node) {
+    Task* t = find(node);
+    if (!t) pf_stop(c, "DeleteItem of a task the runtime does not run");
+    if (t == g_running) pf_stop(c, "DeleteItem of the current task: not yet");
+    int32_t me = (int32_t)pf_r32(node + 24);
+    for (int32_t i = pf_item_count() - 1; i > 0; --i) {
+        uint32_t n = pf_item_node(i);
+        if (n && n != node && (int32_t)pf_r32(n + 28) == me) pf_delete_item_as_owner(c, i);
+    }
+    pf_task_release(me);
+    if (uint32_t owner = pf_item_node((int32_t)pf_r32(node + 28))) pf_signal(owner, SIGF_DEADTASK);
+    for (size_t i = 0; i < g_ready.size(); ++i)
+        if (g_ready[i] == t) { g_ready.erase(g_ready.begin() + (long)i); break; }
+    for (size_t i = 0; i < g_tasks.size(); ++i)
+        if (g_tasks[i] == t) { g_tasks.erase(g_tasks.begin() + (long)i); break; }
+    t->dead = true;
+    set_flags(t, 0, TASK_READY | TASK_WAITING);
+    if (g_pf_trace) pf_log("        task \"%s\" deleted\n", name(t));
+    pf_scavenge(false);
+    return 0;
 }
 
 // The program's own task: the one pf_mem_init made, running on the host's main thread at the

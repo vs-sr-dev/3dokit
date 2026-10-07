@@ -2,7 +2,7 @@
 // runtime, tracing its OS calls.
 //
 //     pfboot PROGRAM [--trace N] [--lenient] [--max-calls N] [--snap N DIR] [--disc DIR]
-//                    [--frames DIR] [--pad BUTTONS@FIELD[xN][/E]]...
+//                    [--frames DIR [--frames-at FIRST[-LAST][/EVERY]]] [--pad BUTTONS@FIELD[xN][/E][+H]]...
 //
 // PROGRAM is the AIF file the build was recompiled from (its module must be
 // in this build). --trace 0 is quiet, 1 (the default) every OS call, 2 also
@@ -13,11 +13,14 @@
 // python -m 3dokit.pfcheck replays it on the 1993 OS). --disc DIR is the
 // disc's root, where the program's files are; by default the program's own
 // directory. --frames DIR writes what the display shows, at each vertical
-// blank that changes it, as a PPM (pf_graphics.cpp). --pad BUTTONS@FIELD[xN][/E]
+// blank that changes it, as a PPM (pf_graphics.cpp); --frames-at FIRST[-LAST][/EVERY]
+// looks only at the fields from FIRST to LAST, every EVERY-th of them (a long race
+// writes some 230 KB a field). --pad BUTTONS@FIELD[xN][/E][+H]
 // presses the first Control Pad's BUTTONS (up down left right a b c start x l r,
 // joined by +) at field FIELD (gf_VBLNumber), N times (4 by default), every E
-// fields (30, half a second), each held for 6 fields and then released; --pad
-// may be given more than once (pf_event.cpp).
+// fields (30, half a second), each held for H fields (6 by default) and then
+// released; given +H and no xN it is one press (a@7600+600: A held from field
+// 7600 to 8199). --pad may be given more than once (pf_event.cpp).
 //
 //     pfboot PROGRAM --memtest DIR [--ops N] [--seed S]
 //
@@ -34,7 +37,7 @@ static uint32_t be32(const std::vector<uint8_t>& d, size_t o) {
     return (uint32_t)d[o] << 24 | (uint32_t)d[o + 1] << 16 | (uint32_t)d[o + 2] << 8 | d[o + 3];
 }
 
-// --pad BUTTONS@FIELD[xN][/E]: the buttons' bits (event.h's ControlPadEventData), scheduled.
+// --pad BUTTONS@FIELD[xN][/E][+H]: the buttons' bits (event.h's ControlPadEventData), scheduled.
 static bool pad_option(const char* spec) {
     static const struct { const char* name; uint32_t bit; } kButtons[] = {
         {"down", 0x80000000u}, {"up", 0x40000000u}, {"right", 0x20000000u}, {"left", 0x10000000u},
@@ -57,11 +60,30 @@ static bool pad_option(const char* spec) {
     }
     char* p;
     unsigned long long first = std::strtoull(s.c_str() + at + 1, &p, 10);
-    long count = 4, every = 30;
+    long count = -1, every = 30, hold = 6;
     if (*p == 'x') count = std::strtol(p + 1, &p, 10);
     if (*p == '/') every = std::strtol(p + 1, &p, 10);
-    if (*p || !bits || count < 1 || every < 7) return false;
-    pf_pad_press(bits, first, (int)count, (int)every, 6);
+    if (*p == '+') {
+        hold = std::strtol(p + 1, &p, 10);
+        if (count < 0) count = 1;   // a hold is one press unless told otherwise
+    }
+    if (count < 0) count = 4;
+    if (*p || !bits || count < 1 || hold < 1 || (count > 1 && every <= hold)) return false;
+    pf_pad_press(bits, first, (int)count, (int)every, (int)hold);
+    return true;
+}
+
+// --frames-at FIRST[-LAST][/EVERY]: the fields --frames looks at.
+static bool frames_at_option(const char* spec) {
+    char* p;
+    unsigned long first = std::strtoul(spec, &p, 10), last = 0xFFFFFFFFul, every = 1;
+    if (p == spec) return false;
+    if (*p == '-') last = std::strtoul(p + 1, &p, 10);
+    if (*p == '/') every = std::strtoul(p + 1, &p, 10);
+    if (*p || last < first || every < 1) return false;
+    g_pf_frames_first = (uint32_t)first;
+    g_pf_frames_last = (uint32_t)last;
+    g_pf_frames_every = (uint32_t)every;
     return true;
 }
 
@@ -76,7 +98,8 @@ static uint32_t bl_target(const std::vector<uint8_t>& d, uint32_t at) {
 int main(int argc, char** argv) {
     if (argc < 2) {
         std::fprintf(stderr, "usage: pfboot PROGRAM [--trace N] [--lenient] [--max-calls N] [--snap N DIR] [--disc DIR]\n"
-                             "                      [--frames DIR] [--pad BUTTONS@FIELD[xN][/E]]...\n"
+                             "                      [--frames DIR [--frames-at FIRST[-LAST][/EVERY]]]\n"
+                             "                      [--pad BUTTONS@FIELD[xN][/E][+H]]...\n"
                              "       pfboot PROGRAM --memtest DIR [--ops N] [--seed S]\n");
         return 2;
     }
@@ -94,9 +117,15 @@ int main(int argc, char** argv) {
         }
         else if (!std::strcmp(argv[i], "--disc") && i + 1 < argc) disc = argv[++i];
         else if (!std::strcmp(argv[i], "--frames") && i + 1 < argc) g_pf_frames_dir = argv[++i];
+        else if (!std::strcmp(argv[i], "--frames-at") && i + 1 < argc) {
+            if (!frames_at_option(argv[++i])) {
+                std::fprintf(stderr, "--frames-at %s: FIRST[-LAST][/EVERY]\n", argv[i]);
+                return 2;
+            }
+        }
         else if (!std::strcmp(argv[i], "--pad") && i + 1 < argc) {
             if (!pad_option(argv[++i])) {
-                std::fprintf(stderr, "--pad %s: BUTTONS@FIELD[xN][/E], BUTTONS of up down left right a b c start x l r\n", argv[i]);
+                std::fprintf(stderr, "--pad %s: BUTTONS@FIELD[xN][/E][+H], BUTTONS of up down left right a b c start x l r\n", argv[i]);
                 return 2;
             }
         }

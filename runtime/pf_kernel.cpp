@@ -288,6 +288,14 @@ int32_t pf_item_opened(int32_t task, int32_t item) {
 
 static void k_itemopened(ArmCpu& c) { c.r[0] = (uint32_t)pf_item_opened((int32_t)c.r[0], (int32_t)c.r[1]); }
 
+// swi 0x10017: void* SetFunction(Item folio, int32 vnum, int32 vtype, void* func) -- os_code
+// 0x18308: a task that is not privileged (n_Flags' 8 clear) is refused at once, NOTPRIV; the rest
+// (a folio's vector or SWI replaced) is for a privileged task only: not yet.
+static void k_setfunction(ArmCpu& c) {
+    if (!(pf_r8(pf_current_task() + 11) & 8)) { c.r[0] = 0xD57B9004u; return; }
+    pf_stop(c, "SetFunction from a privileged task: not yet");
+}
+
 // Kernel -48: void* LookupItem(Item) -- the node, or NULL
 static void k_lookupitem(ArmCpu& c) { c.r[0] = pf_item_node((int32_t)c.r[0]); }
 
@@ -359,27 +367,47 @@ int32_t pf_lock_item(int32_t item, uint32_t flags) {
     return 1;
 }
 
-// swi 0x10006: Err UnlockItem(Item s) -- 0x13b90 and 0x13b30: a semaphore the task holds (else
-// BADITEM, NOTOWNER); its count down, and at 0 the first waiter is signalled and holds it, or it
-// is free.
-int32_t pf_unlock_item(int32_t item) {
-    uint32_t s = pf_check_item(item, 1, SEMAPHORENODE);
-    if (!s) return (int32_t)0xD57B9001u;
-    if ((int32_t)pf_r32(s + SEM_OWNER) != task_item()) return (int32_t)0xD57B9012u;
+// The kernel's unlock (0x13b30): the count down, and at 0 the first waiter is signalled and holds
+// the semaphore, or it is free.
+static void unlock(uint32_t s) {
     uint32_t count = pf_r32(s + SEM_NESTCNT) - 1;
     pf_w32(s + SEM_NESTCNT, count);
-    if (count) return 0;
+    if (count) return;
     uint32_t first = pf_r32(s + SEM_WAITERS + PF_LIST_HEAD);
     if (first == s + SEM_WAITERS + PF_LIST_TAIL) {
         pf_w32(s + SEM_BIT, 0);
         pf_w32(s + SEM_OWNER, 0xFFFFFFFFu);
-        return 0;
+        return;
     }
     pf_list_rem_node(first);
     int32_t waiter = (int32_t)pf_r32(first + SWN_TASK);
     pf_signal(pf_item_node(waiter), pf_r32(first + SWN_SIG));
     pf_w32(s + SEM_OWNER, (uint32_t)waiter);
+}
+
+// swi 0x10006: Err UnlockItem(Item s) -- 0x13b90: a semaphore the task holds (else BADITEM,
+// NOTOWNER), unlocked.
+int32_t pf_unlock_item(int32_t item) {
+    uint32_t s = pf_check_item(item, 1, SEMAPHORENODE);
+    if (!s) return (int32_t)0xD57B9001u;
+    if ((int32_t)pf_r32(s + SEM_OWNER) != task_item()) return (int32_t)0xD57B9012u;
+    unlock(s);
     return 0;
+}
+
+// What a task deleted gives up besides the items it made (os_code 0x16760 and 0x165fc): each item
+// it has open closed as by it (the kernel's own CloseItem, 0x13150), and each semaphore it holds
+// unlocked until it is free or a waiter has it.
+void pf_task_release(int32_t task) {
+    auto open = g_opened.find(task);
+    if (open != g_opened.end()) {
+        for (auto it = open->second.rbegin(); it != open->second.rend(); ++it)
+            if (uint32_t n = pf_item_node(*it)) count_opens(n, -1);
+        g_opened.erase(open);
+    }
+    for (int32_t i = 1; i < pf_item_count(); ++i)
+        if (uint32_t s = pf_check_item(i, 1, SEMAPHORENODE))
+            while ((int32_t)pf_r32(s + SEM_OWNER) == task) unlock(s);
 }
 
 static void k_lockitem(ArmCpu& c) { c.r[0] = (uint32_t)pf_lock_item((int32_t)c.r[0], c.r[1]); }
@@ -395,6 +423,7 @@ void pf_kernel_init() {
     pf_on_swi(0x10004, k_finditem);
     pf_on_swi(0x10005, k_openitem);
     pf_on_swi(0x10008, k_closeitem);
+    pf_on_swi(0x10017, k_setfunction);
     pf_on_slot(PF_KERNEL, -120, k_startup);
     pf_on_slot(PF_KERNEL, -48, k_lookupitem);
     pf_on_slot(PF_KERNEL, -52, k_memset);

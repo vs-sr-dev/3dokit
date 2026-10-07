@@ -80,7 +80,9 @@ build/recomp-build/pfboot GAME --memtest DIR --ops 4000  # the allocator, a rand
 python -m 3dokit.pfcheck DISC/System/Kernel/os_code DIR  # ...replayed on the 1993 kernel's own code
 build/recomp-build/pfboot GAME --snap N DIR              # the memory before and after the N-th OS call
 build/recomp-build/pfboot GAME --frames DIR              # what the display shows, a PPM per change
-build/recomp-build/pfboot GAME --pad a@1300x1            # the first pad's A at field 1300 (BUTTONS@FIELD[xN][/E])
+build/recomp-build/pfboot GAME --frames DIR --frames-at 39000-41000/10   # ...of those fields only
+build/recomp-build/pfboot GAME --pad a@1300x1            # the first pad's A at field 1300 (BUTTONS@FIELD[xN][/E][+H])
+build/recomp-build/pfboot GAME --pad a@7600+600          # ...or held, from field 7600 for 600 fields
 python -m 3dokit.pfcheck DISC/System/Kernel/os_code DIR --graphix DISC/System/Folios/GRAPHIX   # ...on the folio's
 python -m 3dokit.aif --decompress DISC/System/Folios/GRAPHIX graphix.bin   # by its own decompressor
 python -m 3dokit.shapes library GAME --corpus 'build/disc/System/Programs/*'
