@@ -304,8 +304,11 @@ static std::vector<uint32_t> g_reads;           // queued reads, in order
 static const char kFill[] = "iamaduck";
 
 // A read done: the file's bytes, and past its end, up to the end of its last block, what the
-// disc's mastering left there -- the eight letters "iamaduck" over and over, by the byte's place
-// in its block (every file of the two discs checked, but rom_tags and OMF2097's BannerScreen).
+// disc's mastering left there -- the Opera mastering tool's fill, the eight letters "iamaduck"
+// over and over, by the byte's place in its block (every file of the two discs checked, but
+// rom_tags and OMF2097's BannerScreen). Not every disc has it: of five surveyed, Alone in the Dark
+// has no fill at all, and its files' tails hold whatever the master's memory held -- which only
+// the disc's image can give.
 static void read_blocks(uint32_t ior) {
     uint32_t file = pf_r32(pf_r32(ior + IO_DEV) + OFI_FILE);
     uint32_t bs = pf_r32(file + FI_BLOCKSIZE), bytes = pf_r32(file + FI_BYTECOUNT);
