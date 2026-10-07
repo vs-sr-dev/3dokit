@@ -35,7 +35,7 @@ enum : uint32_t {
     AF_TAG_HOOKNAME = 44, AF_TAG_START_AT = 45, AF_TAG_SAMPLE_RATE = 46,
     AF_TAG_COMPRESSIONRATIO = 47, AF_TAG_COMPRESSIONTYPE = 48, AF_TAG_NUMBITS = 49,
     AF_TAG_DELAY_LINE = 57,
-    AF_INSF_LEGALFLAGS = 1,
+    AF_INSF_AUTOABANDON = 1, AF_INSF_LEGALFLAGS = 1,
     // a DSP resource's type (3dokit.dsp): what a knob writes, what a connection joins
     RSRC_KNOB = 1, RSRC_VARIABLE = 2, RSRC_IFIFO = 6, RSRC_OFIFO = 7,
 };
@@ -148,9 +148,14 @@ struct Connection {
 struct Instrument {
     int32_t tmpl;
     uint32_t flags;
-    int state;                              // 0 allocated, 3 started (the node's +0x30 in the folio)
+    int state;                              // the node's +0x30: 0 allocated or abandoned, 1 stopped, 3 started
+    int dsp_state;                          // its DSP side's (+0x14 of the folio's record): above 1 running
     std::map<uint32_t, int32_t> value;      // what the folio wrote to each knob resource
     std::vector<Connection> inputs;
+    // Per FIFO (a resource), the attachment it plays: the folio keeps it in its table of the DSP's
+    // FIFOs (+0x18 of an entry, by the FIFO's number), set when an attachment starts, cleared when
+    // it stops.
+    std::map<int, int32_t> playing;
 };
 struct Knob {
     int32_t ins;
@@ -193,9 +198,10 @@ struct Attachment {
     int32_t ins, sample;
     int rsrc;                               // the FIFO, a resource of the instrument's template
     uint32_t flags, start_at;
-    bool started;                           // by a StartInstrument of its instrument
+    int state;                              // +0x26: 0 made, 1 stopped, 3 playing
     int32_t next;                           // LinkAttachments (+0x4c): what plays after it, 0 none
 };
+enum : uint32_t { AF_ATTF_NOAUTOSTART = 1, AF_ERR_NULLADDRESS = 0xD52BF119u };
 static std::map<int32_t, Attachment> g_attachments;
 
 static uint32_t task_item() { return pf_r32(pf_current_task() + 24); }
@@ -304,7 +310,7 @@ static uint32_t create_instrument(ArmCpu& c, const Tags& tags) {
     }
     if (!pf_check_item(tmpl, NST_AUDIO, TEMPLATE_NODE)) return AF_ERR_BADITEM;
     const Template& t = g_templates[tmpl];
-    Instrument ins{tmpl, flags, 0, {}, {}};
+    Instrument ins{tmpl, flags, 0, 0, {}, {}, {}};
     for (const auto& k : t.knobs)
         if (uint32_t err = tweak(c, ins, t, k, k.dflt, false)) return err;
     int32_t item = audio_item(INSTRUMENT_NODE, (uint8_t)pri);
@@ -534,7 +540,7 @@ static uint32_t create_attachment(ArmCpu& c, const Tags& tags) {
         if (g_pf_trace) pf_log("        attach sample %d to instrument %d's \"%s\"\n", sample, ins, t.rsrc[(size_t)rsrc].name.c_str());
     }
     int32_t item = audio_item(ATTACHMENT_NODE);
-    g_attachments[item] = {ins, sample, rsrc, flags, start_at, false, 0};
+    g_attachments[item] = {ins, sample, rsrc, flags, start_at, 0, 0};
     return (uint32_t)item;
 }
 
@@ -556,16 +562,72 @@ static uint32_t create(ArmCpu& c, int type, const Tags& tags, uint32_t tag_ptr =
 
 static uint32_t audio_create(ArmCpu& c, int type, uint32_t tags) { return create(c, type, read_tags(tags), tags); }
 
+// ---- starting and stopping ------------------------------------------------------------------
+// What the folio does to the DSP on each is not done here; the states it keeps are.
+
+// An attachment started (0x74b8): its sample must have an address (else AF_ERR_NULLADDRESS) and 4
+// bytes or more (else AF_ERR_OUTOFRANGE); then the FIFO plays it, and it is playing. A sample
+// without a sustain or release loop plays once: the folio looks at what is linked after it (0x795c,
+// forgetting a link to what is no longer an attachment) to queue it in the DSP.
+static uint32_t attachment_start(int32_t a) {
+    Attachment& at = g_attachments[a];
+    const Sample& s = g_samples[at.sample];
+    if (!s.address) return AF_ERR_NULLADDRESS;
+    if (s.numbytes < 4) return AF_ERR_OUTOFRANGE;
+    g_instruments[at.ins].playing[at.rsrc] = a;
+    if (s.sustain_begin < 0 && s.release_begin < 0 && at.next && !pf_check_item(at.next, NST_AUDIO, ATTACHMENT_NODE))
+        at.next = 0;
+    at.state = 3;
+    return 0;
+}
+
+// An attachment stopped (0x7cf8): when it is playing, its FIFO plays nothing and it is stopped.
+static void attachment_stop(int32_t a) {
+    Attachment& at = g_attachments[a];
+    if (at.state <= 1) return;
+    g_instruments[at.ins].playing.erase(at.rsrc);
+    at.state = 1;
+}
+
+// An instrument's DSP side stopped (0x7be8), when it runs: every FIFO's playing attachment
+// stopped, while it is still an attachment (the envelopes' attachments, a list of their own, are
+// not made here).
+static void dsp_stop(Instrument& ins) {
+    if (ins.dsp_state <= 1) return;
+    ins.dsp_state = 1;
+    std::map<int, int32_t> was = ins.playing;
+    for (auto [rsrc, a] : was)
+        if (pf_check_item(a, NST_AUDIO, ATTACHMENT_NODE)) attachment_stop(a);
+}
+
+// swi 0x40003: Err StopInstrument(Item instrument, TagArg* tags) -- 0x1ddc: an instrument (else
+// AF_ERR_BADITEM), no tags (else AF_ERR_BADTAG); neither the folio's open nor the owner asked.
+// Started, it is stopped, its DSP side with it; AF_INSF_AUTOABANDON leaves it abandoned (0).
+static uint32_t stop_instrument(int32_t item, uint32_t tags) {
+    if (!pf_check_item(item, NST_AUDIO, INSTRUMENT_NODE)) return AF_ERR_BADITEM;
+    if (tags) return AF_ERR_BADTAG;
+    Instrument& ins = g_instruments[item];
+    if (ins.state <= 1) return 0;
+    ins.state = 1;
+    dsp_stop(ins);
+    if (ins.flags & AF_INSF_AUTOABANDON) ins.state = 0;
+    return 0;
+}
+static void a_stopinstrument(ArmCpu& c) { c.r[0] = stop_instrument((int32_t)c.r[0], c.r[1]); }
+
 // ---- deleting items (the folio's ir_Delete, 0x1170, by node type) -----------------------------
 // A knob (0x27a8): off its instrument's list of grabbed knobs (RemNode), and 0. An instrument
 // (0x2294): every knob grabbed on it (the node's list at +0x34, in the order grabbed) deleted as
-// by its owner (vector 34, 0x6a6c), then 0x8dc4: the instrument stopped, every attachment on each
+// by its owner (vector 34, 0x6a6c), then 0x8dc4: its DSP side stopped, every attachment on each
 // of its FIFOs deleted the same way, then a list at +0x9c of its private data (nothing the
 // programs run so far put there), its DSP resources and memory freed; and off its template's
 // list while the template is an item. The results of those deletions are not read. An attachment
-// (0x61cc): if it is playing, its instrument stopped (not yet here), then off its hook's list
-// and its sample's "SampleRefs". FreeInstrument and ReleaseKnob are DeleteItem in the 1993 lib,
-// DetachSample the folio's own glue for it. An instrument that was a connection's source stays
+// (0x61cc): if it is playing, its instrument stopped (StopInstrument, whose result is the
+// deletion's) and it too, then off its hook's list and its sample's "SampleRefs". FreeInstrument and ReleaseKnob are DeleteItem in the 1993 lib,
+// DetachSample the folio's own glue for it. A sample (0x3d18): every attachment made with it
+// stopped, then each deleted as by its owner (the first error is the deletion's, the rest left);
+// a delay line's memory freed; then off the folio's "AudioSamples" -- unless its word at +0x40
+// is above 0 (AF_ERR_INUSE; 0 here, as nothing changes it). An instrument that was a connection's source stays
 // one in the instruments it fed, as in the folio, whose patched code goes on reading the freed
 // DSP memory.
 static int32_t audio_delete(ArmCpu& c, int type, int32_t item, uint32_t) {
@@ -576,6 +638,7 @@ static int32_t audio_delete(ArmCpu& c, int type, int32_t item, uint32_t) {
         for (const auto& [k, v] : g_knobs)
             if (v.ins == item) doomed.push_back(k);
         for (int32_t k : doomed) pf_delete_item_as_owner(c, k);
+        dsp_stop(g_instruments[item]);
         doomed.clear();
         for (const auto& [a, v] : g_attachments)
             if (v.ins == item) doomed.push_back(a);
@@ -583,10 +646,27 @@ static int32_t audio_delete(ArmCpu& c, int type, int32_t item, uint32_t) {
         g_instruments.erase(item);
         return 0;
     }
-    case ATTACHMENT_NODE:
-        if (g_attachments[item].started) pf_stop(c, "deleting a playing attachment (its instrument stopped): not yet");
+    case SAMPLE_NODE: {
+        std::vector<int32_t> refs;
+        for (const auto& [a, v] : g_attachments)
+            if (v.sample == item) refs.push_back(a);
+        for (int32_t a : refs) attachment_stop(a);
+        int32_t err = 0;
+        for (int32_t a : refs)
+            if ((err = pf_delete_item_as_owner(c, a)) < 0) break;
+        if (g_samples[item].flags & 2) pf_stop(c, "deleting a delay line's sample: not yet");
+        g_samples.erase(item);
+        return err;
+    }
+    case ATTACHMENT_NODE: {
+        int32_t err = 0;
+        if (pf_check_item(g_attachments[item].ins, NST_AUDIO, INSTRUMENT_NODE) && g_attachments[item].state > 1) {
+            err = (int32_t)stop_instrument(g_attachments[item].ins, 0);
+            attachment_stop(item);
+        }
         g_attachments.erase(item);
-        return 0;
+        return err;
+    }
     default: {
         char why[80];
         std::snprintf(why, sizeof why, "DeleteItem of the audio folio's node type %d: not yet", type);
@@ -639,8 +719,8 @@ static void a_detachsample(ArmCpu& c) { c.r[0] = (uint32_t)pf_delete_item(c, (in
 
 // swi 0x40015: Err LinkAttachments(Item at1, Item at2) -- 0x63d4: at1 an attachment (else
 // AF_ERR_BADITEM), at2 0 or an attachment (else the same); at2 is what plays after at1. Neither
-// the folio's open nor the owner is asked. When at1 is playing the folio also links the two in
-// the DSP (0x76b8, 0x7860): not yet here.
+// the folio's open nor the owner is asked. When at1 is playing the folio also links (or unlinks)
+// the two in the DSP (0x7860, 0x76b8), which is not done here.
 static void a_linkattachments(ArmCpu& c) {
     int32_t a1 = (int32_t)c.r[0], a2 = (int32_t)c.r[1];
     if (!pf_check_item(a1, NST_AUDIO, ATTACHMENT_NODE) || (a2 && !pf_check_item(a2, NST_AUDIO, ATTACHMENT_NODE))) {
@@ -648,7 +728,6 @@ static void a_linkattachments(ArmCpu& c) {
         return;
     }
     Attachment& at = g_attachments[a1];
-    if (at.started) pf_stop(c, "LinkAttachments on a playing attachment: not yet");
     at.next = a2;
     if (g_pf_trace) pf_log("        attachment %d then %d\n", a1, a2);
     c.r[0] = 0;
@@ -669,13 +748,17 @@ static void a_tweakrawknob(ArmCpu& c) { tweak_knob(c, false); }
 // swi 0x40001: Err StartInstrument(Item instrument, TagArg* tags) -- 0x1b68 and 0x7148: the folio
 // open; AF_TAG_RATE (the Frequency knob, raw) or AF_TAG_FREQUENCY (cooked), AF_TAG_AMPLITUDE or
 // AF_TAG_VELOCITY (velocity << 8: the Amplitude knob, cooked), each when the instrument has that
-// knob; then its attachments start, then the instrument. Its node's state becomes 3.
+// knob. Its DSP side, when running, is stopped first (before the tags, so a bad tag leaves it
+// stopped). Then on each of its FIFOs, in the template's order, the first attachment (in the order
+// made) not marked AF_ATTF_NOAUTOSTART starts -- whether it can is not the call's result -- and
+// its DSP side runs; its node's state becomes 3.
 static void a_startinstrument(ArmCpu& c) {
     if (!audio_open()) { c.r[0] = AF_ERR_AUDIOCLOSED; return; }
     int32_t item = (int32_t)c.r[0];
     if (!pf_check_item(item, NST_AUDIO, INSTRUMENT_NODE)) { c.r[0] = AF_ERR_BADITEM; return; }
     Instrument& ins = g_instruments[item];
     const Template& t = g_templates[ins.tmpl];
+    dsp_stop(ins);
     int32_t freq = 0, amp = -1;
     bool have_freq = false, cooked_freq = false;
     for (uint32_t p = c.r[1]; p; p += 8) {
@@ -691,8 +774,16 @@ static void a_startinstrument(ArmCpu& c) {
     if (const DspKnob* k = find_knob(t, "Frequency"); k && have_freq) tweak(c, ins, t, *k, freq, cooked_freq);
     if (const DspKnob* k = find_knob(t, "Amplitude"); k && amp >= 0) tweak(c, ins, t, *k, amp, true);
     if (g_pf_trace) pf_log("        StartInstrument %d (%s)\n", item, t.path.c_str());
-    for (auto& [a, v] : g_attachments)          // what the folio sets up for each is not read yet
-        if (v.ins == item) v.started = true;
+    for (size_t i = 0; i < t.rsrc.size(); ++i) {
+        if (t.rsrc[i].type != RSRC_IFIFO && t.rsrc[i].type != RSRC_OFIFO) continue;
+        for (const auto& [a, v] : g_attachments)
+            if (v.ins == item && v.rsrc == (int)i && !(v.flags & AF_ATTF_NOAUTOSTART)) {
+                uint32_t err = attachment_start(a);
+                if (g_pf_trace) pf_log("        attachment %d starts on \"%s\" -> 0x%x\n", a, t.rsrc[i].name.c_str(), err);
+                break;
+            }
+    }
+    ins.dsp_state = 3;
     ins.state = 3;
     c.r[0] = 0;
 }
@@ -874,6 +965,7 @@ void pf_audio_init() {
     pf_on_slot(PF_AUDIO, -148, a_detachsample);
     pf_on_swi(0x40000, a_tweakknob);
     pf_on_swi(0x40001, a_startinstrument);
+    pf_on_swi(0x40003, a_stopinstrument);
     pf_on_swi(0x40008, a_connectinstruments);
     pf_on_swi(0x4000c, a_disconnectinstruments);
     pf_on_swi(0x40011, a_tweakrawknob);
