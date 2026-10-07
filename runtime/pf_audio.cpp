@@ -449,27 +449,38 @@ static uint32_t sample_set(ArmCpu& c, Sample& s, uint32_t tags) {
     return 0;
 }
 
-// A sample (0x3a3c): the kernel's item tags (vector 38, 0x1acf4), the folio's defaults, a first
+// A sample (0x3a3c): the kernel's item tags (vector 38, 0x1acf4: the name, priority, version,
+// revision; the rest passed to the folio, which takes them all), the folio's defaults, a first
 // look for AF_TAG_SAMPLE (another sample's info copied) and AF_TAG_DELAY_LINE (memory of the
-// folio's), the frames from the bytes, the tags as SetAudioItemInfo takes them, and the base
-// frequency. Only made without tags so far.
-static uint32_t create_sample(ArmCpu& c, const Tags& tags) {
-    if (!tags.empty()) pf_stop(c, "a sample's tags at its creation: not yet");
+// folio's), the frames from the bytes, the tags as SetAudioItemInfo takes them (an error there is
+// the creation's), and the base frequency. An item tag would reach 0x347c and be AF_ERR_BADTAG
+// there; neither they nor SAMPLE and DELAY_LINE are done yet.
+static uint32_t create_sample(ArmCpu& c, const Tags& tags, uint32_t tag_ptr) {
+    for (auto [tag, v] : tags) {
+        (void)v;
+        if (tag < 10 || tag >= 0xfe) pf_stop(c, "an item tag at a sample's creation: not yet");
+        if (tag == AF_TAG_SAMPLE || tag == AF_TAG_DELAY_LINE) pf_stop(c, "AF_TAG_SAMPLE or DELAY_LINE: not yet");
+    }
     Sample s;
     s.frames = bytes_to_frames(c, s, s.numbytes);
+    if (tag_ptr)
+        if (uint32_t err = sample_set(c, s, tag_ptr)) return err;
     sample_base_freq(c, s);
     int32_t item = audio_item(SAMPLE_NODE);
     g_samples[item] = s;
+    if (g_pf_trace && tag_ptr)
+        pf_log("        sample %d: %u frames, %u bytes at 0x%x, %u bits, rate 0x%x\n", item, s.frames, s.numbytes,
+               s.address, (unsigned)s.numbits, s.rate);
     return (uint32_t)item;
 }
 
 // The folio's ir_Create: first the folio open (0x109c), then the node type's own routine.
-static uint32_t create(ArmCpu& c, int type, const Tags& tags) {
+static uint32_t create(ArmCpu& c, int type, const Tags& tags, uint32_t tag_ptr = 0) {
     if (!audio_open()) return AF_ERR_AUDIOCLOSED;
     switch (type) {
     case INSTRUMENT_NODE: return create_instrument(c, tags);
     case KNOB_NODE: return create_knob(c, tags);
-    case SAMPLE_NODE: return create_sample(c, tags);
+    case SAMPLE_NODE: return create_sample(c, tags, tag_ptr);
     default: {
         char why[80];
         std::snprintf(why, sizeof why, "CreateItem of the audio folio's node type %d: not yet", type);
@@ -478,7 +489,35 @@ static uint32_t create(ArmCpu& c, int type, const Tags& tags) {
     }
 }
 
-static uint32_t audio_create(ArmCpu& c, int type, uint32_t tags) { return create(c, type, read_tags(tags)); }
+static uint32_t audio_create(ArmCpu& c, int type, uint32_t tags) { return create(c, type, read_tags(tags), tags); }
+
+// ---- deleting items (the folio's ir_Delete, 0x1170, by node type) -----------------------------
+// A knob (0x27a8): off its instrument's list of the items grabbed for that knob (RemNode), and 0.
+// An instrument (0x2294): its attachments deleted (none are made yet), then 0x8dc4: the
+// instrument stopped and, knob by knob of its template, every item grabbed for it deleted as by
+// its owner (vector 34), then its DSP resources and memory freed; and off its template's list
+// while the template is an item. FreeInstrument and ReleaseKnob are DeleteItem in the 1993 lib.
+// An instrument that was a connection's source stays one in the instruments it fed, as in the
+// folio, whose patched code goes on reading the freed DSP memory.
+static int32_t audio_delete(ArmCpu& c, int type, int32_t item, uint32_t) {
+    switch (type) {
+    case KNOB_NODE: g_knobs.erase(item); return 0;
+    case INSTRUMENT_NODE: {
+        std::vector<std::pair<int, int32_t>> grabbed;           // by the template's knob, then item
+        for (const auto& [k, v] : g_knobs)
+            if (v.ins == item) grabbed.push_back({v.knob, k});
+        std::sort(grabbed.begin(), grabbed.end());
+        for (const auto& g : grabbed) pf_delete_item_as_owner(c, g.second);    // results unread, as there
+        g_instruments.erase(item);
+        return 0;
+    }
+    default: {
+        char why[80];
+        std::snprintf(why, sizeof why, "DeleteItem of the audio folio's node type %d: not yet", type);
+        pf_stop(c, why);
+    }
+    }
+}
 
 // ---- the calls ------------------------------------------------------------------------------
 // audio -4: Item LoadInsTemplate(char* name, Item aux) -- 0x1610: the folio open; aux must be 0;
@@ -571,6 +610,30 @@ static void a_connectinstruments(ArmCpu& c) {
     if (g_pf_trace) pf_log("        connect %d \"%s\" -> %d \"%s\"\n", src, from.c_str(), dst, to.c_str());
     if (a < 0 || b < 0) { c.r[0] = AF_ERR_BADNAME; return; }
     d.inputs.push_back({src, (uint32_t)a, (uint32_t)b});
+    c.r[0] = 0;
+}
+
+// swi 0x4000c: Err DisconnectInstruments(Item src, char* srcName, Item dst, char* dstName) --
+// 0x1cac and 0x8130: both instruments (else AF_ERR_BADITEM), the names as ConnectInstruments
+// finds them (else AF_ERR_BADNAME); then every place in the destination's code that reads that
+// resource is put back as it was loaded (0xc000) -- whatever fed it, and whether anything did.
+static void a_disconnectinstruments(ArmCpu& c) {
+    int32_t src = (int32_t)c.r[0], dst = (int32_t)c.r[2];
+    if (!pf_check_item(src, NST_AUDIO, INSTRUMENT_NODE) || !pf_check_item(dst, NST_AUDIO, INSTRUMENT_NODE)) {
+        c.r[0] = AF_ERR_BADITEM;
+        return;
+    }
+    std::string from = guest_string(c.r[1]), to = guest_string(c.r[3]);
+    const Template& ts = g_templates[g_instruments[src].tmpl];
+    Instrument& d = g_instruments[dst];
+    const Template& td = g_templates[d.tmpl];
+    int a = find_rsrc(ts, RSRC_VARIABLE, from), b = find_rsrc(td, RSRC_VARIABLE, to);
+    if (b < 0) b = find_rsrc(td, RSRC_KNOB, to);
+    if (g_pf_trace) pf_log("        disconnect %d \"%s\" -> %d \"%s\"\n", src, from.c_str(), dst, to.c_str());
+    if (a < 0 || b < 0) { c.r[0] = AF_ERR_BADNAME; return; }
+    d.inputs.erase(std::remove_if(d.inputs.begin(), d.inputs.end(),
+                                  [&](const Connection& k) { return k.to_rsrc == (uint32_t)b; }),
+                   d.inputs.end());
     c.r[0] = 0;
 }
 
@@ -696,12 +759,14 @@ void pf_audio_init() {
     pf_on_swi(0x4000f, a_setaudiorate);
     pf_on_swi(0x40010, a_setaudioduration);
     pf_on_create(NST_AUDIO, audio_create);
+    pf_on_delete(NST_AUDIO, audio_delete);
     pf_on_slot(PF_AUDIO, -4, a_loadinstemplate);
     pf_on_slot(PF_AUDIO, -8, a_allocinstrument);
     pf_on_slot(PF_AUDIO, -16, a_grabknob);
     pf_on_swi(0x40000, a_tweakknob);
     pf_on_swi(0x40001, a_startinstrument);
     pf_on_swi(0x40008, a_connectinstruments);
+    pf_on_swi(0x4000c, a_disconnectinstruments);
     pf_on_swi(0x40011, a_tweakrawknob);
     pf_on_swi(0x4001b, a_setaudioiteminfo);
 }

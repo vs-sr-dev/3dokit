@@ -92,6 +92,11 @@ int32_t  pf_item_opened(int32_t task, int32_t item);
 // the node type and the caller's tags; the new item or an Err.
 typedef uint32_t (*PfCreateItem)(ArmCpu& c, int type, uint32_t tags);
 void     pf_on_create(int subsys, PfCreateItem fn);
+// DeleteItem of a subsystem's item, after the kernel's own checks: the folio's ir_Delete, given
+// the node type, the item and the deleting task's node; 0 lets the kernel free the item, anything
+// else is DeleteItem's result and the item stays (os_code 0x1379c).
+typedef int32_t (*PfDeleteItem)(ArmCpu& c, int type, int32_t item, uint32_t task);
+void     pf_on_delete(int subsys, PfDeleteItem fn);
 // An Err: negative, as Portfolio's are (the bits are not yet the OS's own).
 enum : int32_t { PF_ERR_NOTFOUND = -1, PF_ERR_BADITEM = -2 };
 
@@ -214,6 +219,7 @@ void     pf_complete_io(uint32_t ior);
 int32_t  pf_create_ioreq(ArmCpu& c, int32_t device);
 int32_t  pf_send_io(ArmCpu& c, int32_t ior, uint32_t info);
 int32_t  pf_delete_item(ArmCpu& c, int32_t item);
+int32_t  pf_delete_item_as_owner(ArmCpu& c, int32_t item);   // the kernel's vector 34 (0x1387c)
 int32_t  pf_signal(uint32_t task, uint32_t bits);   // the kernel's own SendSignal (pf_task.cpp)
 // The current task's AllocSignal, FreeSignal and WaitSignal (pf_task.cpp), for the OS's own use.
 uint32_t pf_alloc_signal(uint32_t sigs);

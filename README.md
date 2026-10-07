@@ -241,10 +241,12 @@ both discs:
   folio's items as the 1993 folio makes and checks them -- `LoadInsTemplate`
   (a `.dsp` file from the disc, a host directory whose names match without
   case), `AllocInstrument`, `GrabKnob`, `TweakKnob` and `TweakRawKnob` (the
-  knob's calculation and clamp), `StartInstrument`, `ConnectInstruments`, an
-  empty sample and `SetAudioItemInfo` on it (its frames and bytes, its
-  loops' bounds, its base frequency from the folio's default tuning and
-  Operamath's `MulUF16`, checked against its code) -- without the DSP: what the folio would load into it and
+  knob's calculation and clamp), `StartInstrument`, `ConnectInstruments`,
+  `DisconnectInstruments`, samples and `SetAudioItemInfo` on them (their
+  frames and bytes, their loops' bounds, their base frequency from the
+  folio's default tuning and Operamath's `MulUF16`, checked against its
+  code), `DeleteItem` of a knob or an instrument (its knobs with it) --
+  without the DSP: what the folio would load into it and
   write to it is kept for a native mixer, and nothing plays yet; threads
   (`CreateSizedItem` of a task with `CREATETASK_TAG_SP`), each on a host
   thread of its own with exactly one running at a time, `AllocSignal`,
@@ -270,8 +272,9 @@ both discs:
   mastering's `iamaduck` fill --, the four byte-stream functions step for
   step, and the kernel's `DeleteItem` for IOReqs and devices.
   Crash 'n Burn's `launchme` reads its fourteen sound effects through the
-  streams, makes them samples, reads the first block of its `bigfile` and
-  stops at the Graphics folio's `SetScreenColor`; Immercenary's
+  streams, makes them samples, reads the first block of its `bigfile`,
+  fades its (still black) screen in, sets up its first movie's sound and
+  stops at the audio folio's `AttachSample`; Immercenary's
   `p` waits out its 47 vertical blanks and deletes its timer's IOReq. The
   emitter computes every flag it sets
   (no liveness pass yet), reads literal pools from memory rather than

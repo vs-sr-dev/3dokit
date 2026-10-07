@@ -107,8 +107,10 @@ static uint32_t make_ioreq(ArmCpu& c, bool have_dev, uint32_t dev_item, uint32_t
 // MKNODEID(subsystem, type): the kernel makes its own kinds, a folio's are made by the routine it
 // registered (pf_on_create). The kinds the programs run so far make.
 static std::map<int, PfCreateItem> g_creators;
+static std::map<int, PfDeleteItem> g_deleters;
 
 void pf_on_create(int subsys, PfCreateItem fn) { g_creators[subsys] = fn; }
+void pf_on_delete(int subsys, PfDeleteItem fn) { g_deleters[subsys] = fn; }
 
 static void k_createsizeditem(ArmCpu& c) {
     int subsys = (int)(c.r[0] >> 8 & 0xFF), type = (int)(c.r[0] & 0xFF);
@@ -189,6 +191,8 @@ static void k_sendio(ArmCpu& c) { c.r[0] = (uint32_t)pf_send_io(c, (int32_t)c.r[
 // * a device (0x14a60): its delete hook, and when that says 0 every IOReq on the device, each
 //   deleted as by its owner, and the device off the kernel's list (which the runtime does not
 //   keep).
+// * a folio's item: the folio's ir_Delete (pf_on_delete); anything but 0 is the result, and the
+//   item stays.
 // The kernel also gives the node's memory and its name back to the OS; here the OS's memory is
 // never freed. Any other kind stops the run: not yet.
 static int32_t delete_as(ArmCpu& c, int32_t item, uint32_t task) {
@@ -212,6 +216,8 @@ static int32_t delete_as(ArmCpu& c, int32_t item, uint32_t task) {
         }
         g_drivers.erase(n);
         g_delete_hooks.erase(n);
+    } else if (auto d = g_deleters.find((int)pf_r8(n + 8)); d != g_deleters.end()) {
+        if (int32_t r = d->second(c, (int)pf_r8(n + 9), item, task)) return r;
     } else {
         char why[64];
         std::snprintf(why, sizeof why, "DeleteItem of a node %#x: not yet", kind);
@@ -222,6 +228,15 @@ static int32_t delete_as(ArmCpu& c, int32_t item, uint32_t task) {
 }
 
 int32_t pf_delete_item(ArmCpu& c, int32_t item) { return delete_as(c, item, pf_current_task()); }
+
+// The kernel's vector 34 (0x1387c), what a folio deletes with: the node (else BADITEM), and
+// DeleteItem as its owner -- here the current task when the owner is no task any more.
+int32_t pf_delete_item_as_owner(ArmCpu& c, int32_t item) {
+    uint32_t n = pf_item_node(item);
+    if (!n) return (int32_t)KERR_BADITEM;
+    uint32_t owner = pf_item_node((int32_t)pf_r32(n + 28));
+    return delete_as(c, item, owner ? owner : pf_current_task());
+}
 
 static void k_deleteitem(ArmCpu& c) { c.r[0] = (uint32_t)pf_delete_item(c, (int32_t)c.r[0]); }
 
@@ -351,6 +366,7 @@ void pf_io_init() {
     g_drivers.clear();
     g_delete_hooks.clear();
     g_creators.clear();                         // the folios after this one register theirs
+    g_deleters.clear();
     g_sport_waiting.clear();
     g_timer_waiting.clear();
     g_vbl_count = 0;
