@@ -270,6 +270,7 @@ void     pf_io_init();
 void     pf_file_init();
 void     pf_graphics_init();
 void     pf_audio_init();
+void     pf_math_init();
 
 // What the display shows (pf_graphics.cpp): with g_pf_frames_dir set, at each vertical blank
 // the field the VDLs describe, as a PPM in that directory whenever it differs from the last one

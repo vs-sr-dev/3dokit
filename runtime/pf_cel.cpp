@@ -141,9 +141,16 @@ uint32_t ppmp(ArmCpu& c, uint32_t mode, uint32_t pix, uint32_t fb, uint32_t amv)
 
 // One cel: its source pixels through the decoder and the pixel processor into the frame buffer.
 void draw(ArmCpu& c, const Cel& cel, const Target& t) {
-    if (cel.pre0 & (PRE0_LITERAL | PRE0_BGND)) pf_stop(c, "the cel engine: PRE0's LITERAL or BGND bit: not yet");
+    // PRE0's BGND bit: the guide calls bits 28-31 reserved; Opera never reads it; the SDK's own
+    // libraries (Lib3DO's CreateBackdropCel, TextLib) set and clear it together with the CCB's BGND,
+    // "don't skip 0-valued pixels, really, trust me". With the CCB's BGND also set both readings draw
+    // the same pixels; alone, they would differ.
+    if (cel.pre0 & PRE0_LITERAL) pf_stop(c, "the cel engine: PRE0's LITERAL bit: not yet");
+    if ((cel.pre0 & PRE0_BGND) && !(cel.flags & CCB_BGND))
+        pf_stop(c, "the cel engine: PRE0's BGND bit without the CCB's: not yet");
     if (cel.pre0 >> 24 & 15) pf_stop(c, "the cel engine: SKIPX: not yet");
-    if (!(cel.flags & CCB_PACKED) && (cel.pre1 & PRE1_LRFORM)) pf_stop(c, "the cel engine: an LRFORM cel: not yet");
+    bool lrform = !(cel.flags & CCB_PACKED) && (cel.pre1 & PRE1_LRFORM);
+    if (lrform && cel.bpp != 16) pf_stop(c, "the cel engine: an LRFORM cel not of 16 bits: not yet");
     if (cel.flags & (CCB_PXOR | CCB_USEAV)) pf_stop(c, "the cel engine: PXOR or USEAV: not yet");
     if (cel.flags & CCB_TWD) pf_stop(c, "the cel engine: TWD: not yet");
     if ((cel.flags & (CCB_ACW | CCB_ACCW)) != (CCB_ACW | CCB_ACCW))
@@ -175,7 +182,7 @@ void draw(ArmCpu& c, const Cel& cel, const Target& t) {
     };
 
     int32_t x0 = g_ce.x >> 16, y = g_ce.y >> 16;
-    int rows = (int)(cel.pre0 >> 6 & 0x3FF) + 1;
+    int rows = ((int)(cel.pre0 >> 6 & 0x3FF) + 1) * (lrform ? 2 : 1);    // LRFORM's VCNT counts pairs
     auto pixel = [&](int32_t x, uint32_t v) {
         uint32_t amv, dec = decode(c, cel, v, amv);
         if (x < 0 || x > t.xclip || y < 0 || y > t.yclip) return;
@@ -209,10 +216,21 @@ void draw(ArmCpu& c, const Cel& cel, const Target& t) {
             row += len * 4;
         } else {
             // TLHPCNT + 1 pixels a row, the rows WOFFSET + 2 words apart (WOFFSET(10) from 8 bpp up).
+            // LRFORM takes a bitmap's line pairs as they lie: the words hold two rows, the even
+            // row's pixel in the high half, the odd's in the low, and WOFFSET goes from pair to pair
+            // (the guide's "The LRFORM Bit"; Opera's DrawLRCel reads them so).
             uint32_t w = (cel.pre1 & 0x7FF) + 1;
             uint32_t woff = (cel.bpp >= 8 ? cel.pre1 >> 16 & 0x3FF : cel.pre1 >> 24) + 2;
-            for (uint32_t i = 0; i < w; ++i) pixel(x0 + (int32_t)i, in.take((unsigned)cel.bpp));
-            row += woff * 4;
+            if (lrform) {
+                for (uint32_t i = 0; i < w; ++i) {
+                    uint32_t v = pf_r32(row + i * 4);
+                    pixel(x0 + (int32_t)i, j & 1 ? v & 0xFFFF : v >> 16);
+                }
+                if (j & 1) row += woff * 4;
+            } else {
+                for (uint32_t i = 0; i < w; ++i) pixel(x0 + (int32_t)i, in.take((unsigned)cel.bpp));
+                row += woff * 4;
+            }
         }
     }
     // The origin left for a cel that does not load one: below the last row (Opera).

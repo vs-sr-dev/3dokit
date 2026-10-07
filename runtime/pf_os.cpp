@@ -271,6 +271,7 @@ int pf_boot(const uint8_t* image, size_t size, uint32_t bss_end) {
     pf_file_init();
     pf_graphics_init();
     pf_audio_init();
+    pf_math_init();
     pf_event_init();                            // after the graphics: its fields are gf_VBLNumber's
     // argv: the program's name, in the OS's memory
     const uint32_t argv = PF_OS_BASE + 0x100, name = PF_OS_BASE + 0x110;

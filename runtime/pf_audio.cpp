@@ -23,7 +23,7 @@
 
 enum : uint32_t {
     NST_AUDIO = 4,
-    TEMPLATE_NODE = 1, INSTRUMENT_NODE = 2, KNOB_NODE = 3, SAMPLE_NODE = 4, ATTACHMENT_NODE = 7,
+    TEMPLATE_NODE = 1, INSTRUMENT_NODE = 2, KNOB_NODE = 3, SAMPLE_NODE = 4, CUE_NODE = 5, ATTACHMENT_NODE = 7,
     // audio.h's tags (enum audio_folio_tags)
     AF_TAG_AMPLITUDE = 10, AF_TAG_RATE = 11, AF_TAG_NAME = 12, AF_TAG_PITCH = 14,
     AF_TAG_VELOCITY = 15, AF_TAG_TEMPLATE = 16, AF_TAG_INSTRUMENT = 17, AF_TAG_WIDTH = 22,
@@ -544,6 +544,9 @@ static uint32_t create_attachment(ArmCpu& c, const Tags& tags) {
     return (uint32_t)item;
 }
 
+static uint32_t create_cue(ArmCpu& c, const Tags& tags);     // with the audio clock, below
+static void delete_cue(int32_t item);
+
 // The folio's ir_Create: first the folio open (0x109c), then the node type's own routine.
 static uint32_t create(ArmCpu& c, int type, const Tags& tags, uint32_t tag_ptr = 0) {
     if (!audio_open()) return AF_ERR_AUDIOCLOSED;
@@ -551,6 +554,7 @@ static uint32_t create(ArmCpu& c, int type, const Tags& tags, uint32_t tag_ptr =
     case INSTRUMENT_NODE: return create_instrument(c, tags);
     case KNOB_NODE: return create_knob(c, tags);
     case SAMPLE_NODE: return create_sample(c, tags, tag_ptr);
+    case CUE_NODE: return create_cue(c, tags);
     case ATTACHMENT_NODE: return create_attachment(c, tags);
     default: {
         char why[80];
@@ -658,6 +662,7 @@ static int32_t audio_delete(ArmCpu& c, int type, int32_t item, uint32_t) {
         g_samples.erase(item);
         return err;
     }
+    case CUE_NODE: delete_cue(item); return 0;
     case ATTACHMENT_NODE: {
         int32_t err = 0;
         if (pf_check_item(g_attachments[item].ins, NST_AUDIO, INSTRUMENT_NODE) && g_attachments[item].state > 1) {
@@ -847,7 +852,7 @@ static void a_setaudioiteminfo(ArmCpu& c) {
     if (!n) pf_stop(c, "SetAudioItemInfo of no item (the folio reads a null node)");
     if (pf_r8(n + 8) != NST_AUDIO) { c.r[0] = AF_ERR_BADITEM; return; }
     switch (pf_r8(n + 9)) {
-    case TEMPLATE_NODE: case INSTRUMENT_NODE: case KNOB_NODE: case 5: c.r[0] = AF_ERR_UNIMPLEMENTED; break;
+    case TEMPLATE_NODE: case INSTRUMENT_NODE: case KNOB_NODE: case CUE_NODE: c.r[0] = AF_ERR_UNIMPLEMENTED; break;
     case SAMPLE_NODE: {
         Sample& s = g_samples[item];
         c.r[0] = sample_set(c, s, c.r[1]);
@@ -883,8 +888,128 @@ static uint64_t g_tick_frame;                   // the sample frame of the next 
 
 static uint32_t folio() { return pf_folio_base(PF_AUDIO); }
 
+// ---- the timer list and cues -------------------------------------------------------------------
+// The timer list (+0xb0, "AudioTimer") holds nodes by the audio time they wait for: +0x24 the time,
+// +0x28 the function the daemon calls, +0x2c the list while the node is on it (0 off it). The
+// earliest wake-up is at +0xa0, wanted while +0xac is set. A cue (0x469c) is such a node with a
+// signal of its maker's (+0x30) and its maker's task (+0x34, the Task); its function (0x4600) is
+// the kernel's own SendSignal of that signal to that task. The folio keeps the function's address
+// in the node, as here; the cue's is the only one run so far.
+enum : uint32_t {
+    AF_WAKE = 0xa0, AF_WAKEWANTED = 0xac,
+    TN_TIME = 0x24, TN_FN = 0x28, TN_LIST = 0x2c, CUE_SIGNAL = 0x30, CUE_TASK = 0x34,
+    kCueFn = 0x4600, AF_ERR_NOSIGNAL = 0xD52BF116u, AF_ERR_NOTOWNER = 0xD52BF11Cu,
+};
+
+// What the daemon does when signalled (0x460c): from the head, every node whose time has come (at
+// or before now, unsigned) is taken off, marked off, and its function called; then the next
+// wake-up is the head's time, when there is a head.
+static void run_timers() {
+    uint32_t f = folio(), now = pf_r32(f + AF_TIME), end = f + AF_TIMERLIST + PF_LIST_TAIL;
+    for (uint32_t n = pf_r32(f + AF_TIMERLIST + PF_LIST_HEAD); n != end && pf_r32(n + TN_TIME) <= now;) {
+        uint32_t next = pf_r32(n);
+        pf_list_rem_node(n);
+        pf_w32(n + TN_LIST, 0);
+        if (pf_r32(n + TN_FN) == kCueFn) pf_signal(pf_r32(n + CUE_TASK), pf_r32(n + CUE_SIGNAL));
+        n = next;
+    }
+    uint32_t head = pf_r32(f + AF_TIMERLIST + PF_LIST_HEAD);
+    if (head != end) {
+        pf_w32(f + AF_WAKE, pf_r32(head + TN_TIME));
+        pf_w32(f + AF_WAKEWANTED, 1);
+    }
+}
+
+// A node onto the list for `time` (0x40f8): one already on it is AF_ERR_INUSE. The wake-up moves
+// to `time` when none is wanted or `time` comes first (as a signed difference); the node goes in
+// before the first whose time is not earlier (the kernel's UniversalInsertNode, 0x150b8, with the
+// folio's 0x40dc: before the first m for which m's time less the new one's is not negative), else
+// at the end.
+static uint32_t timer_add(uint32_t n, uint32_t time) {
+    uint32_t f = folio(), list = f + AF_TIMERLIST;
+    if (pf_r32(n + TN_LIST)) return AF_ERR_INUSE;
+    if (!pf_r32(f + AF_WAKEWANTED) || (int32_t)(pf_r32(f + AF_WAKE) - time) > 0) pf_w32(f + AF_WAKE, time);
+    pf_w32(f + AF_WAKEWANTED, 1);
+    pf_w32(n + TN_TIME, time);
+    uint32_t m = pf_r32(list + PF_LIST_HEAD);
+    while (m != list + PF_LIST_TAIL && (int32_t)(pf_r32(m + TN_TIME) - time) < 0) m = pf_r32(m);
+    pf_list_insert_before(m, n);
+    pf_w32(n + TN_LIST, list);
+    return 0;
+}
+
+// A cue (0x469c): the kernel's item tags (vector 38; the folio's own part of the walk, 0x6b68,
+// takes anything), then any tag above 9 is AF_ERR_BADTAG; a signal of the caller's
+// (AllocSignal(0), else AF_ERR_NOSIGNAL), the caller's task, off the list, the cue's function.
+// No program run so far gives tags; item tags stop.
+static uint32_t create_cue(ArmCpu& c, const Tags& tags) {
+    for (auto [tag, v] : tags) {
+        (void)v;
+        if (tag <= 9) pf_stop(c, "an item tag at a cue's creation: not yet");
+    }
+    if (!tags.empty()) return AF_ERR_BADTAG;
+    uint32_t sig = pf_alloc_signal(0);
+    if (!sig) return AF_ERR_NOSIGNAL;
+    int32_t item = audio_item(CUE_NODE);
+    uint32_t n = pf_item_node(item);
+    pf_w32(n + CUE_SIGNAL, sig);
+    pf_w32(n + CUE_TASK, pf_current_task());
+    pf_w32(n + TN_LIST, 0);
+    pf_w32(n + TN_FN, kCueFn);
+    return (uint32_t)item;
+}
+
+// A cue deleted (0x4798): with a kernel of version 0x13 or below -- the 1993 one is version 0 --
+// its signal freed when the task deleting it owns it (FreeSignal, the deleter's own bits; its
+// result unread), else left; off the list when on it; its signal word 0.
+static void delete_cue(int32_t item) {
+    uint32_t n = pf_item_node(item);
+    if (pf_r32(n + 28) == task_item()) pf_free_signal(pf_r32(n + CUE_SIGNAL));
+    if (pf_r32(n + TN_LIST)) {
+        pf_list_rem_node(n);
+        pf_w32(n + TN_LIST, 0);
+    }
+    pf_w32(n + CUE_SIGNAL, 0);
+}
+
+// swi 0x4000d: Err SignalAtTime(Item cue, AudioTime time) -- 0x41d8: the folio open; a cue (else
+// AF_ERR_BADITEM) of the caller's (n_Owner, else AF_ERR_NOTOWNER); onto the timer list.
+static uint32_t signal_at_time(int32_t cue, uint32_t time) {
+    if (!audio_open()) return AF_ERR_AUDIOCLOSED;
+    uint32_t n = pf_check_item(cue, NST_AUDIO, CUE_NODE);
+    if (!n) return AF_ERR_BADITEM;
+    if (pf_r32(n + 28) != task_item()) return AF_ERR_NOTOWNER;
+    return timer_add(n, time);
+}
+static void a_signalattime(ArmCpu& c) { c.r[0] = signal_at_time((int32_t)c.r[0], c.r[1]); }
+
+// audio -72: int32 GetCueSignal(Item cue) -- 0x428c: its signal, 0 when it is not a cue.
+static uint32_t cue_signal(int32_t cue) {
+    uint32_t n = pf_check_item(cue, NST_AUDIO, CUE_NODE);
+    return n ? pf_r32(n + CUE_SIGNAL) : 0;
+}
+static void a_getcuesignal(ArmCpu& c) { c.r[0] = cue_signal((int32_t)c.r[0]); }
+
+// audio -68: Err SleepUntilTime(Item cue, AudioTime time) -- 0x42bc, in the caller's task:
+// SignalAtTime, whose error is the call's; then WaitSignal of the cue's signal, and 0.
+static void a_sleepuntiltime(ArmCpu& c) {
+    int32_t cue = (int32_t)c.r[0];
+    uint32_t err = signal_at_time(cue, c.r[1]);
+    if ((int32_t)err < 0) { c.r[0] = err; return; }
+    pf_wait_signal(cue_signal(cue));
+    c.r[0] = 0;
+}
+
+// The folio's FIRQ (0x3e90): the time up by 1; when a wake-up is wanted and has come (a signed
+// difference), it signals the daemon (+0xa8, the bits at +0xa4) and wants none. The daemon, at the
+// folio's high priority, then runs the list; here the list is run at once.
 static void tick(uint64_t) {
     pf_w32(folio() + AF_TIME, pf_r32(folio() + AF_TIME) + 1);
+    uint32_t f = folio();
+    if (pf_r32(f + AF_WAKEWANTED) && (int32_t)(pf_r32(f + AF_WAKE) - pf_r32(f + AF_TIME)) <= 0) {
+        pf_w32(f + AF_WAKEWANTED, 0);
+        run_timers();
+    }
     g_tick_frame += pf_r32(folio() + AF_DURATION);
     pf_at((g_tick_frame * 1000000000ull + 44099) / 44100, tick);
 }
@@ -951,6 +1076,9 @@ void pf_audio_init() {
     clock_init();
     pf_on_slot(PF_AUDIO, -60, a_getaudiorate);
     pf_on_slot(PF_AUDIO, -64, a_getaudioduration);
+    pf_on_slot(PF_AUDIO, -68, a_sleepuntiltime);
+    pf_on_slot(PF_AUDIO, -72, a_getcuesignal);
+    pf_on_swi(0x4000d, a_signalattime);
     pf_on_slot(PF_AUDIO, -76, a_ownaudioclock);
     pf_on_slot(PF_AUDIO, -80, a_disownaudioclock);
     pf_on_slot(PF_AUDIO, -168, a_getaudiotime);
