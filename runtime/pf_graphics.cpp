@@ -32,7 +32,7 @@ enum : uint32_t {
     GRAFERR_MIXEDSCREENS = 0xD55B911Cu, GRAFERR_VDL_LENGTH = 0xD55B9121u,
     GRAFERR_BADDISPDIMS = 0xD55B9123u, GRAFERR_BADBITMAPSPEC = 0xD55B9124u,
     GRAFERR_INTERNALERROR = 0xD55B9125u, GRAFERR_SGINUSE = 0xD55B9126u, GRAFERR_SGNOTINUSE = 0xD55B9127u,
-    GRAFERR_NOWRITEACCESS = 0xD55B9129u,
+    GRAFERR_NOWRITEACCESS = 0xD55B9129u, GRAFERR_NOTOWNER = 0xD55B9012u,
 };
 
 static uint32_t graf(uint32_t field) { return pf_r32(pf_folio_base(PF_GRAPHICS) + field); }
@@ -527,6 +527,25 @@ static void g_displayscreen(ArmCpu& c) {
     c.r[0] = 0;
 }
 
+// ---- the cel engine --------------------------------------------------------------------------
+// Graphics -172: Err DrawCels(Item bitmap, CCB* ccb) -- SWI 39 (0x1298): the bitmap (CheckItem,
+// else GRAFERR_BADITEM); not the caller's, it must have it open (ItemOpened, else
+// GRAFERR_NOTOWNER). Then, under the folio's semaphore, the bitmap's control word and REGCTL0-3
+// into MADAM, the CCB, the cel engine started, and a wait for it with a watchdog of
+// bm_WatchDogCtr (GRAFERR_CELTIMEOUT when it fires); here the engine runs to its end at once.
+static void g_drawcels(ArmCpu& c) {
+    uint32_t bm = pf_check_item((int32_t)c.r[0], NST_GRAPHICS, TYPE_BITMAP);
+    if (!bm) { c.r[0] = GRAFERR_BADITEM; return; }
+    if (pf_r32(bm + 28) != task_item() && pf_item_opened((int32_t)task_item(), (int32_t)c.r[0]) < 0) {
+        c.r[0] = GRAFERR_NOTOWNER;
+        return;
+    }
+    const uint32_t regctl[4] = {pf_r32(bm + BM_REGCTL0), pf_r32(bm + BM_REGCTL1), pf_r32(bm + BM_REGCTL2),
+                                pf_r32(bm + BM_REGCTL3)};
+    pf_cel_draw(c, pf_r32(bm + BM_CECONTROL), regctl, c.r[1]);
+    c.r[0] = 0;
+}
+
 static void graphics_slots() {
     pf_on_slot(PF_GRAPHICS, -48, g_createscreengroup);
     pf_on_slot(PF_GRAPHICS, -64, g_enablevavg);
@@ -538,4 +557,5 @@ static void graphics_slots() {
     pf_on_slot(PF_GRAPHICS, -88, g_setscreencolors);
     pf_on_slot(PF_GRAPHICS, -104, g_addscreengroup);
     pf_on_slot(PF_GRAPHICS, -160, g_displayscreen);
+    pf_on_slot(PF_GRAPHICS, -172, g_drawcels);
 }

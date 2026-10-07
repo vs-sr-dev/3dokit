@@ -74,6 +74,10 @@ uint32_t pf_os_next();                          // where the OS's next allocatio
 uint32_t pf_guest_call(const ArmCpu& c, uint32_t fn, uint32_t r0, uint32_t r1 = 0, uint32_t r2 = 0,
                        uint32_t r3 = 0);
 
+// The cel engine (pf_cel.cpp): the CCB list from `ccb` on, into the bitmap that the control word
+// and REGCTL0-3 describe, as MADAM draws it once GRAPHIX's DrawCels has set it going.
+void     pf_cel_draw(ArmCpu& c, uint32_t cecontrol, const uint32_t regctl[4], uint32_t ccb);
+
 // Items (pf_kernel.cpp): numbers for nodes in guest memory. A node starts
 // with the SDK's ItemNode (nodes.h): n_SubsysType at +8, n_Type +9,
 // n_Flags +11, n_Size +12, n_Name +16, n_Item +24, n_Owner +28; 36 bytes.
