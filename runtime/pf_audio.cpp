@@ -23,7 +23,7 @@
 
 enum : uint32_t {
     NST_AUDIO = 4,
-    TEMPLATE_NODE = 1, INSTRUMENT_NODE = 2, KNOB_NODE = 3, SAMPLE_NODE = 4,
+    TEMPLATE_NODE = 1, INSTRUMENT_NODE = 2, KNOB_NODE = 3, SAMPLE_NODE = 4, ATTACHMENT_NODE = 7,
     // audio.h's tags (enum audio_folio_tags)
     AF_TAG_AMPLITUDE = 10, AF_TAG_RATE = 11, AF_TAG_NAME = 12, AF_TAG_PITCH = 14,
     AF_TAG_VELOCITY = 15, AF_TAG_TEMPLATE = 16, AF_TAG_INSTRUMENT = 17, AF_TAG_WIDTH = 22,
@@ -31,12 +31,13 @@ enum : uint32_t {
     AF_TAG_LOWNOTE = 27, AF_TAG_HIGHNOTE = 28, AF_TAG_LOWVELOCITY = 29, AF_TAG_HIGHVELOCITY = 30,
     AF_TAG_SUSTAINBEGIN = 31, AF_TAG_SUSTAINEND = 32, AF_TAG_RELEASEBEGIN = 33,
     AF_TAG_RELEASEEND = 34, AF_TAG_NUMBYTES = 35, AF_TAG_ADDRESS = 36, AF_TAG_SAMPLE = 37,
-    AF_TAG_PRIORITY = 39, AF_TAG_SET_FLAGS = 40, AF_TAG_FREQUENCY = 42, AF_TAG_SAMPLE_RATE = 46,
+    AF_TAG_PRIORITY = 39, AF_TAG_SET_FLAGS = 40, AF_TAG_FREQUENCY = 42, AF_TAG_ENVELOPE = 43,
+    AF_TAG_HOOKNAME = 44, AF_TAG_START_AT = 45, AF_TAG_SAMPLE_RATE = 46,
     AF_TAG_COMPRESSIONRATIO = 47, AF_TAG_COMPRESSIONTYPE = 48, AF_TAG_NUMBITS = 49,
     AF_TAG_DELAY_LINE = 57,
     AF_INSF_LEGALFLAGS = 1,
     // a DSP resource's type (3dokit.dsp): what a knob writes, what a connection joins
-    RSRC_KNOB = 1, RSRC_VARIABLE = 2,
+    RSRC_KNOB = 1, RSRC_VARIABLE = 2, RSRC_IFIFO = 6, RSRC_OFIFO = 7,
 };
 // The folio's node database (CREATEFOLIO_TAG_NODEDATABASE): a size and n_Flags per node type,
 // 0x90 being NODE_ITEMVALID | NODE_NAMEVALID.
@@ -46,7 +47,8 @@ static const uint32_t kNodeFlags = 0x90;
 // The folio's errors (audio.h's MAKEAERR: AF_ERR_*).
 enum : uint32_t {
     AF_ERR_BADITEM = 0xD52BF001u, AF_ERR_BADTAG = 0xD52BF002u, AF_ERR_BADTAGVAL = 0xD52BF003u,
-    AF_ERR_NOKNOBS = 0xD52BF104u, AF_ERR_BADNAME = 0xD52BF105u, AF_ERR_BADCALCTYPE = 0xD52BF107u,
+    AF_ERR_NOFIFO = 0xD52BF102u, AF_ERR_NOKNOBS = 0xD52BF104u, AF_ERR_BADNAME = 0xD52BF105u,
+    AF_ERR_BADCALCTYPE = 0xD52BF107u,
     AF_ERR_BADKNOBRSRC = 0xD52BF108u, AF_ERR_OUTOFRANGE = 0xD52BF117u,
     AF_ERR_UNIMPLEMENTED = 0xD52BF118u, AF_ERR_SECURITY = 0xD52BF11Bu, AF_ERR_AUDIOCLOSED = 0xD52BF11Du,
 };
@@ -184,6 +186,17 @@ static std::map<int32_t, Template> g_templates;
 static std::map<int32_t, Instrument> g_instruments;
 static std::map<int32_t, Knob> g_knobs;
 static std::map<int32_t, Sample> g_samples;
+// An attachment (0x5d44): a sample to one of an instrument's FIFOs, the hook. The folio's node
+// keeps the instrument (+0x2c), the sample (+0x30, its node +0x34), the hook's name (+0x38),
+// AF_TAG_START_AT (+0x3c), the FIFO's DSP address (+0x40) and its state (+0x26).
+struct Attachment {
+    int32_t ins, sample;
+    int rsrc;                               // the FIFO, a resource of the instrument's template
+    uint32_t flags, start_at;
+    bool started;                           // by a StartInstrument of its instrument
+    int32_t next;                           // LinkAttachments (+0x4c): what plays after it, 0 none
+};
+static std::map<int32_t, Attachment> g_attachments;
 
 static uint32_t task_item() { return pf_r32(pf_current_task() + 24); }
 static int32_t audio_folio_item() { return (int32_t)pf_r32(pf_folio_base(PF_AUDIO) + 24); }
@@ -474,6 +487,57 @@ static uint32_t create_sample(ArmCpu& c, const Tags& tags, uint32_t tag_ptr) {
     return (uint32_t)item;
 }
 
+// An attachment (0x5d44): the kernel's item tags (vector 38), then AF_TAG_INSTRUMENT,
+// AF_TAG_SAMPLE (a sample, else AF_ERR_BADITEM), AF_TAG_ENVELOPE, AF_TAG_SET_FLAGS (bits 0 and 1
+// only, else AF_ERR_BADTAGVAL; or'd in), AF_TAG_HOOKNAME (a copy of the name; 0 none),
+// AF_TAG_START_AT; any other tag above 9 AF_ERR_BADTAG. The instrument must be an audio item: a
+// template takes the attachment onto its own list, an instrument goes on, anything else is
+// AF_ERR_BADITEM. With a sample: START_AT not below 0 and before the sample's last frame (any
+// value if it has none), else AF_ERR_BADTAGVAL; the hook (0x8804) is the instrument's first FIFO
+// (input or output, in the template's order) of that name, compared over 32 characters, or with
+// no name its first one -- none: AF_ERR_NOFIFO; an output FIFO takes only a delay line's memory
+// (0x7d68, else AF_ERR_SECURITY). Without a sample or an envelope the attachment is made all the
+// same. Envelopes, templates and item tags are not done yet.
+static uint32_t create_attachment(ArmCpu& c, const Tags& tags) {
+    int32_t ins = -1, sample = -1;
+    uint32_t flags = 0, start_at = 0, hook = 0;
+    for (auto [tag, v] : tags) {
+        if (tag == AF_TAG_INSTRUMENT) ins = (int32_t)v;
+        else if (tag == AF_TAG_SAMPLE) {
+            sample = (int32_t)v;
+            if (!pf_check_item(sample, NST_AUDIO, SAMPLE_NODE)) return AF_ERR_BADITEM;
+        } else if (tag == AF_TAG_ENVELOPE) pf_stop(c, "an envelope's attachment: not yet");
+        else if (tag == AF_TAG_SET_FLAGS) {
+            if (v & ~3u) return AF_ERR_BADTAGVAL;
+            flags |= v;
+        } else if (tag == AF_TAG_HOOKNAME) hook = v;
+        else if (tag == AF_TAG_START_AT) start_at = v;
+        else if (tag > 9) return AF_ERR_BADTAG;
+        else pf_stop(c, "an item tag at an attachment's creation: not yet");
+    }
+    uint32_t n = pf_item_node(ins);
+    if (!n || pf_r8(n + 8) != NST_AUDIO) return AF_ERR_BADITEM;
+    if (pf_r8(n + 9) == TEMPLATE_NODE) pf_stop(c, "an attachment to a template: not yet");
+    if (pf_r8(n + 9) != INSTRUMENT_NODE) return AF_ERR_BADITEM;
+    int rsrc = -1;
+    if (sample > 0) {
+        const Sample& s = g_samples[sample];
+        if ((int32_t)start_at < 0 || (start_at >= s.frames && s.frames)) return AF_ERR_BADTAGVAL;
+        const Template& t = g_templates[g_instruments[ins].tmpl];
+        std::string name = hook ? guest_string(hook) : std::string();
+        for (size_t i = 0; i < t.rsrc.size() && rsrc < 0; ++i)
+            if ((t.rsrc[i].type == RSRC_IFIFO || t.rsrc[i].type == RSRC_OFIFO) &&
+                (!hook || !std::strncmp(t.rsrc[i].name.c_str(), name.c_str(), 32)))
+                rsrc = (int)i;
+        if (rsrc < 0) return AF_ERR_NOFIFO;
+        if (t.rsrc[(size_t)rsrc].type == RSRC_OFIFO && !(s.flags & 2)) return AF_ERR_SECURITY;
+        if (g_pf_trace) pf_log("        attach sample %d to instrument %d's \"%s\"\n", sample, ins, t.rsrc[(size_t)rsrc].name.c_str());
+    }
+    int32_t item = audio_item(ATTACHMENT_NODE);
+    g_attachments[item] = {ins, sample, rsrc, flags, start_at, false, 0};
+    return (uint32_t)item;
+}
+
 // The folio's ir_Create: first the folio open (0x109c), then the node type's own routine.
 static uint32_t create(ArmCpu& c, int type, const Tags& tags, uint32_t tag_ptr = 0) {
     if (!audio_open()) return AF_ERR_AUDIOCLOSED;
@@ -481,6 +545,7 @@ static uint32_t create(ArmCpu& c, int type, const Tags& tags, uint32_t tag_ptr =
     case INSTRUMENT_NODE: return create_instrument(c, tags);
     case KNOB_NODE: return create_knob(c, tags);
     case SAMPLE_NODE: return create_sample(c, tags, tag_ptr);
+    case ATTACHMENT_NODE: return create_attachment(c, tags);
     default: {
         char why[80];
         std::snprintf(why, sizeof why, "CreateItem of the audio folio's node type %d: not yet", type);
@@ -492,25 +557,36 @@ static uint32_t create(ArmCpu& c, int type, const Tags& tags, uint32_t tag_ptr =
 static uint32_t audio_create(ArmCpu& c, int type, uint32_t tags) { return create(c, type, read_tags(tags), tags); }
 
 // ---- deleting items (the folio's ir_Delete, 0x1170, by node type) -----------------------------
-// A knob (0x27a8): off its instrument's list of the items grabbed for that knob (RemNode), and 0.
-// An instrument (0x2294): its attachments deleted (none are made yet), then 0x8dc4: the
-// instrument stopped and, knob by knob of its template, every item grabbed for it deleted as by
-// its owner (vector 34), then its DSP resources and memory freed; and off its template's list
-// while the template is an item. FreeInstrument and ReleaseKnob are DeleteItem in the 1993 lib.
-// An instrument that was a connection's source stays one in the instruments it fed, as in the
-// folio, whose patched code goes on reading the freed DSP memory.
+// A knob (0x27a8): off its instrument's list of grabbed knobs (RemNode), and 0. An instrument
+// (0x2294): every knob grabbed on it (the node's list at +0x34, in the order grabbed) deleted as
+// by its owner (vector 34, 0x6a6c), then 0x8dc4: the instrument stopped, every attachment on each
+// of its FIFOs deleted the same way, then a list at +0x9c of its private data (nothing the
+// programs run so far put there), its DSP resources and memory freed; and off its template's
+// list while the template is an item. The results of those deletions are not read. An attachment
+// (0x61cc): if it is playing, its instrument stopped (not yet here), then off its hook's list
+// and its sample's "SampleRefs". FreeInstrument and ReleaseKnob are DeleteItem in the 1993 lib,
+// DetachSample the folio's own glue for it. An instrument that was a connection's source stays
+// one in the instruments it fed, as in the folio, whose patched code goes on reading the freed
+// DSP memory.
 static int32_t audio_delete(ArmCpu& c, int type, int32_t item, uint32_t) {
     switch (type) {
     case KNOB_NODE: g_knobs.erase(item); return 0;
     case INSTRUMENT_NODE: {
-        std::vector<std::pair<int, int32_t>> grabbed;           // by the template's knob, then item
+        std::vector<int32_t> doomed;
         for (const auto& [k, v] : g_knobs)
-            if (v.ins == item) grabbed.push_back({v.knob, k});
-        std::sort(grabbed.begin(), grabbed.end());
-        for (const auto& g : grabbed) pf_delete_item_as_owner(c, g.second);    // results unread, as there
+            if (v.ins == item) doomed.push_back(k);
+        for (int32_t k : doomed) pf_delete_item_as_owner(c, k);
+        doomed.clear();
+        for (const auto& [a, v] : g_attachments)
+            if (v.ins == item) doomed.push_back(a);
+        for (int32_t a : doomed) pf_delete_item_as_owner(c, a);
         g_instruments.erase(item);
         return 0;
     }
+    case ATTACHMENT_NODE:
+        if (g_attachments[item].started) pf_stop(c, "deleting a playing attachment (its instrument stopped): not yet");
+        g_attachments.erase(item);
+        return 0;
     default: {
         char why[80];
         std::snprintf(why, sizeof why, "DeleteItem of the audio folio's node type %d: not yet", type);
@@ -550,6 +626,34 @@ static void a_grabknob(ArmCpu& c) {
     c.r[0] = create(c, KNOB_NODE, {{AF_TAG_NAME, c.r[1]}, {AF_TAG_INSTRUMENT, c.r[0]}});
 }
 
+// audio -144: Item AttachSample(Item instrument, Item sample, char* hook) -- 0x3e34:
+// CreateItem(MKNODEID(AUDIONODE, AUDIO_ATTACHMENT_NODE), {AF_TAG_INSTRUMENT, AF_TAG_SAMPLE, and
+// AF_TAG_HOOKNAME when hook is not 0}). audio -148: Err DetachSample(Item attachment) -- 0x3e88:
+// DeleteItem.
+static void a_attachsample(ArmCpu& c) {
+    Tags t = {{AF_TAG_INSTRUMENT, c.r[0]}, {AF_TAG_SAMPLE, c.r[1]}};
+    if (c.r[2]) t.push_back({AF_TAG_HOOKNAME, c.r[2]});
+    c.r[0] = create(c, ATTACHMENT_NODE, t);
+}
+static void a_detachsample(ArmCpu& c) { c.r[0] = (uint32_t)pf_delete_item(c, (int32_t)c.r[0]); }
+
+// swi 0x40015: Err LinkAttachments(Item at1, Item at2) -- 0x63d4: at1 an attachment (else
+// AF_ERR_BADITEM), at2 0 or an attachment (else the same); at2 is what plays after at1. Neither
+// the folio's open nor the owner is asked. When at1 is playing the folio also links the two in
+// the DSP (0x76b8, 0x7860): not yet here.
+static void a_linkattachments(ArmCpu& c) {
+    int32_t a1 = (int32_t)c.r[0], a2 = (int32_t)c.r[1];
+    if (!pf_check_item(a1, NST_AUDIO, ATTACHMENT_NODE) || (a2 && !pf_check_item(a2, NST_AUDIO, ATTACHMENT_NODE))) {
+        c.r[0] = AF_ERR_BADITEM;
+        return;
+    }
+    Attachment& at = g_attachments[a1];
+    if (at.started) pf_stop(c, "LinkAttachments on a playing attachment: not yet");
+    at.next = a2;
+    if (g_pf_trace) pf_log("        attachment %d then %d\n", a1, a2);
+    c.r[0] = 0;
+}
+
 // swi 0x40000: Err TweakKnob(Item knob, int32 value) -- 0x27c8, and swi 0x40011 TweakRawKnob
 // (0x281c), the same without the knob's calculation. Neither asks whether the folio is open.
 static void tweak_knob(ArmCpu& c, bool cooked) {
@@ -587,6 +691,8 @@ static void a_startinstrument(ArmCpu& c) {
     if (const DspKnob* k = find_knob(t, "Frequency"); k && have_freq) tweak(c, ins, t, *k, freq, cooked_freq);
     if (const DspKnob* k = find_knob(t, "Amplitude"); k && amp >= 0) tweak(c, ins, t, *k, amp, true);
     if (g_pf_trace) pf_log("        StartInstrument %d (%s)\n", item, t.path.c_str());
+    for (auto& [a, v] : g_attachments)          // what the folio sets up for each is not read yet
+        if (v.ins == item) v.started = true;
     ins.state = 3;
     c.r[0] = 0;
 }
@@ -750,6 +856,7 @@ void pf_audio_init() {
     g_instruments.clear();
     g_knobs.clear();
     g_samples.clear();
+    g_attachments.clear();
     clock_init();
     pf_on_slot(PF_AUDIO, -60, a_getaudiorate);
     pf_on_slot(PF_AUDIO, -64, a_getaudioduration);
@@ -763,10 +870,13 @@ void pf_audio_init() {
     pf_on_slot(PF_AUDIO, -4, a_loadinstemplate);
     pf_on_slot(PF_AUDIO, -8, a_allocinstrument);
     pf_on_slot(PF_AUDIO, -16, a_grabknob);
+    pf_on_slot(PF_AUDIO, -144, a_attachsample);
+    pf_on_slot(PF_AUDIO, -148, a_detachsample);
     pf_on_swi(0x40000, a_tweakknob);
     pf_on_swi(0x40001, a_startinstrument);
     pf_on_swi(0x40008, a_connectinstruments);
     pf_on_swi(0x4000c, a_disconnectinstruments);
     pf_on_swi(0x40011, a_tweakrawknob);
+    pf_on_swi(0x40015, a_linkattachments);
     pf_on_swi(0x4001b, a_setaudioiteminfo);
 }

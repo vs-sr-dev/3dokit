@@ -245,7 +245,9 @@ both discs:
   `DisconnectInstruments`, samples and `SetAudioItemInfo` on them (their
   frames and bytes, their loops' bounds, their base frequency from the
   folio's default tuning and Operamath's `MulUF16`, checked against its
-  code), `DeleteItem` of a knob or an instrument (its knobs with it) --
+  code), `AttachSample` (to the FIFO the hook names), `DetachSample`,
+  `LinkAttachments`, `DeleteItem` of a knob, an attachment or an
+  instrument (its knobs and attachments with it) --
   without the DSP: what the folio would load into it and
   write to it is kept for a native mixer, and nothing plays yet; threads
   (`CreateSizedItem` of a task with `CREATETASK_TAG_SP`), each on a host
@@ -273,8 +275,10 @@ both discs:
   step, and the kernel's `DeleteItem` for IOReqs and devices.
   Crash 'n Burn's `launchme` reads its fourteen sound effects through the
   streams, makes them samples, reads the first block of its `bigfile`,
-  fades its (still black) screen in, sets up its first movie's sound and
-  stops at the audio folio's `AttachSample`; Immercenary's
+  fades its (still black) screen in, and plays its first movie -- the
+  Crystal Dynamics logo, decoded by its own code from `EXTRA.1` into its
+  screens, 530 different fields in `pfboot --frames` -- to the audio
+  folio's `StopInstrument`, its 14,822nd call; Immercenary's
   `p` waits out its 47 vertical blanks and deletes its timer's IOReq. The
   emitter computes every flag it sets
   (no liveness pass yet), reads literal pools from memory rather than
