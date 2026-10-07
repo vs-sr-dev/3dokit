@@ -1,7 +1,7 @@
 // 3dokit runtime -- pfboot: run a recompiled 3DO program on the Portfolio
 // runtime, tracing its OS calls.
 //
-//     pfboot PROGRAM [--trace N] [--lenient] [--max-calls N]
+//     pfboot PROGRAM [--trace N] [--lenient] [--max-calls N] [--snap N DIR] [--disc DIR]
 //
 // PROGRAM is the AIF file the build was recompiled from (its module must be
 // in this build). --trace 0 is quiet, 1 (the default) every OS call, 2 also
@@ -9,7 +9,9 @@
 // implemented return 0 instead of stopping: a preview of what the program
 // calls next, not a run to trust. --snap N DIR stops after the N-th OS call,
 // with the memory before and after it and the call in DIR (pf_memtest.cpp;
-// python -m 3dokit.pfcheck replays it on the 1993 OS).
+// python -m 3dokit.pfcheck replays it on the 1993 OS). --disc DIR is the
+// disc's root, where the program's files are; by default the program's own
+// directory.
 //
 //     pfboot PROGRAM --memtest DIR [--ops N] [--seed S]
 //
@@ -36,11 +38,12 @@ static uint32_t bl_target(const std::vector<uint8_t>& d, uint32_t at) {
 
 int main(int argc, char** argv) {
     if (argc < 2) {
-        std::fprintf(stderr, "usage: pfboot PROGRAM [--trace N] [--lenient] [--max-calls N] [--snap N DIR]\n"
+        std::fprintf(stderr, "usage: pfboot PROGRAM [--trace N] [--lenient] [--max-calls N] [--snap N DIR] [--disc DIR]\n"
                              "       pfboot PROGRAM --memtest DIR [--ops N] [--seed S]\n");
         return 2;
     }
     const char* memtest = nullptr;
+    const char* disc = nullptr;
     int ops = 2000;
     uint32_t seed = 1;
     for (int i = 2; i < argc; ++i) {
@@ -51,9 +54,16 @@ int main(int argc, char** argv) {
             g_pf_snap_call = std::strtoull(argv[++i], nullptr, 0);
             g_pf_snap_dir = argv[++i];
         }
+        else if (!std::strcmp(argv[i], "--disc") && i + 1 < argc) disc = argv[++i];
         else if (!std::strcmp(argv[i], "--memtest") && i + 1 < argc) memtest = argv[++i];
         else if (!std::strcmp(argv[i], "--ops") && i + 1 < argc) ops = std::atoi(argv[++i]);
         else if (!std::strcmp(argv[i], "--seed") && i + 1 < argc) seed = (uint32_t)std::strtoul(argv[++i], nullptr, 0);
+    }
+    if (disc) g_pf_disc_root = disc;
+    else {
+        std::string prog = argv[1];
+        size_t slash = prog.find_last_of("/\\");
+        g_pf_disc_root = slash == std::string::npos ? "." : prog.substr(0, slash);
     }
     std::ifstream f(argv[1], std::ios::binary);
     std::vector<uint8_t> d((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());

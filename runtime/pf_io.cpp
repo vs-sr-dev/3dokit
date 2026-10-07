@@ -97,10 +97,18 @@ static uint32_t create_ioreq(ArmCpu& c, uint32_t tags) {
     return (uint32_t)item;
 }
 
-// swi 0x10000: Item CreateSizedItem(int32 ctype, TagArg* tags, int32 size) -- the kinds of
-// item the programs run so far make
+// swi 0x10000: Item CreateSizedItem(int32 ctype, TagArg* tags, int32 size) -- ctype is
+// MKNODEID(subsystem, type): the kernel makes its own kinds, a folio's are made by the routine it
+// registered (pf_on_create). The kinds the programs run so far make.
+static std::map<int, PfCreateItem> g_creators;
+
+void pf_on_create(int subsys, PfCreateItem fn) { g_creators[subsys] = fn; }
+
 static void k_createsizeditem(ArmCpu& c) {
+    int subsys = (int)(c.r[0] >> 8 & 0xFF), type = (int)(c.r[0] & 0xFF);
+    auto it = g_creators.find(subsys);
     if (c.r[0] == (1u << 8 | IOREQNODE)) c.r[0] = create_ioreq(c, c.r[1]);
+    else if (it != g_creators.end()) c.r[0] = it->second(c, type, c.r[1]);
     else {
         char why[80];
         std::snprintf(why, sizeof why, "CreateSizedItem of %#x: not yet", c.r[0]);
@@ -189,6 +197,7 @@ static void sport_dispatch(uint32_t ior) {
 
 void pf_io_init() {
     g_drivers.clear();
+    g_creators.clear();                         // the folios after this one register theirs
     pf_on_swi(0x10000, k_createsizeditem);
     pf_on_swi(0x10018, k_sendio);
     pf_device_new("SPORT", 0, sport_dispatch);

@@ -18,6 +18,7 @@
 // after it; a SWI simply goes on.
 #pragma once
 #include "arm60.h"
+#include <string>
 
 enum : uint32_t {
     PF_OS_BASE = 0x00400000u,           // the OS's memory, 1 MB
@@ -67,6 +68,12 @@ uint32_t pf_os_alloc(uint32_t size);
 uint32_t pf_os_string(const char* s);
 uint32_t pf_os_next();                          // where the OS's next allocation will be
 
+// A call from the OS into the program: `fn` with up to four arguments in r0-r3, on the caller's
+// stack (below c's sp), on a copy of c's registers; r0 back. For the callbacks a program hands
+// the OS, such as the C library's putc that the kernel's vfprintf writes through.
+uint32_t pf_guest_call(const ArmCpu& c, uint32_t fn, uint32_t r0, uint32_t r1 = 0, uint32_t r2 = 0,
+                       uint32_t r3 = 0);
+
 // Items (pf_kernel.cpp): numbers for nodes in guest memory. A node starts
 // with the SDK's ItemNode (nodes.h): n_SubsysType at +8, n_Type +9,
 // n_Flags +11, n_Size +12, n_Name +16, n_Item +24, n_Owner +28; 36 bytes.
@@ -75,6 +82,13 @@ int32_t  pf_item_new(uint32_t node, int subsys, int type, const char* name);
 uint32_t pf_item_node(int32_t item);            // 0 if no such item
 uint32_t pf_check_item(int32_t item, int subsys, int type);    // CheckItem: 0 unless of that kind
 int32_t  pf_item_count();                       // items are 1 to this, less one
+// ItemOpened (Kernel -128): 0 when the task has the item open (OpenItem, not yet CloseItem),
+// else the kernel's NOTFOUND; BADITEM when `task` is no task's item.
+int32_t  pf_item_opened(int32_t task, int32_t item);
+// CreateSizedItem for a subsystem's items: the folio's own creation routine (its ir_Create), given
+// the node type and the caller's tags; the new item or an Err.
+typedef uint32_t (*PfCreateItem)(ArmCpu& c, int type, uint32_t tags);
+void     pf_on_create(int subsys, PfCreateItem fn);
 // An Err: negative, as Portfolio's are (the bits are not yet the OS's own).
 enum : int32_t { PF_ERR_NOTFOUND = -1, PF_ERR_BADITEM = -2 };
 
@@ -153,11 +167,19 @@ uint32_t pf_device_new(const char* name, int max_unit, PfDispatchIO dispatch);
 void     pf_complete_io(uint32_t ior);
 int32_t  pf_signal(uint32_t task, uint32_t bits);   // the kernel's own SendSignal
 
+// Files (pf_file.cpp). The disc is a directory on the host, `g_pf_disc_root` (pfboot: the
+// program's own directory unless --disc says otherwise); a program's path, absolute or from its
+// current directory, is found there with names matched without case, as the Opera filesystem
+// matches them. The host path, or "" when there is no such file.
+extern std::string g_pf_disc_root;
+std::string pf_host_path(const char* path);
+
 // The folios' handlers register themselves here.
 void     pf_kernel_init();
 void     pf_io_init();
 void     pf_file_init();
 void     pf_graphics_init();
+void     pf_audio_init();
 
 // The SDK's names (generated: pf_names.cpp).
 struct PfSwiName { uint32_t number; const char* name; };

@@ -186,6 +186,20 @@ void arm_call_unknown(ArmCpu& c, uint32_t addr) {
 
 void arm_poll(ArmCpu& c) { c.budget = 1 << 20; }
 
+static const uint32_t kGuestReturn = 0xFFFFFFE0u;      // where a call from the OS returns
+
+uint32_t pf_guest_call(const ArmCpu& c, uint32_t fn, uint32_t r0, uint32_t r1, uint32_t r2, uint32_t r3) {
+    ArmCpu g = c;
+    g.r[0] = r0;
+    g.r[1] = r1;
+    g.r[2] = r2;
+    g.r[3] = r3;
+    g.r[14] = kGuestReturn;
+    arm_call(g, fn);
+    if (g.pc != kGuestReturn) arm_fault(g, g.pc, "a call from the OS returned somewhere else");
+    return g.r[0];
+}
+
 // ---- the OS's own access to memory: not traced ---------------------------------------------
 uint32_t pf_r32(uint32_t a) { return in_os(a, 4) ? os_get(a, 4) : ld32(a); }
 uint32_t pf_r8(uint32_t a) { return in_os(a, 1) ? os_get(a, 1) : ld8(a); }
@@ -248,6 +262,7 @@ int pf_boot(const uint8_t* image, size_t size, uint32_t bss_end) {
     pf_io_init();
     pf_file_init();
     pf_graphics_init();
+    pf_audio_init();
     // argv: the program's name, in the OS's memory
     const uint32_t argv = PF_OS_BASE + 0x100, name = PF_OS_BASE + 0x110;
     os_put(argv, name, 4);
