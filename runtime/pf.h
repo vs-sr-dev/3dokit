@@ -160,12 +160,20 @@ extern const char* g_pf_snap_dir;
 void     pf_snap_before(const ArmCpu& c, const char* call);
 [[noreturn]] void pf_snap_after(const ArmCpu& c);
 
+// Tasks (pf_task.cpp): the program's own task and the threads it makes, each on a host thread
+// of its own, one running at a time; signals; the switch the kernel makes at the end of an OS
+// call. A program's exit (SWI 0x11) throws PfExit: the program ends, or a thread does.
+struct PfExit { int code; };
+void     pf_task_init();
+void     pf_task_reschedule();
+uint32_t pf_create_task(ArmCpu& c, uint32_t tags);  // CreateSizedItem of a TASKNODE
+
 // Devices and IOReqs (pf_io.cpp). A device is a node of devices.h's layout with an item; its
 // driver is a native function that starts an IOReq and calls pf_complete_io when it is done.
 typedef void (*PfDispatchIO)(uint32_t ior);
 uint32_t pf_device_new(const char* name, int max_unit, PfDispatchIO dispatch);
 void     pf_complete_io(uint32_t ior);
-int32_t  pf_signal(uint32_t task, uint32_t bits);   // the kernel's own SendSignal
+int32_t  pf_signal(uint32_t task, uint32_t bits);   // the kernel's own SendSignal (pf_task.cpp)
 
 // Files (pf_file.cpp). The disc is a directory on the host, `g_pf_disc_root` (pfboot: the
 // program's own directory unless --disc says otherwise); a program's path, absolute or from its

@@ -18,7 +18,6 @@ static std::map<uint32_t, PfFn> g_swis;
 static unsigned long long g_ncalls;
 unsigned long long g_pf_max_calls;
 
-struct PfExit { int code; };
 
 static const uint32_t kExitSentinel = 0xFFFFFFF0u;
 static const uint32_t kStackBase = 0x00200000u - 0x10000;   // the program's stack: 64 KB under the top of DRAM
@@ -156,6 +155,7 @@ static void os_call(ArmCpu& c, PfFn fn, const char* what, uint32_t site, const c
     fn(c);
     if (g_pf_trace) pf_log("        -> %08X\n", c.r[0]);
     if (snap) pf_snap_after(c);
+    pf_task_reschedule();
 }
 
 void arm_swi(ArmCpu& c, uint32_t number, uint32_t site) {
@@ -259,6 +259,7 @@ int pf_boot(const uint8_t* image, size_t size, uint32_t bss_end) {
     pf_on_swi(0x11, pf_exit_swi);
     pf_kernel_init();
     pf_mem_init(m->name, bss_end, kStackBase);
+    pf_task_init();
     pf_io_init();
     pf_file_init();
     pf_graphics_init();

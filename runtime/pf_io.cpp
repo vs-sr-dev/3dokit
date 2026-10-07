@@ -35,15 +35,6 @@ static std::map<uint32_t, PfDispatchIO> g_drivers;     // device node -> its dri
 
 static uint32_t task_item() { return pf_r32(pf_current_task() + 24); }
 
-// ---- signals --------------------------------------------------------------------------------
-// The kernel's internal SendSignal (0x19c70): bits outside the task's t_AllocatedSigs are
-// refused; otherwise they join t_SigBits. (A waiting task would be made ready: one task here.)
-int32_t pf_signal(uint32_t task, uint32_t bits) {
-    if (bits & ~pf_r32(task + T_ALLOCATEDSIGS)) return (int32_t)KERR_ILLEGALSIGNAL;
-    pf_w32(task + T_SIGBITS, pf_r32(task + T_SIGBITS) | bits);
-    return 0;
-}
-
 // ---- devices --------------------------------------------------------------------------------
 // A device as CreateDevice (0x14974) leaves one: its IOReq size (0x70 when none is given), its
 // list of IOReqs, its units; and, here, its driver.
@@ -108,6 +99,7 @@ static void k_createsizeditem(ArmCpu& c) {
     int subsys = (int)(c.r[0] >> 8 & 0xFF), type = (int)(c.r[0] & 0xFF);
     auto it = g_creators.find(subsys);
     if (c.r[0] == (1u << 8 | IOREQNODE)) c.r[0] = create_ioreq(c, c.r[1]);
+    else if (c.r[0] == (1u << 8 | TASKNODE)) c.r[0] = pf_create_task(c, c.r[1]);
     else if (it != g_creators.end()) c.r[0] = it->second(c, type, c.r[1]);
     else {
         char why[80];
