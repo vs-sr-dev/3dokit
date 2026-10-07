@@ -80,6 +80,7 @@ build/recomp-build/pfboot GAME --memtest DIR --ops 4000  # the allocator, a rand
 python -m 3dokit.pfcheck DISC/System/Kernel/os_code DIR  # ...replayed on the 1993 kernel's own code
 build/recomp-build/pfboot GAME --snap N DIR              # the memory before and after the N-th OS call
 build/recomp-build/pfboot GAME --frames DIR              # what the display shows, a PPM per change
+build/recomp-build/pfboot GAME --pad a@1300x1            # the first pad's A at field 1300 (BUTTONS@FIELD[xN][/E])
 python -m 3dokit.pfcheck DISC/System/Kernel/os_code DIR --graphix DISC/System/Folios/GRAPHIX   # ...on the folio's
 python -m 3dokit.aif --decompress DISC/System/Folios/GRAPHIX graphix.bin   # by its own decompressor
 python -m 3dokit.shapes library GAME --corpus 'build/disc/System/Programs/*'
@@ -143,7 +144,7 @@ both discs:
 | 2. Extract | Turn standard formats into standard files | `disc --extract`, `cel` (every depth and coding, PLUTA, the hardware's transparency, `IMAG`), `stream`, `cinepak`, `audio` (SDX2, AIFF/AIFC, loops), `dsp`, `pixels` | the streamed-cel subscriber (`SCEL`); AIF decompression |
 | 3. Map code | What does the code do, where? | `arm` (functions, calls, tail calls, references, control flow, symbols, the compiler's embedded names), `portfolio` (SWIs and folio vectors, attributed and named), `sdk` (the SDK's names for every SWI and slot), `aof` (the SDK's ARM Object Format libraries), `shapes` (library proved against a corpus; two programs paired, names carried, a data map) | a corpus from the SDK's own libraries for `shapes` |
 | 4. Translate | Turn ARM60 code into C | `arm60` (the instruction set, ARMv3 exactly), `armemu` (an ARM60 interpreter: the reference), `recomp.discover` (functions, code and data, switches, indirect transfers), `recomp.emit` and `python -m 3dokit.recomp` (C++ per function, a module per program), `recomp.selftest` (the interpreter records, the C++ replays) | flags only where read; literal pools folded; returns that are not to their call (longjmp) |
-| 5. Runtime | What an engine links | `runtime/` (C99): `tdk_opera` (files out of a disc image), `tdk_cel` (cels to RGBA), `tdk_stream` (DataStream, Cinepak with an optional dither, SDX2); `tdkcheck`. For recompiled code (C++20): `arm60.h` (the CPU, memory, the shifter and the flags), `arm_core` (dispatch, the return check), `arm_stub` (no OS: the self-test), `arm_selftest`; `pf` (Portfolio's frame: the boot, the OS's memory above VRAM, folio tables of traps, SWI and slot dispatch by the SDK's names, the trace; items, lists, the memory lists and their allocator, devices, IOReqs, `SendIO` and `CompleteIO`, the SPORT device, the Graphics folio's node, its system VDLs, its screen groups, their colours and the screen displayed, the cel engine behind `DrawCels` (square cels), the audio folio's templates, instruments, knobs and samples (their info), the kernel's `vfprintf` writing through the program's own `putc`, the disc as a host directory walked as the File folio walks it (aliases from the disc's own scripts), open files and their driver, the byte streams, `DeleteItem`, threads -- each on a host thread, one running at a time -- with signals and the kernel's priority switch, semaphores, the guest's clock and its events: the vertical blank, the timer device, the audio clock) and `pfboot`; `pfcheck` (the runtime against the 1993 OS's own code: the kernel's allocator, any one Graphics call) | Portfolio's functions: the audio folio's cues and playback (a native mixer for its instruments), the display, messages, tasks, the kernel's quantum, the timer's microseconds, the CD device, the File folio's other calls (directories, `CreateFile`, `DeleteFile`), running in real time; the CEL engine's projector beyond square cels |
+| 5. Runtime | What an engine links | `runtime/` (C99): `tdk_opera` (files out of a disc image), `tdk_cel` (cels to RGBA), `tdk_stream` (DataStream, Cinepak with an optional dither, SDX2); `tdkcheck`. For recompiled code (C++20): `arm60.h` (the CPU, memory, the shifter and the flags), `arm_core` (dispatch, the return check), `arm_stub` (no OS: the self-test), `arm_selftest`; `pf` (Portfolio's frame: the boot, the OS's memory above VRAM, folio tables of traps, SWI and slot dispatch by the SDK's names, the trace; items, lists, the memory lists and their allocator, devices, IOReqs, `SendIO` and `CompleteIO`, the SPORT device, the Graphics folio's node, its system VDLs, its screen groups, their colours and the screen displayed, the cel engine behind `DrawCels` (square cels), the audio folio's templates, instruments, knobs and samples (their info), the kernel's `vfprintf` writing through the program's own `putc`, the kernel's messages (ports, `SendMsg`, `ReplyMsg`, `GetMsg`), the event broker at its message boundary and a scheduled pad, the disc as a host directory walked as the File folio walks it (aliases from the disc's own scripts), open files and their driver, the byte streams, `DeleteItem`, threads -- each on a host thread, one running at a time -- with signals and the kernel's priority switch, semaphores, the guest's clock and its events: the vertical blank, the timer device, the audio clock) and `pfboot`; `pfcheck` (the runtime against the 1993 OS's own code: the kernel's allocator, any one Graphics call) | Portfolio's functions: the audio folio's cues and playback (a native mixer for its instruments), the display, tasks, the kernel's quantum, the timer's microseconds, the CD device, the File folio's other calls (directories, `CreateFile`, `DeleteFile`), running in real time; the CEL engine's projector beyond square cels; the event broker's other requests and devices (mouse, joystick, light gun) |
 
 ## Principles
 
@@ -261,7 +262,14 @@ both discs:
   and the switch the kernel makes as an OS call returns, by priority -- not
   yet its quantum timer, so equal priorities take turns only when one
   waits or yields; semaphores (`LockItem`, `UnlockItem`) as the 1993 kernel
-  makes and locks them; and time: a guest clock of its own, moved on by a
+  makes and locks them; messages as the 1993 kernel makes and passes them
+  (`CreateSizedItem` of a MsgPort and of a Message, `SendMsg`, `ReplyMsg`,
+  `GetMsg`, `GetThisMsg`, their deletion); the event broker -- the disc's
+  `System/Tasks/eventbroker` of August 1993, at its message boundary,
+  since the Control Port's driver is on neither the disc nor the ROM: its
+  port, `EB_Configure`, listeners and focus, an `EB_EventRecord` each
+  field the pad changes, the Control Pad driverlet's frames -- and a pad
+  that `pfboot --pad` schedules; and time: a guest clock of its own, moved on by a
   fixed amount at each safe point of the recompiled code and jumping ahead
   when every task waits, so a run is the same on any host, with events
   standing for the interrupts -- the vertical blank (GRAPHIX's
@@ -282,9 +290,11 @@ both discs:
   streams, makes them samples, reads the first block of its `bigfile`,
   fades its (still black) screen in, and plays its first movie -- the
   Crystal Dynamics logo, decoded by its own code from `EXTRA.1` into its
-  screens, 530 different fields in `pfboot --frames` -- to the audio
-  folio's `StopInstrument`, its 14,822nd call; Immercenary's
-  `p` waits out its 47 vertical blanks and deletes its timer's IOReq. The
+  screens, 530 different fields in `pfboot --frames` --, draws its choice
+  dialog on the cel engine, and with `--pad a@1300x1` plays its intro
+  movie and reaches its Select Game menu, a second A its Select Character
+  screen; Immercenary's `p` configures itself with the event broker and
+  stops at the File folio's `GetDirectory`. The
   emitter computes every flag it sets
   (no liveness pass yet), reads literal pools from memory rather than
   folding them, and a return to anywhere but its call's next word stops
