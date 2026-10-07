@@ -65,6 +65,7 @@ uint32_t pf_r8(uint32_t a);
 void     pf_w32(uint32_t a, uint32_t v);
 void     pf_w8(uint32_t a, uint32_t v);
 uint32_t pf_os_alloc(uint32_t size);
+void     pf_os_free(uint32_t a);                            // what pf_os_alloc gave, for its next of that size
 uint32_t pf_os_string(const char* s);
 uint32_t pf_os_next();                          // where the OS's next allocation will be
 

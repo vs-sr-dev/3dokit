@@ -148,7 +148,7 @@ struct Connection {
 struct Instrument {
     int32_t tmpl;
     uint32_t flags;
-    int state;                              // the node's +0x30: 0 allocated or abandoned, 1 stopped, 3 started
+    int state;                              // the node's +0x30: 0 allocated or abandoned, 1 stopped, 2 released, 3 started
     int dsp_state;                          // its DSP side's (+0x14 of the folio's record): above 1 running
     std::map<uint32_t, int32_t> value;      // what the folio wrote to each knob resource
     std::vector<Connection> inputs;
@@ -198,7 +198,7 @@ struct Attachment {
     int32_t ins, sample;
     int rsrc;                               // the FIFO, a resource of the instrument's template
     uint32_t flags, start_at;
-    int state;                              // +0x26: 0 made, 1 stopped, 3 playing
+    int state;                              // +0x26: 0 made, 1 stopped, 2 released, 3 playing
     int32_t next;                           // LinkAttachments (+0x4c): what plays after it, 0 none
 };
 enum : uint32_t { AF_ATTF_NOAUTOSTART = 1, AF_ERR_NULLADDRESS = 0xD52BF119u };
@@ -618,6 +618,40 @@ static uint32_t stop_instrument(int32_t item, uint32_t tags) {
     return 0;
 }
 static void a_stopinstrument(ArmCpu& c) { c.r[0] = stop_instrument((int32_t)c.r[0], c.r[1]); }
+
+// An attachment released (0x79a0): its sample must have an address (else AF_ERR_NULLADDRESS); a
+// link to what is no longer an attachment is forgotten (0x795c); the folio then moves the FIFO to
+// the sample's release loop, to what is linked after it, or to the sample's end (0x76d0, 0x7810,
+// 0x7860, 0x65e8, 0x76b8) and arms the FIFO's interrupt (0x6578) -- the DSP's side, not done
+// here --, and the attachment is released.
+static uint32_t attachment_release(int32_t a) {
+    Attachment& at = g_attachments[a];
+    if (!g_samples[at.sample].address) return AF_ERR_NULLADDRESS;
+    if (at.next && !pf_check_item(at.next, NST_AUDIO, ATTACHMENT_NODE)) at.next = 0;
+    at.state = 2;
+    return 0;
+}
+
+// swi 0x40002: Err ReleaseInstrument(Item instrument, TagArg* tags) -- 0x1d54: an instrument
+// (else AF_ERR_BADITEM), no tags (else AF_ERR_BADTAG); neither the folio's open nor the owner
+// asked. Started, it is released, and its DSP side with it (0x7b1c): on each of its FIFOs, in the
+// template's order, the attachment playing there, while it is still an attachment, released --
+// the first error ends the round and is the call's result; then the envelopes' attachments (none
+// made here); its DSP side's state becomes 2.
+static uint32_t release_instrument(int32_t item, uint32_t tags) {
+    if (!pf_check_item(item, NST_AUDIO, INSTRUMENT_NODE)) return AF_ERR_BADITEM;
+    if (tags) return AF_ERR_BADTAG;
+    Instrument& ins = g_instruments[item];
+    if (ins.state <= 2) return 0;
+    ins.state = 2;
+    uint32_t err = 0;
+    std::map<int, int32_t> was = ins.playing;
+    for (auto [rsrc, a] : was)
+        if (pf_check_item(a, NST_AUDIO, ATTACHMENT_NODE) && (int32_t)(err = attachment_release(a)) < 0) break;
+    ins.dsp_state = 2;
+    return err;
+}
+static void a_releaseinstrument(ArmCpu& c) { c.r[0] = release_instrument((int32_t)c.r[0], c.r[1]); }
 
 // ---- deleting items (the folio's ir_Delete, 0x1170, by node type) -----------------------------
 // A knob (0x27a8): off its instrument's list of grabbed knobs (RemNode), and 0. An instrument
@@ -1093,6 +1127,7 @@ void pf_audio_init() {
     pf_on_slot(PF_AUDIO, -148, a_detachsample);
     pf_on_swi(0x40000, a_tweakknob);
     pf_on_swi(0x40001, a_startinstrument);
+    pf_on_swi(0x40002, a_releaseinstrument);
     pf_on_swi(0x40003, a_stopinstrument);
     pf_on_swi(0x40008, a_connectinstruments);
     pf_on_swi(0x4000c, a_disconnectinstruments);

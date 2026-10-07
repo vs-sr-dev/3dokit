@@ -196,8 +196,8 @@ static void k_sendio(ArmCpu& c) { c.r[0] = (uint32_t)pf_send_io(c, (int32_t)c.r[
 // * a message or a port (pf_msg.cpp, 0x187f8 and 0x1884c).
 // * a folio's item: the folio's ir_Delete (pf_on_delete); anything but 0 is the result, and the
 //   item stays.
-// The kernel also gives the node's memory and its name back to the OS; here the OS's memory is
-// never freed. Any other kind stops the run: not yet.
+// The kernel also gives the node's memory and its name back to the OS, and so does the runtime
+// (pf_item_free). Any other kind stops the run: not yet.
 static int32_t delete_as(ArmCpu& c, int32_t item, uint32_t task) {
     uint32_t n = pf_item_node(item);
     if (!n) return (int32_t)KERR_BADITEM;

@@ -7,6 +7,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <map>
+#include <vector>
 
 const char* const g_pf_folio_names[PF_NFOLIOS] = {"Kernel", "Graphics", "audio", "File", "Operamath"};
 int g_pf_trace = 1;
@@ -211,16 +212,37 @@ uint32_t pf_r8(uint32_t a) { return in_os(a, 1) ? os_get(a, 1) : ld8(a); }
 void pf_w32(uint32_t a, uint32_t v) { if (in_os(a, 4)) os_put(a, v, 4); else st32(a, v); }
 void pf_w8(uint32_t a, uint32_t v) { if (in_os(a, 1)) os_put(a, v, 1); else st8(a, v); }
 
-static uint32_t g_os_free;                      // the OS's own allocations, upward
+// The OS's own allocations: upward from g_os_free, and what pf_os_free gives back used again for
+// the next allocation of the same (word-rounded) size, the most recently freed first -- so a run
+// is the same on any host. Only what pf_os_alloc gave out can be freed; anything else is ignored.
+static uint32_t g_os_free;
+static std::map<uint32_t, uint32_t> g_os_live;                 // address -> rounded size
+static std::map<uint32_t, std::vector<uint32_t>> g_os_spare;   // rounded size -> freed addresses
 
 uint32_t pf_os_alloc(uint32_t size) {
-    uint32_t a = g_os_free;
-    g_os_free = (g_os_free + size + 3) & ~3u;
-    if (g_os_free > PF_OS_BASE + PF_OS_SIZE) {
-        std::fprintf(stderr, "the OS's memory is full\n");
-        std::exit(3);
+    uint32_t rounded = (size + 3) & ~3u, a;
+    auto s = g_os_spare.find(rounded);
+    if (s != g_os_spare.end() && !s->second.empty()) {
+        a = s->second.back();
+        s->second.pop_back();
+        std::memset(g_os + (a - PF_OS_BASE), 0, rounded);
+    } else {
+        a = g_os_free;
+        g_os_free += rounded;
+        if (g_os_free > PF_OS_BASE + PF_OS_SIZE) {
+            std::fprintf(stderr, "the OS's memory is full\n");
+            std::exit(3);
+        }
     }
+    g_os_live[a] = rounded;
     return a;
+}
+
+void pf_os_free(uint32_t a) {
+    auto l = g_os_live.find(a);
+    if (l == g_os_live.end()) return;
+    g_os_spare[l->second].push_back(a);
+    g_os_live.erase(l);
 }
 
 uint32_t pf_os_next() { return g_os_free; }
@@ -236,6 +258,8 @@ uint32_t pf_os_string(const char* s) {
 static void build_folios() {
     std::memset(g_os, 0, sizeof g_os);
     g_os_free = PF_OS_BASE + 0x10000;           // above the folios' pages
+    g_os_live.clear();
+    g_os_spare.clear();
     for (int f = 0; f < PF_NFOLIOS; ++f) {
         uint32_t base = pf_folio_base((PfFolio)f);
         for (int i = 0; i < PF_SLOTS; ++i)

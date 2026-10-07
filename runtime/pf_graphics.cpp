@@ -546,8 +546,63 @@ static void g_drawcels(ArmCpu& c) {
     c.r[0] = 0;
 }
 
+// Graphics -60: Err SetClipOrigin(Item bitmap, int32 x, int32 y) -- SWI 3 (0x1e98): the bitmap
+// (CheckItem, else GRAFERR_BADITEM), the caller's or open (else GRAFERR_NOTOWNER); y made even;
+// the clip rectangle must lie inside the bitmap -- x and y at least 0, x + bm_ClipWidth at most
+// bm_Width, y + bm_ClipHeight at most bm_Height (else GRAFERR_BADCLIP). The buffer's address of
+// (x, y) in the line pairs becomes the cel engine's write address (REGCTL3), and its read address
+// (REGCTL2) too when that was the write address; bm_ClipX and bm_ClipY take x and y. The clip's
+// size (REGCTL1) stays.
+enum : uint32_t { BM_CLIPX = 0x40, BM_CLIPY = 0x44, GRAFERR_BADCLIP = 0xD55B9115u };
+static void g_setcliporigin(ArmCpu& c) {
+    uint32_t bm = pf_check_item((int32_t)c.r[0], NST_GRAPHICS, TYPE_BITMAP);
+    if (!bm) { c.r[0] = GRAFERR_BADITEM; return; }
+    if (pf_r32(bm + 28) != task_item() && pf_item_opened((int32_t)task_item(), (int32_t)c.r[0]) < 0) {
+        c.r[0] = GRAFERR_NOTOWNER;
+        return;
+    }
+    int32_t x = (int32_t)c.r[1], y = (int32_t)c.r[2] & ~1;
+    int32_t w = (int32_t)pf_r32(bm + BM_WIDTH), h = (int32_t)pf_r32(bm + BM_HEIGHT);
+    if (x < 0 || x + (int32_t)pf_r32(bm + BM_CLIPWIDTH) > w || y < 0 || y + (int32_t)pf_r32(bm + BM_CLIPHEIGHT) > h) {
+        c.r[0] = GRAFERR_BADCLIP;
+        return;
+    }
+    uint32_t a = pf_r32(bm + BM_BUFFER) + (uint32_t)(y * w + 2 * x) * 2;
+    if (pf_r32(bm + BM_REGCTL2) == pf_r32(bm + BM_REGCTL3)) pf_w32(bm + BM_REGCTL2, a);
+    pf_w32(bm + BM_CLIPX, (uint32_t)x);
+    pf_w32(bm + BM_CLIPY, (uint32_t)y);
+    pf_w32(bm + BM_REGCTL3, a);
+    c.r[0] = 0;
+}
+
+// Graphics -112: Err SetClipWidth(Item bitmap, int32 w) -- SWI 19 (0x1cfc), and -116 SetClipHeight
+// (Item bitmap, int32 h) -- SWI 20 (0x1dc8): the bitmap as SetClipOrigin takes it; the size above
+// 0, and the clip's origin plus it at most bm_Width (bm_Height), else GRAFERR_BADCLIP; then
+// bm_ClipWidth (bm_ClipHeight) and REGCTL1, the last column and row the engine draws into.
+static void set_clip_size(ArmCpu& c, bool height) {
+    uint32_t bm = pf_check_item((int32_t)c.r[0], NST_GRAPHICS, TYPE_BITMAP);
+    if (!bm) { c.r[0] = GRAFERR_BADITEM; return; }
+    if (pf_r32(bm + 28) != task_item() && pf_item_opened((int32_t)task_item(), (int32_t)c.r[0]) < 0) {
+        c.r[0] = GRAFERR_NOTOWNER;
+        return;
+    }
+    int32_t n = (int32_t)c.r[1];
+    if (n <= 0 || n + (int32_t)pf_r32(bm + (height ? BM_CLIPY : BM_CLIPX)) > (int32_t)pf_r32(bm + (height ? BM_HEIGHT : BM_WIDTH))) {
+        c.r[0] = GRAFERR_BADCLIP;
+        return;
+    }
+    pf_w32(bm + (height ? BM_CLIPHEIGHT : BM_CLIPWIDTH), (uint32_t)n);
+    pf_w32(bm + BM_REGCTL1, (pf_r32(bm + BM_CLIPWIDTH) - 1) | (pf_r32(bm + BM_CLIPHEIGHT) - 1) << 16);
+    c.r[0] = 0;
+}
+static void g_setclipwidth(ArmCpu& c) { set_clip_size(c, false); }
+static void g_setclipheight(ArmCpu& c) { set_clip_size(c, true); }
+
 static void graphics_slots() {
     pf_on_slot(PF_GRAPHICS, -48, g_createscreengroup);
+    pf_on_slot(PF_GRAPHICS, -60, g_setcliporigin);
+    pf_on_slot(PF_GRAPHICS, -112, g_setclipwidth);
+    pf_on_slot(PF_GRAPHICS, -116, g_setclipheight);
     pf_on_slot(PF_GRAPHICS, -64, g_enablevavg);
     pf_on_slot(PF_GRAPHICS, -68, g_disablevavg);
     pf_on_slot(PF_GRAPHICS, -72, g_enablehavg);

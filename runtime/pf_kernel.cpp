@@ -199,8 +199,15 @@ uint32_t pf_item_node(int32_t item) {
 int32_t pf_item_count() { return (int32_t)g_items.size(); }
 
 // The 1993 kernel frees the number for a later item (0x12e7c); here a number is never given twice.
+// The node's memory and its name go back to the OS, as the kernel gives them back (what the OS
+// did not allocate itself -- a folio's node, a name it does not own -- stays).
 void pf_item_free(int32_t item) {
-    if (item > 0 && item < (int32_t)g_items.size()) g_items[item] = 0;
+    if (item <= 0 || item >= (int32_t)g_items.size()) return;
+    if (uint32_t n = g_items[item]) {
+        pf_os_free(pf_r32(n + 16));
+        pf_os_free(n);
+    }
+    g_items[item] = 0;
 }
 
 static bool same_name(uint32_t a, const char* b) {
