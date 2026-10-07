@@ -230,6 +230,31 @@ uint32_t pf_alloc_signal(uint32_t sigs);
 int32_t  pf_free_signal(uint32_t sigs);
 int32_t  pf_wait_signal(uint32_t sigs);
 
+// Messages (pf_msg.cpp), as the 1993 kernel makes and passes them: CreateSizedItem of a MsgPort
+// and of a Message (the caller's tags and size; the item or an Err), and their deletion's own part.
+uint32_t pf_create_msgport(ArmCpu& c, uint32_t tags, uint32_t size);
+uint32_t pf_create_msg(ArmCpu& c, uint32_t tags, uint32_t size);
+void     pf_delete_msgport(ArmCpu& c, uint32_t port);
+void     pf_delete_msg(uint32_t msg);
+// The OS's own ports and messages. A port made here has no task behind it: a message sent to it
+// (by SendMsg or ReplyMsg) goes to `on_msg` with the port and the message, as the port's owner
+// would be woken; the OS reads the port with pf_get_msg. A message made here has `reply_port` and,
+// when `data_size` is not 0, a pass-by-value buffer of that size. pf_send_msg is SendMsg without
+// the caller's checks; pf_reply_msg and pf_get_msg are ReplyMsg and GetMsg.
+typedef void (*PfPortFn)(int32_t port, int32_t msg);
+int32_t  pf_msgport_new(const char* name, PfPortFn on_msg);
+int32_t  pf_msg_new(int32_t reply_port, uint32_t data_size);
+int32_t  pf_send_msg(int32_t port, int32_t msg, uint32_t data, uint32_t size);
+int32_t  pf_reply_msg(int32_t msg, int32_t result, uint32_t data, uint32_t size);
+int32_t  pf_get_msg(int32_t port);
+
+// The event broker (pf_event.cpp): the disc's System/Tasks/eventbroker (Aug 1993) at its message
+// boundary -- its port "eventbroker", its listeners and their focus, and the events it reports --
+// and the Control Port's first pad, whose buttons (event.h's ControlPadEventData bits) are what
+// pf_pad_press schedules: `bits` down from field `first` (gf_VBLNumber, the fields counted from the
+// boot) for `hold` fields, then up; `count` times, every `every` fields.
+void     pf_pad_press(uint32_t bits, uint64_t first, int count, int every, int hold);
+
 // Files (pf_file.cpp). The disc is a directory on the host, `g_pf_disc_root` (pfboot: the
 // program's own directory unless --disc says otherwise); a program's path is walked there as the
 // File folio walks it -- from the current directory or the root, through its aliases, with names
@@ -239,6 +264,8 @@ std::string pf_host_path(const char* path);
 
 // The folios' handlers register themselves here.
 void     pf_kernel_init();
+void     pf_msg_init();
+void     pf_event_init();
 void     pf_io_init();
 void     pf_file_init();
 void     pf_graphics_init();

@@ -2,7 +2,7 @@
 // runtime, tracing its OS calls.
 //
 //     pfboot PROGRAM [--trace N] [--lenient] [--max-calls N] [--snap N DIR] [--disc DIR]
-//                    [--frames DIR]
+//                    [--frames DIR] [--pad BUTTONS@FIELD[xN][/E]]...
 //
 // PROGRAM is the AIF file the build was recompiled from (its module must be
 // in this build). --trace 0 is quiet, 1 (the default) every OS call, 2 also
@@ -13,7 +13,11 @@
 // python -m 3dokit.pfcheck replays it on the 1993 OS). --disc DIR is the
 // disc's root, where the program's files are; by default the program's own
 // directory. --frames DIR writes what the display shows, at each vertical
-// blank that changes it, as a PPM (pf_graphics.cpp).
+// blank that changes it, as a PPM (pf_graphics.cpp). --pad BUTTONS@FIELD[xN][/E]
+// presses the first Control Pad's BUTTONS (up down left right a b c start x l r,
+// joined by +) at field FIELD (gf_VBLNumber), N times (4 by default), every E
+// fields (30, half a second), each held for 6 fields and then released; --pad
+// may be given more than once (pf_event.cpp).
 //
 //     pfboot PROGRAM --memtest DIR [--ops N] [--seed S]
 //
@@ -30,6 +34,37 @@ static uint32_t be32(const std::vector<uint8_t>& d, size_t o) {
     return (uint32_t)d[o] << 24 | (uint32_t)d[o + 1] << 16 | (uint32_t)d[o + 2] << 8 | d[o + 3];
 }
 
+// --pad BUTTONS@FIELD[xN][/E]: the buttons' bits (event.h's ControlPadEventData), scheduled.
+static bool pad_option(const char* spec) {
+    static const struct { const char* name; uint32_t bit; } kButtons[] = {
+        {"down", 0x80000000u}, {"up", 0x40000000u}, {"right", 0x20000000u}, {"left", 0x10000000u},
+        {"a", 0x08000000u}, {"b", 0x04000000u}, {"c", 0x02000000u}, {"start", 0x01000000u},
+        {"x", 0x00800000u}, {"r", 0x00400000u}, {"l", 0x00200000u},
+    };
+    std::string s = spec;
+    size_t at = s.find('@');
+    if (at == std::string::npos) return false;
+    uint32_t bits = 0;
+    for (size_t b = 0; b < at;) {
+        size_t e = s.find('+', b);
+        if (e == std::string::npos || e > at) e = at;
+        std::string name = s.substr(b, e - b);
+        bool known = false;
+        for (const auto& k : kButtons)
+            if (name == k.name) { bits |= k.bit; known = true; }
+        if (!known) return false;
+        b = e + 1;
+    }
+    char* p;
+    unsigned long long first = std::strtoull(s.c_str() + at + 1, &p, 10);
+    long count = 4, every = 30;
+    if (*p == 'x') count = std::strtol(p + 1, &p, 10);
+    if (*p == '/') every = std::strtol(p + 1, &p, 10);
+    if (*p || !bits || count < 1 || every < 7) return false;
+    pf_pad_press(bits, first, (int)count, (int)every, 6);
+    return true;
+}
+
 // The target of the BL at `at` in the AIF header, or 0.
 static uint32_t bl_target(const std::vector<uint8_t>& d, uint32_t at) {
     uint32_t w = be32(d, at);
@@ -41,7 +76,7 @@ static uint32_t bl_target(const std::vector<uint8_t>& d, uint32_t at) {
 int main(int argc, char** argv) {
     if (argc < 2) {
         std::fprintf(stderr, "usage: pfboot PROGRAM [--trace N] [--lenient] [--max-calls N] [--snap N DIR] [--disc DIR]\n"
-                             "                      [--frames DIR]\n"
+                             "                      [--frames DIR] [--pad BUTTONS@FIELD[xN][/E]]...\n"
                              "       pfboot PROGRAM --memtest DIR [--ops N] [--seed S]\n");
         return 2;
     }
@@ -59,6 +94,12 @@ int main(int argc, char** argv) {
         }
         else if (!std::strcmp(argv[i], "--disc") && i + 1 < argc) disc = argv[++i];
         else if (!std::strcmp(argv[i], "--frames") && i + 1 < argc) g_pf_frames_dir = argv[++i];
+        else if (!std::strcmp(argv[i], "--pad") && i + 1 < argc) {
+            if (!pad_option(argv[++i])) {
+                std::fprintf(stderr, "--pad %s: BUTTONS@FIELD[xN][/E], BUTTONS of up down left right a b c start x l r\n", argv[i]);
+                return 2;
+            }
+        }
         else if (!std::strcmp(argv[i], "--memtest") && i + 1 < argc) memtest = argv[++i];
         else if (!std::strcmp(argv[i], "--ops") && i + 1 < argc) ops = std::atoi(argv[++i]);
         else if (!std::strcmp(argv[i], "--seed") && i + 1 < argc) seed = (uint32_t)std::strtoul(argv[++i], nullptr, 0);

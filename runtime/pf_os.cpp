@@ -264,12 +264,14 @@ int pf_boot(const uint8_t* image, size_t size, uint32_t bss_end) {
     pf_on_swi(0x11, pf_exit_swi);
     pf_time_init();
     pf_kernel_init();
+    pf_msg_init();
     pf_mem_init(m->name, bss_end, kStackBase);
     pf_task_init();
     pf_io_init();
     pf_file_init();
     pf_graphics_init();
     pf_audio_init();
+    pf_event_init();                            // after the graphics: its fields are gf_VBLNumber's
     // argv: the program's name, in the OS's memory
     const uint32_t argv = PF_OS_BASE + 0x100, name = PF_OS_BASE + 0x110;
     os_put(argv, name, 4);

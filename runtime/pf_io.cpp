@@ -9,7 +9,7 @@
 #include <vector>
 
 enum : uint32_t {
-    DEVICENODE = 15, IOREQNODE = 14, TASKNODE = 5, MESSAGENODE = 9,
+    DEVICENODE = 15, IOREQNODE = 14, TASKNODE = 5, MESSAGENODE = 9, MSGPORTNODE = 10,
     // Device (device.h; the kernel's CreateDevice and OpenDevice store these)
     DEV_DRIVER = 0x24, DEV_OPENCNT = 0x28, DEV_IOREQSIZE = 0x3c, DEV_IOREQS = 0x40,
     DEV_MAXUNITNUM = 0x60, DEV_SIZE = 0x70,
@@ -117,6 +117,8 @@ static void k_createsizeditem(ArmCpu& c) {
     auto it = g_creators.find(subsys);
     if (c.r[0] == (1u << 8 | IOREQNODE)) c.r[0] = create_ioreq(c, c.r[1]);
     else if (c.r[0] == (1u << 8 | TASKNODE)) c.r[0] = pf_create_task(c, c.r[1]);
+    else if (c.r[0] == (1u << 8 | MSGPORTNODE)) c.r[0] = pf_create_msgport(c, c.r[1], c.r[2]);
+    else if (c.r[0] == (1u << 8 | MESSAGENODE)) c.r[0] = pf_create_msg(c, c.r[1], c.r[2]);
     else if (it != g_creators.end()) c.r[0] = it->second(c, type, c.r[1]);
     else {
         char why[80];
@@ -191,6 +193,7 @@ static void k_sendio(ArmCpu& c) { c.r[0] = (uint32_t)pf_send_io(c, (int32_t)c.r[
 // * a device (0x14a60): its delete hook, and when that says 0 every IOReq on the device, each
 //   deleted as by its owner, and the device off the kernel's list (which the runtime does not
 //   keep).
+// * a message or a port (pf_msg.cpp, 0x187f8 and 0x1884c).
 // * a folio's item: the folio's ir_Delete (pf_on_delete); anything but 0 is the result, and the
 //   item stays.
 // The kernel also gives the node's memory and its name back to the OS; here the OS's memory is
@@ -216,6 +219,10 @@ static int32_t delete_as(ArmCpu& c, int32_t item, uint32_t task) {
         }
         g_drivers.erase(n);
         g_delete_hooks.erase(n);
+    } else if (kind == (1u << 8 | MESSAGENODE)) {
+        pf_delete_msg(n);
+    } else if (kind == (1u << 8 | MSGPORTNODE)) {
+        pf_delete_msgport(c, n);
     } else if (auto d = g_deleters.find((int)pf_r8(n + 8)); d != g_deleters.end()) {
         if (int32_t r = d->second(c, (int)pf_r8(n + 9), item, task)) return r;
     } else {
