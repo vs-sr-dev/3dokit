@@ -14,7 +14,8 @@
 //
 // Keys: the arrows; Z, X, C for A, B, C; Enter for P (start); Backspace for X (stop); Q and W for
 // L and R. A gamepad: the d-pad or the left stick; south, east, west for A, B, C; start for P;
-// back for X; the shoulders for L and R. Esc or closing the window ends the run.
+// back for X; the shoulders for L and R. Closing the window ends the run (no key does: a player
+// reaching for Esc to pause would end it -- the game's pause is P).
 #include "pf.h"
 #include <SDL3/SDL.h>
 #include <atomic>
@@ -126,6 +127,7 @@ int pf_window_run(const char* title, const char* record, const std::function<int
         std::fprintf(stderr, "--record %s: cannot write it\n", record);
         return 2;
     }
+    std::atexit(pf_pad_record_close);           // a run that stops still writes the buttons held
     g_pf_display_vbl = window_vbl;
     g_pf_wait_forever = true;
     std::thread program([&run] {
@@ -142,7 +144,6 @@ int pf_window_run(const char* title, const char* record, const std::function<int
         SDL_Event e;
         while (SDL_PollEvent(&e)) {
             if (e.type == SDL_EVENT_QUIT) quit = true;
-            else if (e.type == SDL_EVENT_KEY_DOWN && e.key.scancode == SDL_SCANCODE_ESCAPE) quit = true;
             else if (e.type == SDL_EVENT_GAMEPAD_ADDED && !pad) pad = SDL_OpenGamepad(e.gdevice.which);
             else if (e.type == SDL_EVENT_GAMEPAD_REMOVED && pad && SDL_GetGamepadID(pad) == e.gdevice.which) {
                 SDL_CloseGamepad(pad);

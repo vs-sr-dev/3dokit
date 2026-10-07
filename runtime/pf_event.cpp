@@ -115,7 +115,7 @@ void pf_pad_live(uint32_t bits) { g_live.store(bits); }
 
 bool pf_pad_record_open(const char* path) {
     std::lock_guard<std::mutex> l(g_record_lock);
-    g_record = std::fopen(path, "w");
+    g_record = std::fopen(path, "wb");          // LF lines: a shell reads them back as they are
     return g_record != nullptr;
 }
 
