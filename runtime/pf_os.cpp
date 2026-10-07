@@ -53,8 +53,13 @@ void pf_log(const char* fmt, ...) {
     std::exit(3);
 }
 
+// The site of the OS call this task's host thread is in (0 outside one): where a stop inside a
+// call is reported. Outside a call, the return address in lr -- which compiled code may also use
+// as a register of its own, as launchme's sound code does.
+static thread_local uint32_t t_site;
+
 [[noreturn]] void pf_stop(ArmCpu& c, const char* why) {
-    arm_fault(c, c.r[14], why);
+    arm_fault(c, t_site ? t_site : c.r[14], why);
 }
 
 // ---- the OS's memory ---------------------------------------------------------------------
@@ -136,6 +141,7 @@ void pf_on_slot(PfFolio folio, int slot, PfFn fn) {
 // call as a snapshot names it (pf_snap_before).
 static void os_call(ArmCpu& c, PfFn fn, const char* what, uint32_t site, const char* call) {
     ++g_ncalls;
+    t_site = site;
     if (g_pf_trace)
         pf_log("[%5llu] %06X %-40s r0=%08X r1=%08X r2=%08X r3=%08X\n", g_ncalls, site, what,
                c.r[0], c.r[1], c.r[2], c.r[3]);
@@ -156,6 +162,7 @@ static void os_call(ArmCpu& c, PfFn fn, const char* what, uint32_t site, const c
     if (g_pf_trace) pf_log("        -> %08X\n", c.r[0]);
     if (snap) pf_snap_after(c);
     pf_task_reschedule();
+    t_site = 0;
 }
 
 void arm_swi(ArmCpu& c, uint32_t number, uint32_t site) {

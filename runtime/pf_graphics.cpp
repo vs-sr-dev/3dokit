@@ -5,6 +5,7 @@
 #include "pf.h"
 #include <cstdio>
 #include <cstdlib>
+#include <vector>
 
 // The folio's structures (graphics.h; the 1.2 and 1.3 headers agree, and the 1993 folio's stores
 // put each field used here where they do). The node sizes are the folio's own node database
@@ -26,10 +27,12 @@ static const uint32_t kNodeSize[] = {0, 0x54, 0x7c, 0x84, 0x34};
 // The folio's errors (graphics.h's GRAFERR_*, the values GRAPHIX builds).
 enum : uint32_t {
     GRAFERR_BADITEM = 0xD55B9001u, GRAFERR_BADTAG = 0xD55B9002u, GRAFERR_BADTAGVAL = 0xD55B9003u,
-    GRAFERR_NOMEM = 0xD55B9006u, GRAFERR_BUFWIDTH = 0xD55B9118u, GRAFERR_VDLWIDTH = 0xD55B911Au,
-    GRAFERR_NOTYET = 0xD55B911Bu, GRAFERR_VDL_LENGTH = 0xD55B9121u, GRAFERR_BADDISPDIMS = 0xD55B9123u,
-    GRAFERR_BADBITMAPSPEC = 0xD55B9124u, GRAFERR_INTERNALERROR = 0xD55B9125u,
-    GRAFERR_SGINUSE = 0xD55B9126u, GRAFERR_NOWRITEACCESS = 0xD55B9129u,
+    GRAFERR_NOMEM = 0xD55B9006u, GRAFERR_BADVDLTYPE = 0xD55B9116u, GRAFERR_INDEXRANGE = 0xD55B9117u,
+    GRAFERR_BUFWIDTH = 0xD55B9118u, GRAFERR_VDLWIDTH = 0xD55B911Au, GRAFERR_NOTYET = 0xD55B911Bu,
+    GRAFERR_MIXEDSCREENS = 0xD55B911Cu, GRAFERR_VDL_LENGTH = 0xD55B9121u,
+    GRAFERR_BADDISPDIMS = 0xD55B9123u, GRAFERR_BADBITMAPSPEC = 0xD55B9124u,
+    GRAFERR_INTERNALERROR = 0xD55B9125u, GRAFERR_SGINUSE = 0xD55B9126u, GRAFERR_SGNOTINUSE = 0xD55B9127u,
+    GRAFERR_NOWRITEACCESS = 0xD55B9129u,
 };
 
 static uint32_t graf(uint32_t field) { return pf_r32(pf_folio_base(PF_GRAPHICS) + field); }
@@ -50,11 +53,80 @@ static void system_vdls();
 
 // GRAPHIX's FIRQ at the vertical blank (0x50b4, "Graphics FIRQ", interrupt 1, priority 250):
 // gf_VBLNumber up by 1, with bit 0 then set in an odd field (the field bit of CLIO's 0x3400034),
-// which keeps it even in even fields as the fields alternate; then the field's VDL into the
-// display link, which the runtime does not show yet.
+// which keeps it even in even fields as the fields alternate; then the field's VDL
+// (gf_CurrentVDLEven or, in an odd field, gf_CurrentVDLOdd) into the display link -- the word
+// gf_VDLDisplayLink points at.
+static void write_frame(uint32_t vbl);
+
 static void graphics_vbl(uint64_t) {
-    uint32_t g = pf_folio_base(PF_GRAPHICS);
-    pf_w32(g + GF_VBLNUMBER, pf_r32(g + GF_VBLNUMBER) + 1);
+    uint32_t g = pf_folio_base(PF_GRAPHICS), n = pf_r32(g + GF_VBLNUMBER) + 1;
+    pf_w32(g + GF_VBLNUMBER, n);
+    pf_w32(pf_r32(g + GF_VDLDISPLAYLINK), pf_r32(g + (n & 1 ? GF_CURRENTVDLODD : GF_CURRENTVDLEVEN)));
+    if (g_pf_frames_dir) write_frame(n);
+}
+
+// ---- what the display shows (pfboot --frames) --------------------------------------------------
+// One field as the VDLs describe it (hardware.h's VDL words), from forced-first round to it
+// again: each entry's DMA control word -- its lines (bits 0-8), the words after its 4-word header
+// (9-14), VDL_LDPREV, VDL_LDCUR (the buffers from its second and third words), VDL_ENVIDDMA --
+// then its link, then its words: a colour (bit 31 clear: pen 24-28, all three channels or the
+// one bits 29-30 name) into the CLUT, which stays from entry to entry. A line with video DMA reads
+// 320 pixels from the buffer in the 3DO's line pairs (two lines in a word, the even one in the
+// high half; the pair after the next 1,280 bytes on) and gives each 5-bit channel its CLUT entry's
+// colour. Lines without video DMA are left out, so the VIRS line comes first. Not modelled: the
+// display control words (interpolation, the background and transparency, bit 15 of a pixel),
+// other widths, a relative link.
+const char* g_pf_frames_dir;
+static std::vector<uint8_t> g_last_frame;
+
+static bool display_field(std::vector<uint8_t>& rgb, int& lines) {
+    uint32_t first = graf(GF_VDLFORCEDFIRST), e = first;
+    uint8_t clut[32][3] = {};
+    uint32_t cur = 0;
+    bool odd = false;
+    rgb.clear();
+    lines = 0;
+    for (int entries = 0; entries < 256; ++entries) {
+        uint32_t w0 = pf_r32(e), n = w0 & 0x1ff, len = (w0 >> 9) & 0x3f;
+        if (w0 & 0x00040000u) return false;                 // VDL_RELSEL
+        if (w0 & 0x00010000u) { cur = pf_r32(e + 4); odd = false; }
+        for (uint32_t i = 0; i < len; ++i) {
+            uint32_t v = pf_r32(e + 16 + 4 * i);
+            if (v & 0x80000000u) continue;
+            uint32_t pen = (v >> 24) & 31, sel = (v >> 29) & 3;
+            uint8_t ch[3] = {(uint8_t)(v >> 16), (uint8_t)(v >> 8), (uint8_t)v};
+            for (int k = 0; k < 3; ++k)
+                if (sel == 0 || sel == 3 - (uint32_t)k) clut[pen][k] = ch[k];
+        }
+        for (uint32_t l = 0; l < n && (w0 & 0x00200000u); ++l) {
+            if (++lines > 512) return false;
+            for (uint32_t x = 0; x < 320; ++x) {
+                uint32_t w = pf_r32(cur + 4 * x), p = odd ? w & 0xffff : w >> 16;
+                rgb.push_back(clut[(p >> 10) & 31][0]);
+                rgb.push_back(clut[(p >> 5) & 31][1]);
+                rgb.push_back(clut[p & 31][2]);
+            }
+            if (odd) cur += 1280;
+            odd = !odd;
+        }
+        e = pf_r32(e + 12);
+        if (e == first) return true;
+    }
+    return false;
+}
+
+static void write_frame(uint32_t vbl) {
+    std::vector<uint8_t> rgb;
+    int lines;
+    if (!display_field(rgb, lines) || rgb == g_last_frame) return;
+    g_last_frame = rgb;
+    char path[1024];
+    std::snprintf(path, sizeof path, "%s/vbl%06u.ppm", g_pf_frames_dir, vbl);
+    if (FILE* f = std::fopen(path, "wb")) {
+        std::fprintf(f, "P6\n320 %d\n255\n", lines);
+        std::fwrite(rgb.data(), 1, rgb.size(), f);
+        std::fclose(f);
+    }
 }
 
 void pf_graphics_init() {
@@ -380,11 +452,90 @@ static void g_disablevavg(ArmCpu& c) { averaging(c, 0, 8); }
 static void g_enablehavg(ArmCpu& c) { averaging(c, 4, 0); }
 static void g_disablehavg(ArmCpu& c) { averaging(c, 0, 4); }
 
+// ---- colours and the display -----------------------------------------------------------------
+// A screen's node, if the caller owns it, for the calls that check ownership after CheckItem.
+static void must_own(ArmCpu& c, uint32_t n) {
+    if (pf_r32(n + 28) != task_item()) pf_stop(c, "the Graphics folio: an item of another task");
+}
+
+// SWI 13 (0x1fc8): Err SetScreenColors(Item screen, uint32* entries, int32 count) -- the screen
+// (CheckItem, its owner), its VDL of type VDLTYPE_SIMPLE (else GRAFERR_BADVDLTYPE); then each
+// entry, index (its top byte) at most 32 (else GRAFERR_INDEXRANGE, the earlier ones written) and
+// its 24-bit colour, into the colour words of the VDL's first entry (from its sixth word): index
+// 32 is the background word, 0xE0000000 | the colour. Only the first entry -- the screen's first
+// bitmap's -- is written.
+template <class Entry>
+static uint32_t set_screen_colors(ArmCpu& c, uint32_t item, int32_t count, Entry entry) {
+    uint32_t scr = pf_check_item((int32_t)item, NST_GRAPHICS, TYPE_SCREEN);
+    if (!scr) return GRAFERR_BADITEM;
+    must_own(c, scr);
+    if (pf_r32(scr + SCR_VDLTYPE) != 4) return GRAFERR_BADVDLTYPE;
+    for (int32_t i = 0; i < count; ++i) {
+        uint32_t e = entry(i), index = e >> 24;
+        if (index > 32) return GRAFERR_INDEXRANGE;
+        uint32_t w = (index == 32 ? 0xE0000000u : index << 24) | (e & 0xFFFFFF);
+        pf_w32(pf_r32(pf_r32(scr + SCR_VDLPTR) + VDL_DATAPTR) + 20 + 4 * index, w);
+    }
+    return 0;
+}
+
+// Graphics -88: SetScreenColors -- SWI 13. Graphics -80: Err SetScreenColor(Item screen,
+// uint32 entry) -- SWI 9 (0x1fa0): the one entry, from the SWI's own stack.
+static void g_setscreencolors(ArmCpu& c) {
+    uint32_t entries = c.r[1];
+    c.r[0] = set_screen_colors(c, c.r[0], (int32_t)c.r[2], [&](int32_t i) { return pf_r32(entries + 4u * (uint32_t)i); });
+}
+static void g_setscreencolor(ArmCpu& c) {
+    uint32_t e = c.r[1];
+    if (g_pf_trace) pf_log("        colour %u: 0x%06x\n", e >> 24, e & 0xFFFFFF);
+    c.r[0] = set_screen_colors(c, c.r[0], 1, [&](int32_t) { return e; });
+}
+
+// Graphics -84: Err ResetScreenColors(Item screen) -- SWI 10 (0x20e8): SetScreenColor of the grey
+// ramp, entry i being i * 255 / 31 in each channel, stopping at the first error.
+static void g_resetscreencolors(ArmCpu& c) {
+    uint32_t item = c.r[0];
+    for (uint32_t i = 0; i < 32; ++i) {
+        uint32_t v = i * 255 / 31;
+        c.r[0] = item;
+        c.r[1] = i << 24 | v << 16 | v << 8 | v;
+        g_setscreencolor(c);
+        if ((int32_t)c.r[0] < 0) return;
+    }
+    c.r[0] = 0;
+}
+
+// Graphics -160: Err DisplayScreen(Item screen0, Item screen1) -- SWI 45 (0x307c): both screens
+// (screen1 0: screen0 again), CheckItem'd, then each owned; the first's group (none:
+// GRAFERR_INTERNALERROR) an item still (else GRAFERR_SGNOTINUSE -- AddScreenGroup is not asked
+// for), the second's the same group (else GRAFERR_MIXEDSCREENS); then the first VDL's data into
+// gf_CurrentVDLEven and the second's into gf_CurrentVDLOdd, which the next blanks link in.
+static void g_displayscreen(ArmCpu& c) {
+    uint32_t s0 = pf_check_item((int32_t)c.r[0], NST_GRAPHICS, TYPE_SCREEN);
+    uint32_t s1 = c.r[1] ? pf_check_item((int32_t)c.r[1], NST_GRAPHICS, TYPE_SCREEN) : s0;
+    if (!s0 || !s1) { c.r[0] = GRAFERR_BADITEM; return; }
+    must_own(c, s0);
+    must_own(c, s1);
+    uint32_t sg = pf_r32(s0 + SCR_SCREENGROUPPTR);
+    if (!sg) { c.r[0] = GRAFERR_INTERNALERROR; return; }
+    if (!pf_check_item((int32_t)pf_r32(sg + 24), NST_GRAPHICS, TYPE_SCREENGROUP)) { c.r[0] = GRAFERR_SGNOTINUSE; return; }
+    if (pf_r32(s1 + SCR_SCREENGROUPPTR) != sg) { c.r[0] = GRAFERR_MIXEDSCREENS; return; }
+    uint32_t g = pf_folio_base(PF_GRAPHICS);
+    pf_w32(g + GF_CURRENTVDLEVEN, pf_r32(pf_r32(s0 + SCR_VDLPTR) + VDL_DATAPTR));
+    pf_w32(g + GF_CURRENTVDLODD, pf_r32(pf_r32(s1 + SCR_VDLPTR) + VDL_DATAPTR));
+    if (g_pf_trace) pf_log("        display %d and %d\n", (int32_t)c.r[0], (int32_t)c.r[1]);
+    c.r[0] = 0;
+}
+
 static void graphics_slots() {
     pf_on_slot(PF_GRAPHICS, -48, g_createscreengroup);
     pf_on_slot(PF_GRAPHICS, -64, g_enablevavg);
     pf_on_slot(PF_GRAPHICS, -68, g_disablevavg);
     pf_on_slot(PF_GRAPHICS, -72, g_enablehavg);
     pf_on_slot(PF_GRAPHICS, -76, g_disablehavg);
+    pf_on_slot(PF_GRAPHICS, -80, g_setscreencolor);
+    pf_on_slot(PF_GRAPHICS, -84, g_resetscreencolors);
+    pf_on_slot(PF_GRAPHICS, -88, g_setscreencolors);
     pf_on_slot(PF_GRAPHICS, -104, g_addscreengroup);
+    pf_on_slot(PF_GRAPHICS, -160, g_displayscreen);
 }

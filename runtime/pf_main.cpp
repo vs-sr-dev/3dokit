@@ -2,6 +2,7 @@
 // runtime, tracing its OS calls.
 //
 //     pfboot PROGRAM [--trace N] [--lenient] [--max-calls N] [--snap N DIR] [--disc DIR]
+//                    [--frames DIR]
 //
 // PROGRAM is the AIF file the build was recompiled from (its module must be
 // in this build). --trace 0 is quiet, 1 (the default) every OS call, 2 also
@@ -11,7 +12,8 @@
 // with the memory before and after it and the call in DIR (pf_memtest.cpp;
 // python -m 3dokit.pfcheck replays it on the 1993 OS). --disc DIR is the
 // disc's root, where the program's files are; by default the program's own
-// directory.
+// directory. --frames DIR writes what the display shows, at each vertical
+// blank that changes it, as a PPM (pf_graphics.cpp).
 //
 //     pfboot PROGRAM --memtest DIR [--ops N] [--seed S]
 //
@@ -39,6 +41,7 @@ static uint32_t bl_target(const std::vector<uint8_t>& d, uint32_t at) {
 int main(int argc, char** argv) {
     if (argc < 2) {
         std::fprintf(stderr, "usage: pfboot PROGRAM [--trace N] [--lenient] [--max-calls N] [--snap N DIR] [--disc DIR]\n"
+                             "                      [--frames DIR]\n"
                              "       pfboot PROGRAM --memtest DIR [--ops N] [--seed S]\n");
         return 2;
     }
@@ -55,6 +58,7 @@ int main(int argc, char** argv) {
             g_pf_snap_dir = argv[++i];
         }
         else if (!std::strcmp(argv[i], "--disc") && i + 1 < argc) disc = argv[++i];
+        else if (!std::strcmp(argv[i], "--frames") && i + 1 < argc) g_pf_frames_dir = argv[++i];
         else if (!std::strcmp(argv[i], "--memtest") && i + 1 < argc) memtest = argv[++i];
         else if (!std::strcmp(argv[i], "--ops") && i + 1 < argc) ops = std::atoi(argv[++i]);
         else if (!std::strcmp(argv[i], "--seed") && i + 1 < argc) seed = (uint32_t)std::strtoul(argv[++i], nullptr, 0);

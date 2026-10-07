@@ -234,6 +234,11 @@ void     pf_file_init();
 void     pf_graphics_init();
 void     pf_audio_init();
 
+// What the display shows (pf_graphics.cpp): with g_pf_frames_dir set, at each vertical blank
+// the field the VDLs describe, as a PPM in that directory whenever it differs from the last one
+// written (vblNNNNNN.ppm, by gf_VBLNumber). A diagnostic, not the display.
+extern const char* g_pf_frames_dir;
+
 // The SDK's names (generated: pf_names.cpp).
 struct PfSwiName { uint32_t number; const char* name; };
 struct PfSlotName { const char* folio; int slot; const char* name; };
