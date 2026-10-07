@@ -82,6 +82,9 @@ int32_t  pf_item_new(uint32_t node, int subsys, int type, const char* name);
 uint32_t pf_item_node(int32_t item);            // 0 if no such item
 uint32_t pf_check_item(int32_t item, int subsys, int type);    // CheckItem: 0 unless of that kind
 int32_t  pf_item_count();                       // items are 1 to this, less one
+void     pf_item_free(int32_t item);            // the node deleted: its number names nothing now
+int32_t  pf_open_item(int32_t item);            // OpenItem and CloseItem by the current task
+int32_t  pf_close_item(int32_t item);
 // ItemOpened (Kernel -128): 0 when the task has the item open (OpenItem, not yet CloseItem),
 // else the kernel's NOTFOUND; BADITEM when `task` is no task's item.
 int32_t  pf_item_opened(int32_t task, int32_t item);
@@ -196,10 +199,21 @@ int32_t  pf_unlock_item(int32_t item);                 // UnlockItem
 // Devices and IOReqs (pf_io.cpp). A device is a node of devices.h's layout with an item; its
 // driver is a native function that starts an IOReq, as a command of a 1993 driver does: 1 when
 // the request is done (the kernel's dispatch then completes it, and SendIO returns 1), 0 when it
-// is queued (the driver clears IO_QUICK, and calls pf_complete_io when it is done).
+// is queued (the driver clears IO_QUICK, and calls pf_complete_io when it is done) or completed
+// it itself, an Err when the driver refuses it (SendIO returns that, the request left as the
+// driver left it). A device may have a delete hook (dev_DeleteDev), which DeleteItem runs first;
+// 0 lets the deletion go on. A node bigger than a Device (`size`, 0 for the Device alone) holds
+// the driver's own fields after it.
 typedef int32_t (*PfDispatchIO)(uint32_t ior);
-uint32_t pf_device_new(const char* name, int max_unit, PfDispatchIO dispatch);
+typedef int32_t (*PfDeleteDev)(uint32_t dev);
+uint32_t pf_device_new(const char* name, int max_unit, PfDispatchIO dispatch, PfDeleteDev del = nullptr,
+                       uint32_t size = 0);
 void     pf_complete_io(uint32_t ior);
+// What the OS's own code asks of the kernel, as a program's SWI would: CreateIOReq on a device
+// (CREATEIOREQ_TAG_DEVICE alone), SendIO with the IOInfo at guest address `info`, DeleteItem.
+int32_t  pf_create_ioreq(ArmCpu& c, int32_t device);
+int32_t  pf_send_io(ArmCpu& c, int32_t ior, uint32_t info);
+int32_t  pf_delete_item(ArmCpu& c, int32_t item);
 int32_t  pf_signal(uint32_t task, uint32_t bits);   // the kernel's own SendSignal (pf_task.cpp)
 // The current task's AllocSignal, FreeSignal and WaitSignal (pf_task.cpp), for the OS's own use.
 uint32_t pf_alloc_signal(uint32_t sigs);
@@ -207,9 +221,9 @@ int32_t  pf_free_signal(uint32_t sigs);
 int32_t  pf_wait_signal(uint32_t sigs);
 
 // Files (pf_file.cpp). The disc is a directory on the host, `g_pf_disc_root` (pfboot: the
-// program's own directory unless --disc says otherwise); a program's path, absolute or from its
-// current directory, is found there with names matched without case, as the Opera filesystem
-// matches them. The host path, or "" when there is no such file.
+// program's own directory unless --disc says otherwise); a program's path is walked there as the
+// File folio walks it -- from the current directory or the root, through its aliases, with names
+// matched without case. The host path, or "" when there is no such file.
 extern std::string g_pf_disc_root;
 std::string pf_host_path(const char* path);
 

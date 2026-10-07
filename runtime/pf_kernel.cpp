@@ -198,6 +198,11 @@ uint32_t pf_item_node(int32_t item) {
 
 int32_t pf_item_count() { return (int32_t)g_items.size(); }
 
+// The 1993 kernel frees the number for a later item (0x12e7c); here a number is never given twice.
+void pf_item_free(int32_t item) {
+    if (item > 0 && item < (int32_t)g_items.size()) g_items[item] = 0;
+}
+
 static bool same_name(uint32_t a, const char* b) {
     for (;; ++a, ++b) {
         int x = std::tolower((int)pf_r8(a)), y = std::tolower((unsigned char)*b);
@@ -242,26 +247,28 @@ static std::map<int32_t, std::multiset<int32_t>> g_opened;
 static int32_t task_item() { return (int32_t)pf_r32(pf_current_task() + 24); }
 
 // swi 0x10005: Item OpenItem(Item found, void* args) -- the item, opened
-static void k_openitem(ArmCpu& c) {
-    uint32_t n = pf_item_node((int32_t)c.r[0]);
-    if (!n) c.r[0] = (uint32_t)PF_ERR_BADITEM;
-    else {
-        count_opens(n, 1);
-        g_opened[task_item()].insert((int32_t)c.r[0]);
-    }
+int32_t pf_open_item(int32_t item) {
+    uint32_t n = pf_item_node(item);
+    if (!n) return PF_ERR_BADITEM;
+    count_opens(n, 1);
+    g_opened[task_item()].insert(item);
+    return item;
 }
 
+static void k_openitem(ArmCpu& c) { c.r[0] = (uint32_t)pf_open_item((int32_t)c.r[0]); }
+
 // swi 0x10008: Err CloseItem(Item)
-static void k_closeitem(ArmCpu& c) {
-    uint32_t n = pf_item_node((int32_t)c.r[0]);
-    if (n) {
-        count_opens(n, -1);
-        auto& open = g_opened[task_item()];
-        auto it = open.find((int32_t)c.r[0]);
-        if (it != open.end()) open.erase(it);
-    }
-    c.r[0] = n ? 0 : (uint32_t)PF_ERR_BADITEM;
+int32_t pf_close_item(int32_t item) {
+    uint32_t n = pf_item_node(item);
+    if (!n) return PF_ERR_BADITEM;
+    count_opens(n, -1);
+    auto& open = g_opened[task_item()];
+    auto it = open.find(item);
+    if (it != open.end()) open.erase(it);
+    return 0;
 }
+
+static void k_closeitem(ArmCpu& c) { c.r[0] = (uint32_t)pf_close_item((int32_t)c.r[0]); }
 
 // Kernel -128: Err ItemOpened(Item task, Item it) -- os_code 0x138ec: CheckItem of the task
 // (KERNELNODE, TASKNODE), else BADITEM; then 0 when its resource table holds the item as opened,

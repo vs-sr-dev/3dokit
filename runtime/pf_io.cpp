@@ -27,26 +27,30 @@ enum : uint32_t {
 // The kernel's errors (kernel.h's MAKEKERR, the values os_code builds).
 enum : uint32_t {
     KERR_BADITEM = 0xD57B9001u, KERR_BADTAG = 0xD57B9002u, KERR_NOTFOUND = 0xD57B9005u,
-    KERR_BADPTR = 0xD57B9009u, KERR_BADUNIT = 0xD57B900Bu,
+    KERR_NOTPRIV = 0xD57B9004u, KERR_BADPTR = 0xD57B9009u, KERR_BADUNIT = 0xD57B900Bu,
     KERR_BADCOMMAND = 0xD57B900Cu, KERR_BADIOARG = 0xD57B900Du, KERR_IOINPROGRESS = 0xD57B900Fu,
     KERR_NOTOWNER = 0xD57B9012u, KERR_ILLEGALSIGNAL = 0xD57B9116u,
+    TASK_SUPER = 8,
 };
 
 static std::map<uint32_t, PfDispatchIO> g_drivers;     // device node -> its driver
+static std::map<uint32_t, PfDeleteDev> g_delete_hooks; // device node -> its dev_DeleteDev
 
 static uint32_t task_item() { return pf_r32(pf_current_task() + 24); }
 
 // ---- devices --------------------------------------------------------------------------------
 // A device as CreateDevice (0x14974) leaves one: its IOReq size (0x70 when none is given), its
 // list of IOReqs, its units; and, here, its driver.
-uint32_t pf_device_new(const char* name, int max_unit, PfDispatchIO dispatch) {
-    uint32_t dev = pf_os_alloc(DEV_SIZE);
-    pf_w32(dev + 12, DEV_SIZE);
+uint32_t pf_device_new(const char* name, int max_unit, PfDispatchIO dispatch, PfDeleteDev del, uint32_t size) {
+    if (!size) size = DEV_SIZE;
+    uint32_t dev = pf_os_alloc(size);
+    pf_w32(dev + 12, size);
     pf_item_new(dev, 1, DEVICENODE, name);
     pf_w32(dev + DEV_IOREQSIZE, IOREQ_SIZE);
     pf_list_init(dev + DEV_IOREQS, "Device ioreqs");
     pf_w8(dev + DEV_MAXUNITNUM, (uint32_t)max_unit);
     g_drivers[dev] = dispatch;
+    if (del) g_delete_hooks[dev] = del;
     return dev;
 }
 
@@ -56,6 +60,9 @@ uint32_t pf_device_new(const char* name, int max_unit, PfDispatchIO dispatch) {
 // open (by the task: one task here); the node is the device's IOReq size, on the device's list,
 // born done. Without a reply port both io_MsgItem and io_SigItem are the task, so completion
 // signals it.
+static uint32_t make_ioreq(ArmCpu& c, bool have_dev, uint32_t dev_item, uint32_t port, uint32_t name,
+                           uint32_t pri);
+
 static uint32_t create_ioreq(ArmCpu& c, uint32_t tags) {
     uint32_t dev_item = 0, port = 0, name = 0, pri = 0;
     bool have_dev = false;
@@ -70,6 +77,13 @@ static uint32_t create_ioreq(ArmCpu& c, uint32_t tags) {
         else if (tag == 11) { dev_item = v; have_dev = true; }
         else if (tag != 0xff) return KERR_BADTAG;
     }
+    return make_ioreq(c, have_dev, dev_item, port, name, pri);
+}
+
+int32_t pf_create_ioreq(ArmCpu& c, int32_t device) { return (int32_t)make_ioreq(c, true, (uint32_t)device, 0, 0, 0); }
+
+static uint32_t make_ioreq(ArmCpu& c, bool have_dev, uint32_t dev_item, uint32_t port, uint32_t name,
+                           uint32_t pri) {
     uint32_t dev = have_dev ? pf_check_item((int32_t)dev_item, 1, DEVICENODE) : 0;
     if (!dev) return KERR_BADITEM;
     if (!pf_r32(dev + DEV_OPENCNT)) return KERR_NOTFOUND;   // not opened (os_code's own code)
@@ -131,22 +145,22 @@ void pf_complete_io(uint32_t ior) {
 // swi 0x10018: Err SendIO(Item ior, IOInfo* info) -- 0x142e8: the request checked (its owner,
 // not in progress, the IOInfo's flags and unit, the buffers: what it receives into must be the
 // task's to write, what it sends from inside memory), the IOInfo copied in, then the driver.
-static void k_sendio(ArmCpu& c) {
+int32_t pf_send_io(ArmCpu& c, int32_t item, uint32_t info) {
     uint32_t task = pf_current_task();
-    uint32_t ior = pf_check_item((int32_t)c.r[0], 1, IOREQNODE);
-    if (!ior) { c.r[0] = KERR_BADITEM; return; }
-    if (pf_r32(ior + 28) != task_item()) { c.r[0] = KERR_NOTOWNER; return; }
-    if (!(pf_r32(ior + IO_FLAGS) & IO_DONE)) { c.r[0] = KERR_IOINPROGRESS; return; }
+    uint32_t ior = pf_check_item(item, 1, IOREQNODE);
+    if (!ior) return (int32_t)KERR_BADITEM;
+    if (pf_r32(ior + 28) != task_item()) return (int32_t)KERR_NOTOWNER;
+    if (!(pf_r32(ior + IO_FLAGS) & IO_DONE)) return (int32_t)KERR_IOINPROGRESS;
     uint32_t dev = pf_r32(ior + IO_DEV);
     pf_w8(ior + 10, pf_r8(task + 10));                      // the task's priority
-    for (uint32_t i = 0; i < 32; i += 4) pf_w32(ior + IO_INFO + i, pf_r32(c.r[1] + i));
-    if (pf_r8(ior + IOI_FLAGS2) || (pf_r8(ior + IOI_FLAGS) & ~IO_QUICK)) { c.r[0] = KERR_BADIOARG; return; }
-    if (pf_r8(ior + IOI_UNIT) > pf_r8(dev + DEV_MAXUNITNUM)) { c.r[0] = KERR_BADUNIT; return; }
+    for (uint32_t i = 0; i < 32; i += 4) pf_w32(ior + IO_INFO + i, pf_r32(info + i));
+    if (pf_r8(ior + IOI_FLAGS2) || (pf_r8(ior + IOI_FLAGS) & ~IO_QUICK)) return (int32_t)KERR_BADIOARG;
+    if (pf_r8(ior + IOI_UNIT) > pf_r8(dev + DEV_MAXUNITNUM)) return (int32_t)KERR_BADUNIT;
     pf_w32(ior + IO_CALLBACK, 0);
     uint32_t rlen = pf_r32(ior + IOI_RECV_LEN), slen = pf_r32(ior + IOI_SEND_LEN);
-    if (rlen && pf_task_can_write(task, pf_r32(ior + IOI_RECV_BUF), (int32_t)rlen) < 0) { c.r[0] = KERR_BADPTR; return; }
+    if (rlen && pf_task_can_write(task, pf_r32(ior + IOI_RECV_BUF), (int32_t)rlen) < 0) return (int32_t)KERR_BADPTR;
     // the kernel's readable check (0x125c4): the range inside memory's top
-    if (slen && (slen > ARM_MEM_SIZE || pf_r32(ior + IOI_SEND_BUF) + slen > ARM_MEM_SIZE)) { c.r[0] = KERR_BADPTR; return; }
+    if (slen && (slen > ARM_MEM_SIZE || pf_r32(ior + IOI_SEND_BUF) + slen > ARM_MEM_SIZE)) return (int32_t)KERR_BADPTR;
     // the kernel's internal SendIO (0x142b4), then the driver's dispatch
     pf_w32(ior + IO_ERROR, 0);
     pf_w32(ior + IO_ACTUAL, 0);
@@ -155,14 +169,61 @@ static void k_sendio(ArmCpu& c) {
     pf_w32(ior + IO_FLAGS, flags);
     auto d = g_drivers.find(dev);
     if (d == g_drivers.end()) pf_stop(c, "SendIO: a device without a driver");
-    // the kernel's dispatch (0x1468c): a command done at once is completed here, and SendIO is 1
-    if (d->second(ior)) {
+    // the kernel's dispatch (0x1468c): a command done at once is completed here, and SendIO is 1;
+    // a driver with a dispatch of its own (the File folio's) answers SendIO itself
+    int32_t r = d->second(ior);
+    if (r > 0) {
         pf_complete_io(ior);
-        c.r[0] = 1;
-    } else {
-        c.r[0] = 0;
+        return 1;
     }
+    return r;
 }
+
+static void k_sendio(ArmCpu& c) { c.r[0] = (uint32_t)pf_send_io(c, (int32_t)c.r[0], c.r[1]); }
+
+// swi 0x10003: Err DeleteItem(Item) -- 0x138c8 and 0x1379c: the node, else BADITEM; the task must
+// own it or be it, or be privileged (0x12f7c), else NOTPRIV; then the kind's own deletion, and
+// the item is gone. The kinds made so far:
+// * an IOReq (0x14114): one in progress is aborted and waited for first (not yet: the run
+//   stops); off its device's list.
+// * a device (0x14a60): its delete hook, and when that says 0 every IOReq on the device, each
+//   deleted as by its owner, and the device off the kernel's list (which the runtime does not
+//   keep).
+// The kernel also gives the node's memory and its name back to the OS; here the OS's memory is
+// never freed. Any other kind stops the run: not yet.
+static int32_t delete_as(ArmCpu& c, int32_t item, uint32_t task) {
+    uint32_t n = pf_item_node(item);
+    if (!n) return (int32_t)KERR_BADITEM;
+    uint32_t me = pf_r32(task + 24);
+    if (!(pf_r8(task + 11) & TASK_SUPER) && pf_r32(n + 28) != me && (uint32_t)item != me)
+        return (int32_t)KERR_NOTPRIV;
+    uint32_t kind = pf_r8(n + 8) << 8 | pf_r8(n + 9);
+    if (kind == (1u << 8 | IOREQNODE)) {
+        if (!(pf_r32(n + IO_FLAGS) & IO_DONE)) pf_stop(c, "DeleteItem: an IOReq in progress: not yet");
+        pf_list_rem_node(n + IO_LINK);
+    } else if (kind == (1u << 8 | DEVICENODE)) {
+        auto h = g_delete_hooks.find(n);
+        int32_t r = h == g_delete_hooks.end() ? 0 : h->second(n);
+        if (r) return r;
+        for (uint32_t l; (l = pf_r32(n + DEV_IOREQS + PF_LIST_HEAD)) != n + DEV_IOREQS + PF_LIST_TAIL;) {
+            uint32_t ior = l - IO_LINK;
+            uint32_t owner = pf_item_node((int32_t)pf_r32(ior + 28));
+            delete_as(c, (int32_t)pf_r32(ior + 24), owner ? owner : pf_current_task());
+        }
+        g_drivers.erase(n);
+        g_delete_hooks.erase(n);
+    } else {
+        char why[64];
+        std::snprintf(why, sizeof why, "DeleteItem of a node %#x: not yet", kind);
+        pf_stop(c, why);
+    }
+    pf_item_free(item);
+    return 0;
+}
+
+int32_t pf_delete_item(ArmCpu& c, int32_t item) { return delete_as(c, item, pf_current_task()); }
+
+static void k_deleteitem(ArmCpu& c) { c.r[0] = (uint32_t)pf_delete_item(c, (int32_t)c.r[0]); }
 
 // ---- the Operator's devices ----------------------------------------------------------------
 // The SPORT and timer drivers are not on the disc: the 1993 kernel names no device, and the
@@ -288,12 +349,14 @@ static void timer_vbl(uint64_t) {
 
 void pf_io_init() {
     g_drivers.clear();
+    g_delete_hooks.clear();
     g_creators.clear();                         // the folios after this one register theirs
     g_sport_waiting.clear();
     g_timer_waiting.clear();
     g_vbl_count = 0;
     pf_on_swi(0x10000, k_createsizeditem);
     pf_on_swi(0x10018, k_sendio);
+    pf_on_swi(0x10003, k_deleteitem);
     pf_device_new("SPORT", 0, sport_dispatch);
     pf_device_new("timer", 1, timer_dispatch);
     pf_on_vbl(sport_vbl);
