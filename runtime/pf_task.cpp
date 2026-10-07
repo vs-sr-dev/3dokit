@@ -7,9 +7,11 @@
 // Each task runs on a host thread of its own, because the recompiled code nests its calls on the
 // host's stack; exactly one runs at a time, and a switch hands the turn over and waits for it to
 // come back. So the run is as deterministic as with one task: a switch happens only where the
-// kernel would make one at an OS call. What is not modelled yet is time: the kernel's quantum
-// timer, which would also make equal priorities take turns and let a higher priority that became
-// ready without a reschedule (see pf_create_task) run at the next tick.
+// kernel would make one -- at the end of an OS call, or where an interrupt (an event of
+// pf_time.cpp, at a safe point) has made a higher-priority task ready. When every task waits, the
+// guest's clock jumps to the next event. Not modelled yet: the kernel's quantum timer, which would
+// make equal priorities take turns and let a higher priority that became ready without a
+// reschedule (see pf_create_task) run at the next tick.
 #include "pf.h"
 #include <condition_variable>
 #include <cstdio>
@@ -81,9 +83,14 @@ static void make_ready(Task* t) {
 
 static void run_task(Task* t);
 
-// Hand the turn to `next` and wait for it to come back (a dead task's thread just returns).
+// Hand the turn to `next` and wait for it to come back (a dead task's thread just returns). The
+// task that waited may be the one woken: then it simply goes on.
 static void switch_to(Task* next) {
     Task* me = g_running;
+    if (next == me) {
+        g_reschedule = false;
+        return;
+    }
     if (g_pf_trace) pf_log("        (task \"%s\" runs)\n", name(next));
     std::unique_lock<std::mutex> l(*g_lock);
     g_running = next;
@@ -98,13 +105,22 @@ static void switch_to(Task* next) {
     g_turn->wait(l, [me] { return g_running == me; });
 }
 
-[[noreturn]] static void nothing_runs(const char* why) {
-    std::fflush(stdout);
-    std::fprintf(stderr, "%s: every task waits, and nothing can wake one yet (no timer, no interrupts)\n", why);
-    std::exit(3);
-}
+static bool someone_ready() { return !g_ready.empty(); }
 
-static Task* take_ready() {
+// The highest ready task, taken off the queue; when there is none, the clock moves on to the
+// events that make one ready -- or, if none does within pf_time_idle's limit, the run ends.
+static Task* take_ready(const char* who) {
+    if (g_ready.empty()) {
+        uint64_t from = pf_now();
+        if (!pf_time_idle(someone_ready)) {
+            std::fflush(stdout);
+            std::fprintf(stderr, "%s: every task waits, and no event wakes one (%.6f s of guest time)\n", who,
+                         (double)pf_now() / 1e9);
+            std::exit(3);
+        }
+        if (g_pf_trace)
+            pf_log("        (every task waits: %.6f s to %.6f s)\n", (double)from / 1e9, (double)pf_now() / 1e9);
+    }
     Task* t = g_ready.front();
     g_ready.erase(g_ready.begin());
     return t;
@@ -113,8 +129,7 @@ static Task* take_ready() {
 // The current task waits (WaitSignal): the highest ready task runs until this one is woken.
 static void block() {
     set_flags(g_running, TASK_WAITING, TASK_READY);
-    if (g_ready.empty()) nothing_runs(name(g_running));
-    switch_to(take_ready());
+    switch_to(take_ready(name(g_running)));
 }
 
 // A thread's host thread: its turn, then its function from the registers CreateTask left in its
@@ -129,7 +144,7 @@ static void run_task(Task* t) {
     for (int i = 0; i < 13; ++i) c.r[i] = pf_r32(t->node + T_REGS + 4u * i);
     c.r[13] = pf_r32(t->node + T_SP);
     c.r[14] = kThreadExit;
-    c.budget = 1 << 20;
+    c.budget = PF_POLL_EVERY;
     try {
         arm_call(c, pf_r32(t->node + T_PC));
         if (c.pc != kThreadExit) arm_fault(c, c.pc, "a thread returned somewhere other than the kernel");
@@ -139,8 +154,7 @@ static void run_task(Task* t) {
     }
     t->dead = true;
     set_flags(t, 0, TASK_READY | TASK_WAITING);
-    if (g_ready.empty()) nothing_runs(name(t));
-    switch_to(take_ready());
+    switch_to(take_ready(name(t)));
 }
 
 // ---- the switch at the end of an OS call (0x104fc) -----------------------------------------
@@ -149,7 +163,7 @@ static void run_task(Task* t) {
 void pf_task_reschedule() {
     if (!g_reschedule || g_ready.empty()) return;
     if (pri(g_running) > pri(g_ready.front())) return;
-    Task* next = take_ready();
+    Task* next = take_ready(name(g_running));
     make_ready(g_running);
     switch_to(next);
 }
@@ -157,13 +171,14 @@ void pf_task_reschedule() {
 // ---- signals ----------------------------------------------------------------------------------
 // The kernel's own signal (0x19c70): bits the task has not allocated are refused; otherwise they
 // join t_SigBits, and a task waiting for any of them is made ready -- with a reschedule when its
-// priority is above the current task's.
+// priority is above the current task's. (The current task itself is waiting only while the clock
+// moves on for it, in take_ready.)
 int32_t pf_signal(uint32_t node, uint32_t bits) {
     if (bits & ~pf_r32(node + T_ALLOCATEDSIGS)) return (int32_t)KERR_ILLEGALSIGNAL;
     uint32_t sig = pf_r32(node + T_SIGBITS) | bits;
     pf_w32(node + T_SIGBITS, sig);
     Task* t = find(node);
-    if (t && t != g_running && (pf_r8(node + 11) & TASK_WAITING) && (sig & pf_r32(node + T_WAITBITS))) {
+    if (t && (pf_r8(node + 11) & TASK_WAITING) && (sig & pf_r32(node + T_WAITBITS))) {
         make_ready(t);
         if (pri(g_running) < pri(t)) g_reschedule = true;
     }
@@ -173,35 +188,37 @@ int32_t pf_signal(uint32_t node, uint32_t bits) {
 // swi 0x10015: int32 AllocSignal(int32 sigs) -- 0 asks for one: the highest free bit from bit 30
 // down, cleared in t_SigBits (0 when every bit is taken). Otherwise those bits, which may not be
 // the system's (0-7) or bit 31, and 0 if any of them is already allocated.
-static void k_allocsignal(ArmCpu& c) {
-    uint32_t task = pf_current_task(), have = pf_r32(task + T_ALLOCATEDSIGS), want = c.r[0];
+uint32_t pf_alloc_signal(uint32_t want) {
+    uint32_t task = pf_current_task(), have = pf_r32(task + T_ALLOCATEDSIGS);
     if (want) {
-        if (want & 0x800000FFu) c.r[0] = KERR_ILLEGALSIGNAL;
-        else if (want & have) c.r[0] = 0;
-        else pf_w32(task + T_ALLOCATEDSIGS, have | want);
-        return;
+        if (want & 0x800000FFu) return KERR_ILLEGALSIGNAL;
+        if (want & have) return 0;
+        pf_w32(task + T_ALLOCATEDSIGS, have | want);
+        return want;
     }
-    if (have == 0x7FFFFFFFu) { c.r[0] = 0; return; }
+    if (have == 0x7FFFFFFFu) return 0;
     uint32_t bit = 0x40000000u;
     while (bit & have) bit >>= 1;
     pf_w32(task + T_ALLOCATEDSIGS, have | bit);
     pf_w32(task + T_SIGBITS, pf_r32(task + T_SIGBITS) & ~bit);
-    c.r[0] = bit;
+    return bit;
 }
+static void k_allocsignal(ArmCpu& c) { c.r[0] = pf_alloc_signal(c.r[0]); }
 
 // swi 0x10016: Err FreeSignal(int32 sigs) -- allocated bits only, not the system's.
-static void k_freesignal(ArmCpu& c) {
+int32_t pf_free_signal(uint32_t sigs) {
     uint32_t task = pf_current_task(), have = pf_r32(task + T_ALLOCATEDSIGS);
-    if ((c.r[0] & 0x800000FFu) || (c.r[0] & ~have)) { c.r[0] = KERR_ILLEGALSIGNAL; return; }
-    pf_w32(task + T_ALLOCATEDSIGS, have & ~c.r[0]);
-    c.r[0] = 0;
+    if ((sigs & 0x800000FFu) || (sigs & ~have)) return (int32_t)KERR_ILLEGALSIGNAL;
+    pf_w32(task + T_ALLOCATEDSIGS, have & ~sigs);
+    return 0;
 }
+static void k_freesignal(ArmCpu& c) { c.r[0] = (uint32_t)pf_free_signal(c.r[0]); }
 
 // swi 0x10001: int32 WaitSignal(int32 sigs) -- allocated bits only; SIGF_ABORT is always waited
 // for too. The bits that came, cleared from t_SigBits; when none has yet, the task waits.
-static void k_waitsignal(ArmCpu& c) {
-    uint32_t task = pf_current_task(), sigs = c.r[0];
-    if (sigs & ~pf_r32(task + T_ALLOCATEDSIGS)) { c.r[0] = KERR_ILLEGALSIGNAL; return; }
+int32_t pf_wait_signal(uint32_t sigs) {
+    uint32_t task = pf_current_task();
+    if (sigs & ~pf_r32(task + T_ALLOCATEDSIGS)) return (int32_t)KERR_ILLEGALSIGNAL;
     sigs |= SIGF_ABORT;
     if (!(pf_r32(task + T_SIGBITS) & sigs)) {
         pf_w32(task + T_WAITBITS, sigs);
@@ -209,8 +226,9 @@ static void k_waitsignal(ArmCpu& c) {
     }
     uint32_t got = pf_r32(task + T_SIGBITS) & sigs;
     pf_w32(task + T_SIGBITS, pf_r32(task + T_SIGBITS) & ~got);
-    c.r[0] = got;
+    return (int32_t)got;
 }
+static void k_waitsignal(ArmCpu& c) { c.r[0] = (uint32_t)pf_wait_signal(c.r[0]); }
 
 // swi 0x10002: Err SendSignal(Item task, int32 sigs) -- 0 is the caller; the system's bits only
 // from a privileged task, bit 31 never. The kernel's signal's own refusal is not passed on: 0.

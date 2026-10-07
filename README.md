@@ -141,7 +141,7 @@ both discs:
 | 2. Extract | Turn standard formats into standard files | `disc --extract`, `cel` (every depth and coding, PLUTA, the hardware's transparency, `IMAG`), `stream`, `cinepak`, `audio` (SDX2, AIFF/AIFC, loops), `dsp`, `pixels` | the streamed-cel subscriber (`SCEL`); AIF decompression |
 | 3. Map code | What does the code do, where? | `arm` (functions, calls, tail calls, references, control flow, symbols, the compiler's embedded names), `portfolio` (SWIs and folio vectors, attributed and named), `sdk` (the SDK's names for every SWI and slot), `aof` (the SDK's ARM Object Format libraries), `shapes` (library proved against a corpus; two programs paired, names carried, a data map) | a corpus from the SDK's own libraries for `shapes` |
 | 4. Translate | Turn ARM60 code into C | `arm60` (the instruction set, ARMv3 exactly), `armemu` (an ARM60 interpreter: the reference), `recomp.discover` (functions, code and data, switches, indirect transfers), `recomp.emit` and `python -m 3dokit.recomp` (C++ per function, a module per program), `recomp.selftest` (the interpreter records, the C++ replays) | flags only where read; literal pools folded; returns that are not to their call (longjmp) |
-| 5. Runtime | What an engine links | `runtime/` (C99): `tdk_opera` (files out of a disc image), `tdk_cel` (cels to RGBA), `tdk_stream` (DataStream, Cinepak with an optional dither, SDX2); `tdkcheck`. For recompiled code (C++20): `arm60.h` (the CPU, memory, the shifter and the flags), `arm_core` (dispatch, the return check), `arm_stub` (no OS: the self-test), `arm_selftest`; `pf` (Portfolio's frame: the boot, the OS's memory above VRAM, folio tables of traps, SWI and slot dispatch by the SDK's names, the trace; items, lists, the memory lists and their allocator, devices, IOReqs, `SendIO` and `CompleteIO`, the SPORT device, the Graphics folio's node, its system VDLs and its screen groups, the audio folio's templates, instruments, knobs and samples, the kernel's `vfprintf` writing through the program's own `putc`, the disc as a host directory, threads -- each on a host thread, one running at a time -- with signals and the kernel's priority switch) and `pfboot`; `pfcheck` (the runtime against the 1993 OS's own code: the kernel's allocator, any one Graphics call) | Portfolio's functions: time (the timer, the audio clock, the vertical blank), the audio folio's playback (a native mixer for its instruments), the display, messages, tasks, the timer and CD devices, the File folio's files; the CEL engine proper: quads, PIXC, the pixel processor |
+| 5. Runtime | What an engine links | `runtime/` (C99): `tdk_opera` (files out of a disc image), `tdk_cel` (cels to RGBA), `tdk_stream` (DataStream, Cinepak with an optional dither, SDX2); `tdkcheck`. For recompiled code (C++20): `arm60.h` (the CPU, memory, the shifter and the flags), `arm_core` (dispatch, the return check), `arm_stub` (no OS: the self-test), `arm_selftest`; `pf` (Portfolio's frame: the boot, the OS's memory above VRAM, folio tables of traps, SWI and slot dispatch by the SDK's names, the trace; items, lists, the memory lists and their allocator, devices, IOReqs, `SendIO` and `CompleteIO`, the SPORT device, the Graphics folio's node, its system VDLs and its screen groups, the audio folio's templates, instruments, knobs and samples, the kernel's `vfprintf` writing through the program's own `putc`, the disc as a host directory, threads -- each on a host thread, one running at a time -- with signals and the kernel's priority switch, semaphores, the guest's clock and its events: the vertical blank, the timer device, the audio clock) and `pfboot`; `pfcheck` (the runtime against the 1993 OS's own code: the kernel's allocator, any one Graphics call) | Portfolio's functions: the audio folio's cues and playback (a native mixer for its instruments), the display, messages, tasks, the kernel's quantum, the timer's microseconds, the CD device, the File folio's files and streams, running in real time; the CEL engine proper: quads, PIXC, the pixel processor |
 
 ## Principles
 
@@ -223,9 +223,11 @@ both discs:
   read but stop), `AddScreenGroup`, `Enable`/`DisableHAVG` and `VAVG`, and
   the kernel's `CheckItem`; devices and IOReqs as the 1993 kernel makes and
   runs them (`CreateSizedItem` of an IOReq, `SendIO`, `CompleteIO`,
-  `SIGF_IODONE`), and the SPORT device, whose driver is not on the disc (the
-  console's ROM brings it) and is written from the SDK's documentation, its
-  copies and clones done at once rather than at the vertical blank; the
+  `SIGF_IODONE`), and the SPORT and timer devices, whose drivers are not on
+  the disc (the console's ROM brings them) and are written from the SDK's
+  documentation -- SPORT's copies and clones at the vertical blank, the
+  timer's vertical-blank unit (`TIMERCMD_DELAY`, `_DELAYUNTIL`), a driver
+  that queues a request clearing `IO_QUICK` as the kernel leaves it to; the
   kernel's `vfprintf` (the C library's printf core, every character
   through the program's own `putc`) and `ItemOpened`; and the audio
   folio's items as the 1993 folio makes and checks them -- `LoadInsTemplate`
@@ -239,9 +241,19 @@ both discs:
   `FreeSignal`, `WaitSignal`, `SendSignal`, `Yield`, `SetItemPri` on a task,
   and the switch the kernel makes as an OS call returns, by priority -- not
   yet its quantum timer, so equal priorities take turns only when one
-  waits or yields. Crash 'n Burn's `launchme` starts its sound thread, which
-  waits for its signal, and stops at the audio folio's clock
-  (`OwnAudioClock`): time comes next. The
+  waits or yields; semaphores (`LockItem`, `UnlockItem`) as the 1993 kernel
+  makes and locks them; and time: a guest clock of its own, moved on by a
+  fixed amount at each safe point of the recompiled code and jumping ahead
+  when every task waits, so a run is the same on any host, with events
+  standing for the interrupts -- the vertical blank (GRAPHIX's
+  `gf_VBLNumber`, SPORT, the timer) and the audio clock as the 1993 folio
+  keeps it (`OwnAudioClock`, `DisownAudioClock`, `GetAudioTime`,
+  `GetAudioRate`, `GetAudioDuration`, `SetAudioRate`, `SetAudioDuration`,
+  Operamath's `DivUF16` checked against its code) -- a higher-priority task
+  they make ready running at once, as when the interrupt returns.
+  Crash 'n Burn's `launchme` sets its audio clock to 128 Hz and stops at the
+  File folio's first stream (`OpenDiskStream`); Immercenary's `p` waits out
+  its 47 vertical blanks. The
   emitter computes every flag it sets
   (no liveness pass yet), reads literal pools from memory rather than
   folding them, and a return to anywhere but its call's next word stops

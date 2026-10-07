@@ -286,9 +286,97 @@ uint32_t pf_check_item(int32_t item, int subsys, int type) {
 
 static void k_checkitem(ArmCpu& c) { c.r[0] = pf_check_item((int32_t)c.r[0], (int)c.r[1], (int)c.r[2]); }
 
+// ---- semaphores ------------------------------------------------------------------------------
+// A Semaphore (semaphore.h, and the 1993 kernel's own accesses): its ItemNode, sem_bit (+0x24,
+// swapped to take it), sem_Owner (+0x28, the locking task's item, -1 when free), sem_NestCnt
+// (+0x2c) and the list of waiters (+0x30): 0x50 bytes. A waiter is a SemaphoreWaitNode
+// (KERNELNODE, type 8; swn_sig +0x10, swn_Task +0x14, the task's item), which the kernel builds on
+// its stack and the runtime in the OS's memory, one per task.
+enum : uint32_t {
+    SEMAPHORENODE = 7, SEMWAITNODE = 8, SEM_SIZE = 0x50, SEM_BIT = 0x24, SEM_OWNER = 0x28,
+    SEM_NESTCNT = 0x2c, SEM_WAITERS = 0x30, SWN_SIG = 0x10, SWN_TASK = 0x14, SWN_SIZE = 0x20,
+    SEM_WAIT = 1,
+};
+
+// The kernel's semaphore creation (0x13960): the waiters' list, no owner. The kernel also puts it
+// on KernelBase's list of semaphores, which the runtime does not keep (pf_task.cpp).
+int32_t pf_semaphore_new(const char* name) {
+    uint32_t n = pf_os_alloc(SEM_SIZE);
+    pf_w32(n + 12, SEM_SIZE);
+    int32_t item = pf_item_new(n, 1, SEMAPHORENODE, name);
+    pf_list_init(n + SEM_WAITERS, "Semaphore WaitQ");
+    pf_w32(n + SEM_OWNER, 0xFFFFFFFFu);
+    return item;
+}
+
+static std::map<int32_t, uint32_t> g_wait_nodes;    // a task's SemaphoreWaitNode
+
+// swi 0x10007: int32 LockItem(Item s, uint32 flags) -- 0x13ad0 and 0x139c8: a semaphore, else
+// BADITEM; flags SEM_WAIT only, else BADTAGVAL. A free semaphore is taken (1); one the task holds
+// is taken again (1, its count up); one another task holds is 0 without SEM_WAIT, else the task
+// waits on a signal of its own (ABORTED if SIGF_ABORT came instead), and then holds it (1).
+int32_t pf_lock_item(int32_t item, uint32_t flags) {
+    uint32_t s = pf_check_item(item, 1, SEMAPHORENODE);
+    if (!s) return (int32_t)0xD57B9001u;
+    if (flags & ~SEM_WAIT) return (int32_t)0xD57B9117u;
+    int32_t me = task_item();
+    if (pf_r32(s + SEM_BIT)) {
+        if ((int32_t)pf_r32(s + SEM_OWNER) == me) {
+            pf_w32(s + SEM_NESTCNT, pf_r32(s + SEM_NESTCNT) + 1);
+            return 1;
+        }
+        if (!(flags & SEM_WAIT)) return 0;
+        uint32_t& w = g_wait_nodes[me];
+        if (!w) w = pf_os_alloc(SWN_SIZE);
+        pf_w8(w + 8, 1);
+        pf_w8(w + 9, SEMWAITNODE);
+        pf_w32(w + SWN_TASK, (uint32_t)me);
+        uint32_t sig = pf_alloc_signal(0);
+        if (!sig) return -2;
+        pf_w32(w + SWN_SIG, sig);
+        pf_list_add_tail(s + SEM_WAITERS, w);
+        int32_t got = pf_wait_signal(sig);
+        pf_free_signal(sig);
+        if (got & 4) return (int32_t)0xD57B900Au;          // SIGF_ABORT: ABORTED
+    }
+    pf_w32(s + SEM_BIT, 1);
+    pf_w32(s + SEM_NESTCNT, 1);
+    pf_w32(s + SEM_OWNER, (uint32_t)me);
+    return 1;
+}
+
+// swi 0x10006: Err UnlockItem(Item s) -- 0x13b90 and 0x13b30: a semaphore the task holds (else
+// BADITEM, NOTOWNER); its count down, and at 0 the first waiter is signalled and holds it, or it
+// is free.
+int32_t pf_unlock_item(int32_t item) {
+    uint32_t s = pf_check_item(item, 1, SEMAPHORENODE);
+    if (!s) return (int32_t)0xD57B9001u;
+    if ((int32_t)pf_r32(s + SEM_OWNER) != task_item()) return (int32_t)0xD57B9012u;
+    uint32_t count = pf_r32(s + SEM_NESTCNT) - 1;
+    pf_w32(s + SEM_NESTCNT, count);
+    if (count) return 0;
+    uint32_t first = pf_r32(s + SEM_WAITERS + PF_LIST_HEAD);
+    if (first == s + SEM_WAITERS + PF_LIST_TAIL) {
+        pf_w32(s + SEM_BIT, 0);
+        pf_w32(s + SEM_OWNER, 0xFFFFFFFFu);
+        return 0;
+    }
+    pf_list_rem_node(first);
+    int32_t waiter = (int32_t)pf_r32(first + SWN_TASK);
+    pf_signal(pf_item_node(waiter), pf_r32(first + SWN_SIG));
+    pf_w32(s + SEM_OWNER, (uint32_t)waiter);
+    return 0;
+}
+
+static void k_lockitem(ArmCpu& c) { c.r[0] = (uint32_t)pf_lock_item((int32_t)c.r[0], c.r[1]); }
+static void k_unlockitem(ArmCpu& c) { c.r[0] = (uint32_t)pf_unlock_item((int32_t)c.r[0]); }
+
 void pf_kernel_init() {
     g_items.assign(1, 0);
     g_opened.clear();
+    g_wait_nodes.clear();
+    pf_on_swi(0x10006, k_unlockitem);
+    pf_on_swi(0x10007, k_lockitem);
     pf_on_swi(0x1000e, k_kprintf);
     pf_on_swi(0x10004, k_finditem);
     pf_on_swi(0x10005, k_openitem);

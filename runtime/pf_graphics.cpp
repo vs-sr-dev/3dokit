@@ -48,8 +48,18 @@ static uint32_t grey_ramp(uint32_t a, int from) {
 static void graphics_slots();
 static void system_vdls();
 
+// GRAPHIX's FIRQ at the vertical blank (0x50b4, "Graphics FIRQ", interrupt 1, priority 250):
+// gf_VBLNumber up by 1, with bit 0 then set in an odd field (the field bit of CLIO's 0x3400034),
+// which keeps it even in even fields as the fields alternate; then the field's VDL into the
+// display link, which the runtime does not show yet.
+static void graphics_vbl(uint64_t) {
+    uint32_t g = pf_folio_base(PF_GRAPHICS);
+    pf_w32(g + GF_VBLNUMBER, pf_r32(g + GF_VBLNUMBER) + 1);
+}
+
 void pf_graphics_init() {
     graphics_slots();
+    pf_on_vbl(graphics_vbl);
     uint32_t g = pf_folio_base(PF_GRAPHICS), kl = pf_kernel_lists();
     uint32_t page = pf_page_size(MEMTYPE_VRAM);             // the VRAM page, 2 KB
     pf_w32(g + GF_VBLNUMBER, 0);

@@ -184,8 +184,6 @@ void arm_call_unknown(ArmCpu& c, uint32_t addr) {
     arm_fault(c, addr, "a call to an address that is no function's entry and no OS trap");
 }
 
-void arm_poll(ArmCpu& c) { c.budget = 1 << 20; }
-
 static const uint32_t kGuestReturn = 0xFFFFFFE0u;      // where a call from the OS returns
 
 uint32_t pf_guest_call(const ArmCpu& c, uint32_t fn, uint32_t r0, uint32_t r1, uint32_t r2, uint32_t r3) {
@@ -257,6 +255,7 @@ int pf_boot(const uint8_t* image, size_t size, uint32_t bss_end) {
     arm_activate(m);
     build_folios();
     pf_on_swi(0x11, pf_exit_swi);
+    pf_time_init();
     pf_kernel_init();
     pf_mem_init(m->name, bss_end, kStackBase);
     pf_task_init();
@@ -285,7 +284,7 @@ int pf_run(const uint8_t* image, size_t size, uint32_t bss_end, uint32_t entry) 
     c.r[13] = 0x00200000u - 16;                 // the stack: the top of DRAM
     c.r[10] = kStackBase;                       // sl, 64 KB below
     c.r[14] = kExitSentinel;
-    c.budget = 1 << 20;
+    c.budget = PF_POLL_EVERY;
     pf_log("boot %s: entry %08X, KernelBase %08X, bss to %08X\n", m->name, entry, c.r[7], bss_end);
     try {
         arm_call(c, entry);

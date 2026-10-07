@@ -399,11 +399,106 @@ static void a_connectinstruments(ArmCpu& c) {
     c.r[0] = 0;
 }
 
+// ---- the audio clock --------------------------------------------------------------------------
+// The DSP counts sample frames down from head.dsp's CountDown knob and interrupts at 0; the
+// folio's handler (0x3e90, the FIRQ "AudioTimer" on interrupt 11) adds 1 to the audio time and,
+// when a wake-up is due, signals its daemon, which runs the timer list (0x460c). Ticks are
+// GetAudioDuration() frames of 44,100 Hz apart: 184 from the start (the daemon's SetAudioRate of
+// 240 Hz, 0x45b0); a new duration counts from the next tick, as the DSP reloads its counter only
+// at 0. The folio keeps its clock in its node, and so does the runtime: the time (+0x9c), the
+// semaphores that guard its timer list (+0xd0) and its rate (+0xd8, the clock's owner), the
+// duration (+0xe0). Not made: head.dsp's instrument and its CountDown knob (+0xd4), which the
+// folio tweaks with each new duration -- a tweak that cannot fail or clamp within the durations
+// SetAudioDuration lets through.
+enum : uint32_t {
+    AF_TIME = 0x9c, AF_TIMERLIST = 0xb0, AF_LISTSEM = 0xd0, AF_RATESEM = 0xd8, AF_DURATION = 0xe0,
+    AF_ERR_INUSE = 0xD52BF10Fu, AF_ERR_OUTOFRANGE = 0xD52BF117u,
+};
+static const uint32_t kDefaultRate = 240u << 16;
+static uint64_t g_tick_frame;                   // the sample frame of the next tick, from the boot
+
+static uint32_t folio() { return pf_folio_base(PF_AUDIO); }
+
+// Operamath's DivUF16 (its slot -12, 0x2420), which the folio calls for its rates: (n << 16) / d,
+// or 0xFFFFFFFF when that does not fit in 32 bits or d is 0. Checked against the 1993 code.
+static uint32_t div_uf16(uint32_t n, uint32_t d) {
+    if (!d) return 0xFFFFFFFFu;
+    uint64_t q = ((uint64_t)n << 16) / d;
+    return q > 0xFFFFFFFFu ? 0xFFFFFFFFu : (uint32_t)q;
+}
+
+static void tick(uint64_t) {
+    pf_w32(folio() + AF_TIME, pf_r32(folio() + AF_TIME) + 1);
+    g_tick_frame += pf_r32(folio() + AF_DURATION);
+    pf_at((g_tick_frame * 1000000000ull + 44099) / 44100, tick);
+}
+
+// swi 0x40010: Err SetAudioDuration(Item owner, uint32 frames) -- 0x435c: the owner must be the
+// clock's semaphore (else AF_ERR_INUSE); 44 to 32767 frames (else AF_ERR_OUTOFRANGE).
+static uint32_t set_duration(uint32_t owner, uint32_t frames) {
+    if (owner != pf_r32(folio() + AF_RATESEM)) return AF_ERR_INUSE;
+    if (frames < 0x2c || frames > 0x7fff) return AF_ERR_OUTOFRANGE;
+    pf_w32(folio() + AF_DURATION, frames);
+    return 0;
+}
+static void a_setaudioduration(ArmCpu& c) { c.r[0] = set_duration(c.r[0], c.r[1]); }
+
+// swi 0x4000f: Err SetAudioRate(Item owner, frac16 rate) -- 0x43fc: the duration 44100 / rate,
+// rounded (as frac16, then (q + 0x8000) >> 16, arithmetic), then SetAudioDuration's checks.
+static uint32_t set_rate(uint32_t owner, uint32_t rate) {
+    uint32_t q = div_uf16(44100u << 16, rate);
+    return set_duration(owner, (uint32_t)((int32_t)(q + 0x8000u) >> 16));
+}
+static void a_setaudiorate(ArmCpu& c) { c.r[0] = set_rate(c.r[0], c.r[1]); }
+
+// audio -60: frac16 GetAudioRate(void) -- 0x4450: 44100 / the duration, as frac16.
+static void a_getaudiorate(ArmCpu& c) { c.r[0] = div_uf16(44100u << 16, pf_r32(folio() + AF_DURATION) << 16); }
+// audio -64: uint32 GetAudioDuration(void) -- 0x4540.
+static void a_getaudioduration(ArmCpu& c) { c.r[0] = pf_r32(folio() + AF_DURATION); }
+// audio -168: AudioTime GetAudioTime(void) -- 0x4440.
+static void a_getaudiotime(ArmCpu& c) { c.r[0] = pf_r32(folio() + AF_TIME); }
+
+// audio -76: Item OwnAudioClock(void) -- 0x448c: the folio open; LockItem of the rate's semaphore
+// without waiting: the semaphore's item, else AF_ERR_INUSE.
+static void a_ownaudioclock(ArmCpu& c) {
+    if (!audio_open()) { c.r[0] = AF_ERR_AUDIOCLOSED; return; }
+    uint32_t sem = pf_r32(folio() + AF_RATESEM);
+    c.r[0] = pf_lock_item((int32_t)sem, 0) > 0 ? sem : AF_ERR_INUSE;
+}
+
+// audio -80: Err DisownAudioClock(Item owner) -- 0x4510: the rate's semaphore (else
+// AF_ERR_BADITEM), unlocked.
+static void a_disownaudioclock(ArmCpu& c) {
+    uint32_t sem = pf_r32(folio() + AF_RATESEM);
+    c.r[0] = c.r[0] != sem ? AF_ERR_BADITEM : (uint32_t)pf_unlock_item((int32_t)sem);
+}
+
+// What the folio's start (0x3f08) and its daemon's (0x4550) leave: the time at 0, the timer list,
+// the two semaphores, the clock at 240 Hz, and the first tick a duration from the boot.
+static void clock_init() {
+    uint32_t f = folio();
+    pf_w32(f + AF_TIME, 0);
+    pf_w32(f + AF_LISTSEM, (uint32_t)pf_semaphore_new("AFTimerListSem4"));
+    pf_w32(f + AF_RATESEM, (uint32_t)pf_semaphore_new("AFTimerRateSem4"));
+    pf_list_init(f + AF_TIMERLIST, "AudioTimer");
+    pf_w32(f + AF_DURATION, (uint32_t)((int32_t)(div_uf16(44100u << 16, kDefaultRate) + 0x8000u) >> 16));
+    g_tick_frame = pf_r32(f + AF_DURATION);
+    pf_at((g_tick_frame * 1000000000ull + 44099) / 44100, tick);
+}
+
 void pf_audio_init() {
     g_templates.clear();
     g_instruments.clear();
     g_knobs.clear();
     g_samples.clear();
+    clock_init();
+    pf_on_slot(PF_AUDIO, -60, a_getaudiorate);
+    pf_on_slot(PF_AUDIO, -64, a_getaudioduration);
+    pf_on_slot(PF_AUDIO, -76, a_ownaudioclock);
+    pf_on_slot(PF_AUDIO, -80, a_disownaudioclock);
+    pf_on_slot(PF_AUDIO, -168, a_getaudiotime);
+    pf_on_swi(0x4000f, a_setaudiorate);
+    pf_on_swi(0x40010, a_setaudioduration);
     pf_on_create(NST_AUDIO, audio_create);
     pf_on_slot(PF_AUDIO, -4, a_loadinstemplate);
     pf_on_slot(PF_AUDIO, -8, a_allocinstrument);

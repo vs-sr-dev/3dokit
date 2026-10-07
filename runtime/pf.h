@@ -168,12 +168,41 @@ void     pf_task_init();
 void     pf_task_reschedule();
 uint32_t pf_create_task(ArmCpu& c, uint32_t tags);  // CreateSizedItem of a TASKNODE
 
+// Time (pf_time.cpp): the guest's clock, in nanoseconds since the boot. It is not the host's:
+// it moves on by a fixed amount at each safe point the recompiled code passes (backward branches
+// and calls, ARM_POLL), and when every task waits it jumps to the next event. So a run is the
+// same every time, however fast the host is. An event is what an interrupt does on the console
+// (the vertical blank, the audio clock's tick): at its time, at the next safe point or as the
+// waiting tasks idle, it runs and may signal tasks, and a higher-priority task made ready then
+// runs at once, as it would when the interrupt returns.
+typedef void (*PfTimeFn)(uint64_t when);
+enum : int32_t { PF_POLL_EVERY = 64 };              // safe points between two calls of arm_poll
+extern uint64_t g_pf_safe_point_ns;                 // the guest time a safe point stands for
+void     pf_time_init();
+uint64_t pf_now();
+void     pf_at(uint64_t when, PfTimeFn fn);         // fn(when) at that time (or now, if past)
+// Every task waits: the clock jumps to the next event and runs it. False when, after 10 s of
+// guest time, no event has made a task ready (or there is no event at all).
+bool     pf_time_idle(bool (*someone_ready)());
+// The vertical blank: 59.94 fields a second (NTSC), each one running these, in this order.
+void     pf_on_vbl(PfTimeFn fn);
+
+// Semaphores (pf_kernel.cpp), as the 1993 kernel makes and locks them (os_code 0x13960,
+// 0x139c8, 0x13b30): a node of semaphore.h's layout and its item.
+int32_t  pf_semaphore_new(const char* name);
+int32_t  pf_lock_item(int32_t item, uint32_t flags);   // LockItem: 1 locked, 0 not (no wait), or an Err
+int32_t  pf_unlock_item(int32_t item);                 // UnlockItem
+
 // Devices and IOReqs (pf_io.cpp). A device is a node of devices.h's layout with an item; its
 // driver is a native function that starts an IOReq and calls pf_complete_io when it is done.
 typedef void (*PfDispatchIO)(uint32_t ior);
 uint32_t pf_device_new(const char* name, int max_unit, PfDispatchIO dispatch);
 void     pf_complete_io(uint32_t ior);
 int32_t  pf_signal(uint32_t task, uint32_t bits);   // the kernel's own SendSignal (pf_task.cpp)
+// The current task's AllocSignal, FreeSignal and WaitSignal (pf_task.cpp), for the OS's own use.
+uint32_t pf_alloc_signal(uint32_t sigs);
+int32_t  pf_free_signal(uint32_t sigs);
+int32_t  pf_wait_signal(uint32_t sigs);
 
 // Files (pf_file.cpp). The disc is a directory on the host, `g_pf_disc_root` (pfboot: the
 // program's own directory unless --disc says otherwise); a program's path, absolute or from its

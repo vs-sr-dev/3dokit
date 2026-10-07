@@ -9,7 +9,8 @@ set(_rt ${CMAKE_CURRENT_LIST_DIR})
 add_library(tdk_arm_core OBJECT ${_rt}/arm_core.cpp)
 add_library(tdk_arm_stub OBJECT ${_rt}/arm_stub.cpp)
 add_library(tdk_pf OBJECT ${_rt}/pf_os.cpp ${_rt}/pf_kernel.cpp ${_rt}/pf_mem.cpp ${_rt}/pf_io.cpp ${_rt}/pf_file.cpp
-            ${_rt}/pf_graphics.cpp ${_rt}/pf_audio.cpp ${_rt}/pf_task.cpp ${_rt}/pf_memtest.cpp)
+            ${_rt}/pf_graphics.cpp ${_rt}/pf_audio.cpp ${_rt}/pf_task.cpp ${_rt}/pf_time.cpp
+            ${_rt}/pf_memtest.cpp)
 find_package(Threads REQUIRED)
 target_link_libraries(tdk_pf PUBLIC Threads::Threads)    # a host thread per task (pf_task.cpp)
 foreach(t tdk_arm_core tdk_arm_stub tdk_pf)
