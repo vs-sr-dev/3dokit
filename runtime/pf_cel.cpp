@@ -120,9 +120,14 @@ uint32_t decode(ArmCpu& c, const Cel& cel, uint32_t v, uint32_t& amv) {
 
 // The pixel processor, one P-mode (a half of PIXC) on each 5-bit component: the primary source
 // (1S: the decoded pixel or the frame buffer's) times the multiplier (MS 00: MF + 1; 01: the
-// pixel's AMV + 1), shifted down by the divider (DF: 16, 2, 4, 8), plus the secondary source (2S:
+// pixel's AMV + 1; 10 and 11: the decoded pixel's own component, its top three bits + 1),
+// shifted down by the divider (DF: 16, 2, 4, 8; with MS 10 the component's low two bits read the
+// same way), plus the secondary source (2S:
 // 0, AV, the frame buffer's, the pixel's), then halved when 2D is set, then held within 0 to 31.
-// Each stage drops its fraction (Opera; the guide gives no rounding).
+// Each stage drops its fraction (Opera; the guide gives no rounding). MS 10 and 11 are Opera's
+// (PPROC): the guide's PIXC section says the other way round -- the colour's *bottom* three bits
+// the multiplier, its top two the divider -- which makes a component's scale jump about with its
+// lowest bits; Opera's top bits give a smooth curve (MS 11 with DF 8: about c * c / 32).
 //
 // With the CCB's USEAV the AV bits are controls instead (the guide's table 4, chapter 5): bits 4-3
 // the secondary source's divider (1, 2, 4; 3, the decoder's low bits, stops), bit 2 the output
@@ -135,7 +140,6 @@ uint32_t decode(ArmCpu& c, const Cel& cel, uint32_t v, uint32_t& amv) {
 uint32_t ppmp(ArmCpu& c, uint32_t mode, uint32_t pix, uint32_t fb, uint32_t amv, uint32_t flags) {
     uint32_t s1 = mode >> 15 & 1, ms = mode >> 13 & 3, mf = mode >> 10 & 7, df = mode >> 8 & 3,
              s2 = mode >> 6 & 3, av = mode >> 1 & 31, d2 = mode & 1;
-    if (ms >= 2) pf_stop(c, "the cel engine: a multiplier from the pixel's colour (PIXC MS 10, 11): not yet");
     bool useav = flags & CCB_USEAV, pxor = flags & CCB_PXOR;
     uint32_t sdv = useav ? av >> 3 : 0;
     bool nowrapguard = useav && (av & 4), xtend = useav && (av & 2), neg = useav && (av & 1);
@@ -146,8 +150,8 @@ uint32_t ppmp(ArmCpu& c, uint32_t mode, uint32_t pix, uint32_t fb, uint32_t amv,
     uint32_t in = s1 ? fb : pix, out = 0;
     for (int k = 0; k < 3; ++k) {
         int sh = 10 - 5 * k;                    // red, green, blue
-        uint32_t m = ms ? (amv >> (6 - 3 * k) & 7) + 1 : mf + 1;
-        int32_t a = (int32_t)(((in >> sh & 31) * m) >> shift[df]);
+        uint32_t pc = pix >> sh & 31, m = ms == 0 ? mf + 1 : ms == 1 ? (amv >> (6 - 3 * k) & 7) + 1 : (pc >> 2) + 1;
+        int32_t a = (int32_t)(((in >> sh & 31) * m) >> shift[ms == 2 ? pc & 3 : df]);
         int32_t b = s2 == 0 ? 0 : s2 == 1 ? (int32_t)av : (int32_t)((s2 == 2 ? fb : pix) >> sh & 31);
         b >>= sdv;
         int32_t bop = neg ? ~b : pxor ? b ^ (a & 31) : b;
