@@ -40,6 +40,13 @@ the runtime's, their nodes and `InitList`'s names taken from where the
 runtime's next own allocation would be; looked up in the runtime's table),
 and `IsItemOpened` (yes). An error path that deletes an item stops the
 check. Only the GRAPHIX of Crash 'n Burn's disc (16 August 1993) is known.
+
+    python -m 3dokit.pfcheck OS_CODE DIR --graphix GRAPHIX [--font-start]
+
+With Doctor Hauzer's GRAPHIX 20.45, a snapshot's call is one of the folio's font calls, run on its
+code where the runtime laid the folio (its image, relocated, is in the snapshot's OS memory at
+0x4E0000), its few kernel calls stood in the runtime's way (`FontCall`); `--font-start` first
+rebuilds the font as the folio's start leaves it and compares that with the memory before.
 """
 import argparse
 import os
@@ -416,6 +423,217 @@ def run_call(os_code, graphix_path, d, out=sys.stdout):
     return got == want and not diffs
 
 
+# ---- GRAPHIX 20.45's font, where the runtime lays the folio --------------------------------
+
+OS_IMAGES = 0x4E0000                     # the runtime's PF_OS_IMAGES: the folio's image, relocated
+
+# GRAPHIX 20.45 (Doctor Hauzer): its tables, the glue by which its font code reaches the kernel's
+# functions, and the font's part of its start. Each checked against the folio's own words.
+G2045 = {
+    'version': (20, 45),
+    'kernelbase': 0x63c8, 'grafbase': 0x6978,
+    'vectors_end': 0x6698,               # slot -4 at 0x6694
+    'swis_end': 0x65d4, 'nswis': 52,     # SWI n at swis_end - 4 * (n + 1)
+    'stack_extend': 0x148,
+    'font_start': 0x3f8c, 'nchars': 49, 'entry_size': 0x2c,
+    'gf_font': (0xd0, 0x120),            # the GrafFolio's font fields
+    'glue': {0x6170: ('InitList', 0x6178, 0xe512f024),
+             0x6180: ('memcpy', 0x6188, 0xe513f038),
+             0x6190: ('AddTail', 0x6198, 0xe512f010),
+             0x61b0: ('RemNode', 0x61b8, 0xe511f018),
+             0x2e0: ('AllocMemFromMemLists', 0x2f0, 0xe519f01c)},
+    'check': {0x666c: 0x3970, 0x6598: 0x3920, 0x6564: 0x3bd8,    # -44, SWIs 14 and 27, unrelocated
+              0x4078: 0x63c8, 0x40f0: 0x7ef8},
+    'drawcels': 0x1954,                  # SWI 39, which DrawChar ends in: not compared here
+}
+
+
+def graphix_version(path):
+    with open(path, 'rb') as f:
+        data = aif.unwrap(f.read())
+    return data[0x94], data[0x95]
+
+
+class FontCall:
+    """GRAPHIX 20.45's font code run where the runtime put the folio (its image is in the OS's
+    memory of the snapshot), over the memory before. No kernel code runs: the folio's few kernel
+    calls are stand-ins made the runtime's way -- InitList (pf_list_init, the caller's name),
+    memcpy, AddTail and RemNode (its list functions), AllocMemFromMemLists (the OS's memory past
+    the folio's image, upward)."""
+
+    def __init__(self, graphix_path, before):
+        with open(graphix_path, 'rb') as f:
+            data = f.read()
+        raw = aif.relocated(data, 0)
+        g = self.g = G2045
+        word = lambda a: struct.unpack_from('>I', raw, a)[0]
+        for a, v in list(g['check'].items()) + [(at, w) for _, at, w in g['glue'].values()]:
+            if word(a) != v:
+                raise KernelError('%s: the word at %#x is not %#x: not GRAPHIX 20.45' % (graphix_path, a, v))
+        self.image = aif.relocated(data, OS_IMAGES)
+        self.entries = OS_IMAGES + ((len(self.image) + 3) & ~3)
+        mem = self.mem = armemu.Memory()
+        mem.add(0, DRAM_VRAM, before[:DRAM_VRAM])
+        mem.add(OS_BASE, OS_SIZE, before[DRAM_VRAM:DRAM_VRAM + OS_SIZE])
+        mem.add(STACK_BASE, STACK_SIZE)
+        cpu = self.cpu = armemu.CPU(mem)
+        self.depth = 0
+        G = OS_IMAGES
+
+        def ret(c, value=None):
+            if value is not None:
+                c.r[0] = value & 0xFFFFFFFF
+            c.r[armemu.PC] = c.r[armemu.LR] & ~3
+
+        def refuse(why):
+            def trap(c):
+                raise KernelError(why)
+            return trap
+
+        def init_list(c):
+            l, name = c.r[0], c.r[1]
+            if not name:
+                raise KernelError('InitList with no name: not stood in')
+            w8(mem, l + 8, 1)
+            w8(mem, l + 9, 2)
+            w8(mem, l + 11, 0x80)
+            w32(mem, l + 12, 0x20)
+            w32(mem, l + 16, name)
+            w32(mem, l + 0x14, l + 0x18)
+            w32(mem, l + 0x18, 0)
+            w32(mem, l + 0x1c, l + 0x14)
+            ret(c)
+
+        def memcpy(c):
+            for i in range(c.r[2]):
+                w8(mem, c.r[0] + i, r8(mem, c.r[1] + i))
+            ret(c, c.r[0])
+
+        def add_tail(c):
+            l, n = c.r[0], c.r[1]
+            at = l + 0x18
+            prev = r32(mem, at + 4)
+            w32(mem, n, at)
+            w32(mem, n + 4, prev)
+            w32(mem, prev, n)
+            w32(mem, at + 4, n)
+            ret(c)
+
+        def rem_node(c):
+            n = c.r[0]
+            nxt, prev = r32(mem, n), r32(mem, n + 4)
+            if nxt:
+                w32(mem, prev, nxt)
+                w32(mem, nxt + 4, prev)
+                w32(mem, n, 0)
+            ret(c)
+
+        def alloc(c):
+            a = self.entries
+            self.entries = (a + c.r[1] + 3) & ~3
+            ret(c, a)
+
+        cpu.traps[G + 0x6170] = init_list
+        cpu.traps[G + 0x6180] = memcpy
+        cpu.traps[G + 0x6190] = add_tail
+        cpu.traps[G + 0x61b0] = rem_node
+        cpu.traps[G + 0x2e0] = alloc
+        cpu.traps[G + g['stack_extend']] = refuse('the folio ran out of stack')
+        cpu.traps[G + g['drawcels']] = refuse('DrawCels: the cel engine is not compared here')
+
+        def on_swi(c, number):
+            n = number - 0x20000
+            if not 0 <= n < g['nswis']:
+                raise KernelError('SWI %#x at %08X' % (number, c.r[armemu.PC] - 4))
+            c.r[0] = self.call(r32(mem, G + g['swis_end'] - 4 * (n + 1)), c.r[0:4])
+
+        cpu.on_swi = on_swi
+
+    def call(self, fn, args):
+        cpu = self.cpu
+        saved = (list(cpu.r), cpu.cpsr)
+        sp = saved[0][armemu.SP] if self.depth else STACK_BASE + STACK_SIZE
+        self.depth += 1
+        try:
+            for i, v in enumerate(args):
+                cpu.r[i] = v & 0xFFFFFFFF
+            cpu.r[10] = STACK_BASE
+            cpu.r[11] = 0
+            cpu.r[armemu.SP] = (sp - 64) & ~7
+            cpu.r[armemu.LR] = armemu.RETURN_SENTINEL
+            cpu.r[armemu.PC] = fn
+            while cpu.r[armemu.PC] != armemu.RETURN_SENTINEL:
+                cpu.step()
+            return cpu.r[0]
+        finally:
+            self.depth -= 1
+            cpu.r[:] = saved[0]
+            cpu.cpsr = saved[1]
+
+    def start(self):
+        """The folio's start, its font part: the image as the loader leaves it (and the words its
+        start writes, KernelBase and GrafBase), the GrafFolio's font fields and the FontEntrys'
+        memory cleared, then 0x3f8c."""
+        g, mem = self.g, self.mem
+        for i, b in enumerate(self.image):
+            w8(mem, OS_IMAGES + i, b)
+        w32(mem, OS_IMAGES + g['kernelbase'], KERNEL_BASE)
+        w32(mem, OS_IMAGES + g['grafbase'], GRAF_BASE)
+        for a in range(GRAF_BASE + g['gf_font'][0], GRAF_BASE + g['gf_font'][1], 4):
+            w32(mem, a, 0)
+        for a in range(self.entries, self.entries + g['nchars'] * g['entry_size'], 4):
+            w32(mem, a, 0)
+        return self.call(OS_IMAGES + g['font_start'], [])
+
+    def slot(self, slot, regs):
+        return self.call(r32(self.mem, OS_IMAGES + self.g['vectors_end'] + slot), regs[0:4])
+
+    def image_now(self):
+        return bytes(self.mem.regions[0][2]) + bytes(self.mem.regions[1][2])
+
+
+def compare(label, got, want, after, mine, out):
+    diffs = [a for a in range(len(after)) if after[a] != mine[a]]
+    print('%s: the folio returns %08X, the runtime %08X; memory after: %d bytes differ'
+          % (label, got, want, len(diffs)), file=out)
+    for a in diffs[:16]:
+        addr = a if a < DRAM_VRAM else OS_BASE + a - DRAM_VRAM
+        print('  %08X  runtime %02X  folio %02X' % (addr, after[a], mine[a]), file=out)
+    return got == want and not diffs
+
+
+def run_font(graphix_path, d, start, out=sys.stdout):
+    """A snapshot's Graphics call on GRAPHIX 20.45; with `start`, first the font as the folio's
+    start leaves it, against the memory before (any snapshot before the first font call)."""
+    with open(os.path.join(d, 'before.bin'), 'rb') as f:
+        before = f.read()
+    with open(os.path.join(d, 'after.bin'), 'rb') as f:
+        after = f.read()
+    with open(os.path.join(d, 'call.txt')) as f:
+        for line in f:
+            w = line.split()
+            if w[0] == 'call':
+                what = w[1:]
+            elif w[0] == 'regs':
+                regs = [int(x, 16) for x in w[1:]]
+            elif w[0] == 'result':
+                want = int(w[1], 16)
+    ok = True
+    try:
+        if start:
+            fc = FontCall(graphix_path, before)
+            got = fc.start()
+            ok &= compare('the font at the start', got, 0, before, fc.image_now(), out)
+        if what[:2] != ['slot', 'Graphics']:
+            raise KernelError('call.txt: %s is not a Graphics slot' % ' '.join(what))
+        fc = FontCall(graphix_path, before)
+        got = fc.slot(int(what[2]), regs)
+    except (KernelError, armemu.MemoryError_, armemu.Unpredictable) as e:
+        print('%s: the folio broke: %s' % (' '.join(what), e), file=out)
+        return False
+    return compare(' '.join(what), got, want, after, fc.image_now(), out) and ok
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(
         prog='python -m 3dokit.pfcheck', description=__doc__,
@@ -423,6 +641,8 @@ def main(argv=None):
     ap.add_argument('os_code', help='System/Kernel/os_code of the disc')
     ap.add_argument('dirs', nargs='+', help="what pfboot --memtest or --snap wrote")
     ap.add_argument('--graphix', help='System/Folios/GRAPHIX of the disc, for a snapshot')
+    ap.add_argument('--font-start', action='store_true',
+                    help='GRAPHIX 20.45: also the font as the folio starts it, against the memory before')
     a = ap.parse_args(argv)
     ok = True
     for d in a.dirs:
@@ -430,7 +650,10 @@ def main(argv=None):
         if os.path.exists(os.path.join(d, 'call.txt')):
             if not a.graphix:
                 ap.error('%s is a snapshot of a call: --graphix is needed' % d)
-            ok &= run_call(a.os_code, a.graphix, d)
+            if graphix_version(a.graphix) == G2045['version']:
+                ok &= run_font(a.graphix, d, a.font_start)
+            else:
+                ok &= run_call(a.os_code, a.graphix, d)
         else:
             ok &= run(a.os_code, d)
     return 0 if ok else 1

@@ -185,6 +185,7 @@ void pf_graphics_init() {
         pf_snap_after(c);
     }
     system_vdls();
+    pf_font_init();
 }
 
 // The system's VDLs (0x41b4), in two blocks of the OS's VRAM. The display's chain is
@@ -652,6 +653,8 @@ static void g_drawcels(ArmCpu& c) {
     pf_cel_draw(c, pf_r32(bm + BM_CECONTROL), regctl, c.r[1]);
     c.r[0] = 0;
 }
+
+void pf_draw_cels(ArmCpu& c) { g_drawcels(c); }
 
 // Graphics -152: Err SetCEControl(Item bitmap, int32 word, int32 mask) -- SWI 41 (0x10e4): the
 // bitmap (CheckItem, else GRAFERR_BADITEM), the caller's or open (else GRAFERR_NOTOWNER); the

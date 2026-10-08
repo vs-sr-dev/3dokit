@@ -45,6 +45,11 @@
 // to its end in turn -- every one of them must be in this build. Each program
 // boots a fresh OS; the guest's clock and the fields counted go on from the
 // last (the pad's fields are the whole run's).
+//
+//     pfboot FILE --unpack OUT
+//
+// writes a compressed System image unpacked by the runtime's own decompressor
+// (pf_aif.cpp): from its base, its header to the end of its relocation list.
 #include "pf.h"
 #include <cstdio>
 #include <cstdlib>
@@ -131,12 +136,26 @@ static int run_program(const std::string& path) {
 }
 
 int main(int argc, char** argv) {
+    if (argc == 4 && !std::strcmp(argv[2], "--unpack")) {
+        std::ifstream f(argv[1], std::ios::binary);
+        std::vector<uint8_t> d((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>()), out;
+        std::string why = pf_aif_unpack(d, out);
+        if (!why.empty()) {
+            std::fprintf(stderr, "%s: %s\n", argv[1], why.c_str());
+            return 2;
+        }
+        std::ofstream o(argv[3], std::ios::binary);
+        o.write((const char*)out.data(), (std::streamsize)out.size());
+        std::printf("%s: %zu bytes\n", argv[3], out.size());
+        return o ? 0 : 2;
+    }
     if (argc < 2) {
         std::fprintf(stderr, "usage: pfboot PROGRAM [--trace N] [--lenient] [--max-calls N] [--snap N DIR] [--disc DIR]\n"
                              "                      [--frames DIR [--frames-at FIRST[-LAST][/EVERY]]]\n"
                              "                      [--pad BUTTONS@FIELD[xN][/E][+H]]... [--window [--record FILE]] [--wav FILE]\n"
                              "       pfboot PROGRAM --memtest DIR [--ops N] [--seed S]\n"
-                             "       pfboot DISC --boot [the options above]\n");
+                             "       pfboot DISC --boot [the options above]\n"
+                             "       pfboot FILE --unpack OUT\n");
         return 2;
     }
     const char* memtest = nullptr;

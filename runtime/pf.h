@@ -26,6 +26,7 @@
 enum : uint32_t {
     PF_OS_BASE = 0x00400000u,           // the OS's memory, 1 MB
     PF_OS_SIZE = 0x00100000u,
+    PF_OS_IMAGES = 0x004E0000u,         // its top 128 KB: System images' data (pf_font.cpp), not allocated
     PF_TRAP_BASE = 0x00800000u,         // trap addresses: folio << 10 | slot index << 2
     PF_TRAP_SIZE = 0x00010000u,
 };
@@ -305,6 +306,11 @@ uint32_t pf_os_release();
 // changed between them its own version is what says which way the runtime goes.
 #define PF_VERSION(v, r) (((uint32_t)(v) << 8) | (uint32_t)(r))
 uint32_t pf_system_version(const char* path);
+// A compressed AIF image (a System file's bytes, os_code's boot header and all) unpacked as its
+// own decompressor unpacks it (pf_aif.cpp): `out` the bytes from its base, the header with its
+// NOP at 0 and the unpacked words from 0x100 on -- the image's ro + rw, then its relocation stub
+// and list. "" when it is done, else why it is not.
+std::string pf_aif_unpack(const std::vector<uint8_t>& file, std::vector<uint8_t>& out);
 
 // The folios' handlers register themselves here.
 void     pf_kernel_init();
@@ -327,6 +333,8 @@ int32_t  pf_stream_read(const ArmCpu& c, uint32_t below, uint32_t st, uint32_t d
 int32_t  pf_stream_seek(const ArmCpu& c, uint32_t below, uint32_t st, int32_t offset, uint32_t whence);
 void     pf_stream_close(const ArmCpu& c, uint32_t below, uint32_t st);
 void     pf_graphics_init();
+void     pf_font_init();                    // the folio's built-in font, at its start (pf_font.cpp)
+void     pf_draw_cels(ArmCpu& c);           // Graphics -172 DrawCels(r0 bitmap, r1 ccb), r0 its Err
 void     pf_audio_init();
 void     pf_math_init();
 

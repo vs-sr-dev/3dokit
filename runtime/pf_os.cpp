@@ -218,7 +218,7 @@ uint32_t pf_r8(uint32_t a) { return in_os(a, 1) ? os_get(a, 1) : ld8(a); }
 void pf_w32(uint32_t a, uint32_t v) { if (in_os(a, 4)) os_put(a, v, 4); else st32(a, v); }
 void pf_w8(uint32_t a, uint32_t v) { if (in_os(a, 1)) os_put(a, v, 1); else st8(a, v); }
 
-// The OS's own allocations: upward from g_os_free, and what pf_os_free gives back used again for
+// The OS's own allocations: upward from g_os_free (up to PF_OS_IMAGES), and what pf_os_free gives back used again for
 // the next allocation of the same (word-rounded) size, the most recently freed first -- so a run
 // is the same on any host. Only what pf_os_alloc gave out can be freed; anything else is ignored.
 static uint32_t g_os_free;
@@ -235,7 +235,7 @@ uint32_t pf_os_alloc(uint32_t size) {
     } else {
         a = g_os_free;
         g_os_free += rounded;
-        if (g_os_free > PF_OS_BASE + PF_OS_SIZE) {
+        if (g_os_free > PF_OS_IMAGES) {
             std::fprintf(stderr, "the OS's memory is full\n");
             std::exit(3);
         }
