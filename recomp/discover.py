@@ -192,7 +192,7 @@ class Program:
         f.problems, f.switches, f.indirect = [], {}, []
         f.local_returns = set()
         todo = [f.entry]
-        while todo:
+        while todo or self._unreached_returns(f, todo):
             a = todo.pop()
             taken = set()       # conditions branched away on since the flags last changed
             while True:
@@ -268,6 +268,20 @@ class Program:
                     a += 4
                     continue
                 a += 4
+
+    def _unreached_returns(self, f, todo):
+        """When the descent has run out: a local return it has not reached that lies between
+        words of the function's own code is code too -- hand-written code can reach a word only
+        by returning to it through lr (Immercenary's CinepakSubroutine: `add lr, pc, #0x18` at
+        0xa954, its routines' `mov pc, lr`, the word after a `b`). A word lr points at outside
+        the function's span is left alone: hand-written code points lr at tables too."""
+        if not f.code:
+            return False
+        lo, hi = min(f.code), max(f.code)
+        more = sorted(v for v in f.local_returns if v not in f.code and lo < v < hi and self._inside(v)
+                      and self.at(v).kind != 'undefined')
+        todo.extend(more)
+        return bool(more)
 
     @staticmethod
     def _both_ways(taken, cond):

@@ -149,6 +149,15 @@ void pf_list_init(uint32_t l, const char* name) {
     pf_w32(l + PF_LIST_LAST, l + PF_LIST_HEAD);
 }
 
+// Kernel -36: void InitList(List* l, const char* name) -- 0x11cd4: as above, but the name is the
+// caller's pointer, not a copy (NULL: the kernel's own "List", made here when first asked for).
+static uint32_t g_list_name;
+static void k_initlist(ArmCpu& c) {
+    if (!c.r[1] && !g_list_name) g_list_name = pf_os_string("List");
+    pf_list_init(c.r[0], nullptr);
+    pf_w32(c.r[0] + 16, c.r[1] ? c.r[1] : g_list_name);
+}
+
 void pf_list_insert_before(uint32_t at, uint32_t n) {
     uint32_t prev = pf_r32(at + 4);
     pf_w32(n, at);
@@ -174,6 +183,30 @@ void pf_list_rem_node(uint32_t n) {
     pf_w32(next + 4, prev);
     pf_w32(n, 0);
 }
+
+// The same functions as a program calls them, the kernel's vectors (0x107c4 on): -4 RemHead and
+// -12 RemTail (the node taken off, its own links left as they were; 0 for an empty list), -8
+// AddHead, -16 AddTail, -20 InsertNodeFromTail, -24 RemNode.
+static void k_remhead(ArmCpu& c) {
+    uint32_t l = c.r[0], n = pf_r32(l + PF_LIST_HEAD);
+    if (n == l + PF_LIST_TAIL) { c.r[0] = 0; return; }
+    uint32_t next = pf_r32(n);
+    pf_w32(l + PF_LIST_HEAD, next);
+    pf_w32(next + 4, l + PF_LIST_HEAD);
+    c.r[0] = n;
+}
+static void k_remtail(ArmCpu& c) {
+    uint32_t l = c.r[0], n = pf_r32(l + PF_LIST_LAST);
+    if (n == l + PF_LIST_HEAD) { c.r[0] = 0; return; }
+    uint32_t prev = pf_r32(n + 4);
+    pf_w32(l + PF_LIST_LAST, prev);
+    pf_w32(prev, l + PF_LIST_TAIL);
+    c.r[0] = n;
+}
+static void k_addhead(ArmCpu& c) { pf_list_add_head(c.r[0], c.r[1]); }
+static void k_addtail(ArmCpu& c) { pf_list_add_tail(c.r[0], c.r[1]); }
+static void k_insertnodefromtail(ArmCpu& c) { pf_list_insert_from_tail(c.r[0], c.r[1]); }
+static void k_remnode(ArmCpu& c) { pf_list_rem_node(c.r[0]); }
 
 // ---- items ---------------------------------------------------------------------------------
 // An item number is an index into this table; 0 is no item. The node's
@@ -445,6 +478,7 @@ static void k_readhardwarerandomnumber(ArmCpu& c) {
 }
 
 void pf_kernel_init() {
+    g_list_name = 0;
     g_items.assign(1, 0);
     g_rand_sample = 2463534242u;
     g_opened.clear();
@@ -458,6 +492,13 @@ void pf_kernel_init() {
     pf_on_swi(0x10017, k_setfunction);
     pf_on_swi(0x10011, k_readhardwarerandomnumber);
     pf_on_slot(PF_KERNEL, -120, k_startup);
+    pf_on_slot(PF_KERNEL, -4, k_remhead);
+    pf_on_slot(PF_KERNEL, -8, k_addhead);
+    pf_on_slot(PF_KERNEL, -12, k_remtail);
+    pf_on_slot(PF_KERNEL, -16, k_addtail);
+    pf_on_slot(PF_KERNEL, -20, k_insertnodefromtail);
+    pf_on_slot(PF_KERNEL, -24, k_remnode);
+    pf_on_slot(PF_KERNEL, -36, k_initlist);
     pf_on_slot(PF_KERNEL, -48, k_lookupitem);
     pf_on_slot(PF_KERNEL, -52, k_memset);
     pf_on_slot(PF_KERNEL, -56, k_memcpy);

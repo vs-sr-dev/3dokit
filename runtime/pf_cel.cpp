@@ -247,7 +247,10 @@ void draw(ArmCpu& c, const Cel& cel, const Target& t) {
     // libraries (Lib3DO's CreateBackdropCel, TextLib) set and clear it together with the CCB's BGND,
     // "don't skip 0-valued pixels, really, trust me". With the CCB's BGND also set both readings draw
     // the same pixels; alone, they would differ.
-    if (cel.pre0 & PRE0_LITERAL) pf_stop(c, "the cel engine: PRE0's LITERAL bit: not yet");
+    // PRE0's LITERAL bit (hardware.h's name, bit 31) is passed over: the guide calls bits 28-31
+    // reserved, and Opera defines the name and never reads it. Immercenary's title sets it. Not
+    // read in the console's own hardware: a place to look on Phoenix and the console if a cel
+    // that carries it looks wrong.
     if ((cel.pre0 & PRE0_BGND) && !(cel.flags & CCB_BGND))
         pf_stop(c, "the cel engine: PRE0's BGND bit without the CCB's: not yet");
     if (cel.pre0 >> 24 & 15) pf_stop(c, "the cel engine: SKIPX: not yet");

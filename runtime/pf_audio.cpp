@@ -993,6 +993,19 @@ static void a_loadinstrument(ArmCpu& c) {
     a_allocinstrument(c);
 }
 
+// audio -96: Err UnloadInstrument(Item instrument) -- 1993's 0x151c, 23.10's 0x116c, the same: an
+// instrument (else AF_ERR_BADITEM); its template kept, the instrument deleted (DeleteItem), and
+// when that went well UnloadInsTemplate of the template, whose result is the call's.
+static void a_unloadinstrument(ArmCpu& c) {
+    int32_t ins = (int32_t)c.r[0];
+    if (!pf_check_item(ins, NST_AUDIO, INSTRUMENT_NODE)) { c.r[0] = AF_ERR_BADITEM; return; }
+    int32_t tmpl = g_instruments[ins].tmpl;
+    int32_t err = pf_delete_item(c, ins);
+    if (err < 0) { c.r[0] = (uint32_t)err; return; }
+    c.r[0] = (uint32_t)tmpl;
+    a_unloadinstemplate(c);
+}
+
 // ---- an AIFF file into a sample (LoadSample) -----------------------------------------------
 // The folio's IFF reader (iffParseFile, 0xa6d8), in the caller's task: the file opened as a
 // stream (OpenDiskStream(name, 0); the folio first changes to the name's directory and opens the
@@ -1015,6 +1028,7 @@ struct IffRead {
     uint32_t below, st;
     int32_t left;                               // what is left of the enclosing chunk
     uint32_t buf;                               // a chunk's bytes, on the caller's stack
+    bool load = true;                           // the sample's data loaded (ScanSample: not)
 };
 static int32_t iff_read(IffRead& r, uint32_t dst, int32_t n) {
     if (n & 1) ++n;
@@ -1121,7 +1135,8 @@ static int32_t aiff_chunk(IffRead& r, Sample& s, AiffMarkers& mk, bool aifc, uin
         (void)got;
         int32_t n = size - 8 - (int32_t)pf_r32(b);
         s.ssnd_bytes = (uint32_t)n;
-        s.numbytes = (uint32_t)n;                                   // the data is loaded
+        if (r.load) s.numbytes = (uint32_t)n;                       // the data is loaded
+        else n = (int32_t)s.numbytes;                               // else a buffer of the size asked
         s.data_offset = (uint32_t)iff_skip(r, (int32_t)pf_r32(b));
         if (n <= 0) {
             int32_t e = iff_skip(r, (int32_t)s.ssnd_bytes);
@@ -1137,17 +1152,17 @@ static int32_t aiff_chunk(IffRead& r, Sample& s, AiffMarkers& mk, bool aifc, uin
         if (!p) return (int32_t)AF_ERR_NOMEM;
         s.address = p;
         s.flags |= 1;
-        int32_t e = iff_read(r, p, n);
+        int32_t e = r.load ? iff_read(r, p, n) : iff_skip(r, (int32_t)s.ssnd_bytes);
         if (e < 0) return e;
     }
     return 0;                                                       // APPL, FVER and the rest
 }
 
-static uint32_t parse_aiff(ArmCpu& c, uint32_t name, Sample& s, uint32_t alloc_fn) {
+static uint32_t parse_aiff(ArmCpu& c, uint32_t name, Sample& s, uint32_t alloc_fn, bool load = true) {
     const uint32_t below = 0xb00;
     uint32_t st = pf_stream_open(c, below, name, 0);
     if (!st) return IFF_ERR_OPEN;
-    IffRead r{c, below, st, 8, c.r[13] - 0xa00};
+    IffRead r{c, below, st, 8, c.r[13] - 0xa00, load};
     AiffMarkers mk;
     int32_t err = 0;
     uint32_t h = r.buf + 0x200;
@@ -1203,6 +1218,24 @@ static uint32_t load_sample_here(ArmCpu& c, uint32_t name, uint32_t alloc_fn, ui
     return audio_create(c, SAMPLE_NODE, tags);
 }
 static void a_loadsample(ArmCpu& c) { c.r[0] = load_sample_here(c, c.r[0], 0, 0); }
+
+// audio -48: Item ScanSample(char* name, int32 bufferSize) -- 1993's 0x2b78 (23.10's 0x2c5c makes
+// it by tags, the size as tag 0x44): the AIFF read for its information as LoadSample reads it, but
+// at its SSND chunk the data is not loaded -- a buffer of bufferSize bytes (the folio's AllocMem)
+// when that is above 0, its size the sample's -- and the sample made of that and its name.
+static void a_scansample(ArmCpu& c) {
+    uint32_t name = c.r[0];
+    Sample s;
+    s.numbytes = c.r[1];
+    uint32_t err = parse_aiff(c, name, s, 0, false);
+    if (g_pf_trace) pf_log("        ScanSample \"%s\" -> 0x%x\n", guest_string(name).c_str(), err);
+    if ((int32_t)err < 0) { c.r[0] = err; return; }
+    uint32_t tags = c.r[13] - 32 - 0xb0, info = tags + 0x18;
+    sample_info_write(info, s);
+    const uint32_t t[5] = {AF_TAG_NAME, name, AF_TAG_SAMPLE, info, 0};
+    for (int k = 0; k < 5; ++k) pf_w32(tags + 4u * k, t[k]);
+    c.r[0] = audio_create(c, SAMPLE_NODE, tags);
+}
 
 // audio -44: Err UnloadSample(Item sample) -- 0x3c78: a sample (else AF_ERR_BADITEM); deleted; and
 // when that went well and its data is the folio's (bit 0), the data given back -- to the free
@@ -1430,6 +1463,61 @@ static void a_disconnectinstruments(ArmCpu& c) {
                    d.inputs.end());
     pf_dsp_disconnect(dst, (uint32_t)b);
     c.r[0] = 0;
+}
+
+// audio -36: Err GetAudioItemInfo(Item item, TagArg* tags) -- 1993's 0x1324: an item of the
+// folio's (else AF_ERR_BADITEM), then by its type: a sample's tags (0x37d8), a knob's (0x25f8), an
+// attachment's (0x6074), any other 0xD52BF118. A sample's: each tag's value word replaced by the
+// field it names -- WIDTH, CHANNELS, FRAMES, BASENOTE, DETUNE (signed), LOW/HIGHNOTE,
+// LOW/HIGHVELOCITY, SUSTAIN/RELEASE BEGIN/END, NUMBYTES, ADDRESS, SAMPLE_RATE, COMPRESSIONRATIO,
+// COMPRESSIONTYPE, NUMBITS, 51 the base frequency, 55 where the data begins in the file, 56 the
+// SSND chunk's bytes; an item tag (up to 9) passed over; any other AF_ERR_BADTAG, the tags before
+// it answered. (Knobs and attachments: not yet.)
+static uint32_t sample_get(const Sample& s, uint32_t tags) {
+    for (uint32_t p = tags; p; p += 8) {
+        uint32_t tag = pf_r32(p), v;
+        if (!tag) break;
+        switch (tag) {
+        case 22: v = s.width; break;
+        case 23: v = s.channels; break;
+        case 24: v = s.frames; break;
+        case 25: v = s.basenote; break;
+        case 26: v = (uint32_t)(int32_t)(int8_t)s.detune; break;
+        case 27: v = s.lownote; break;
+        case 28: v = s.highnote; break;
+        case 29: v = s.lowvelocity; break;
+        case 30: v = s.highvelocity; break;
+        case 31: v = (uint32_t)s.sustain_begin; break;
+        case 32: v = (uint32_t)s.sustain_end; break;
+        case 33: v = (uint32_t)s.release_begin; break;
+        case 34: v = (uint32_t)s.release_end; break;
+        case 35: v = s.numbytes; break;
+        case 36: v = s.address; break;
+        case 46: v = s.rate; break;
+        case 47: v = s.compression_ratio; break;
+        case 48: v = s.compression_type; break;
+        case 49: v = s.numbits; break;
+        case 51: v = s.base_freq; break;
+        case 55: v = s.data_offset; break;
+        case 56: v = s.ssnd_bytes; break;
+        default:
+            if (tag > 9) return AF_ERR_BADTAG;
+            continue;
+        }
+        pf_w32(p + 4, v);
+    }
+    return 0;
+}
+
+static void a_getaudioiteminfo(ArmCpu& c) {
+    int32_t item = (int32_t)c.r[0];
+    uint32_t n = pf_item_node(item);
+    if (!n || pf_r8(n + 8) != NST_AUDIO) { c.r[0] = AF_ERR_BADITEM; return; }
+    switch (pf_r8(n + 9)) {
+    case SAMPLE_NODE: c.r[0] = sample_get(g_samples[item], c.r[1]); break;
+    case KNOB_NODE: case ATTACHMENT_NODE: pf_stop(c, "GetAudioItemInfo of a knob or an attachment: not yet");
+    default: c.r[0] = 0xD52BF118u;
+    }
 }
 
 // swi 0x4001b: Err SetAudioItemInfo(Item item, TagArg* tags) -- 0x120c: the folio open; an item
@@ -1729,7 +1817,10 @@ void pf_audio_init() {
     pf_on_slot(PF_AUDIO, -8, a_allocinstrument);
     pf_on_slot(PF_AUDIO, -16, a_grabknob);
     pf_on_slot(PF_AUDIO, -40, a_loadinstrument);
+    pf_on_slot(PF_AUDIO, -96, a_unloadinstrument);
     pf_on_slot(PF_AUDIO, -12, a_loadsample);
+    pf_on_slot(PF_AUDIO, -48, a_scansample);
+    pf_on_slot(PF_AUDIO, -36, a_getaudioiteminfo);
     pf_on_slot(PF_AUDIO, -56, a_makesample);
     pf_on_slot(PF_AUDIO, -44, a_unloadsample);
     pf_on_slot(PF_AUDIO, -92, a_unloadinstemplate);
