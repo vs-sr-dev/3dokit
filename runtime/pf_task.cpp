@@ -9,9 +9,9 @@
 // come back. So the run is as deterministic as with one task: a switch happens only where the
 // kernel would make one -- at the end of an OS call, or where an interrupt (an event of
 // pf_time.cpp, at a safe point) has made a higher-priority task ready. When every task waits, the
-// guest's clock jumps to the next event. Not modelled yet: the kernel's quantum timer, which would
-// make equal priorities take turns and let a higher priority that became ready without a
-// reschedule (see pf_create_task) run at the next tick.
+// guest's clock jumps to the next event. The kernel's quantum timer makes equal priorities take
+// turns (below, "the quantum"); a higher priority that became ready without a reschedule (see
+// pf_create_task) runs at once here rather than at the next tick.
 #include "pf.h"
 #include <condition_variable>
 #include <cstdio>
@@ -49,6 +49,7 @@ struct Task {
     uint32_t node;
     bool started, dead;
     uint32_t image;                             // a task with its own image: its AIF header
+    uint32_t quantum = 15000;                   // its quantum, us (t_MaxUSecs, +0xc0 in 20.21's Task)
 };
 
 static std::vector<Task*> g_tasks;              // every task alive; never freed
@@ -89,6 +90,7 @@ static void make_ready(Task* t) {
 }
 
 static void run_task(Task* t);
+static void arm_quantum();
 
 // Hand the turn to `next` and wait for it to come back (a dead task's thread just returns). The
 // task that waited may be the one woken: then it simply goes on.
@@ -103,6 +105,7 @@ static void switch_to(Task* next) {
     g_running = next;
     g_reschedule = false;
     pf_w32(pf_folio_base(PF_KERNEL) + KB_CURRENTTASK, next->node);
+    arm_quantum();
     if (!next->started) {
         next->started = true;
         std::thread(run_task, next).detach();
@@ -236,6 +239,31 @@ static void run_task(Task* t) {
     t->dead = true;
     set_flags(t, 0, TASK_READY | TASK_WAITING);
     switch_to(take_ready(name(t)));
+}
+
+// ---- the quantum --------------------------------------------------------------------------
+// The kernel's "kernel quanta" FIRQ (20.21's 0x16ec8, made at 0x184fc at priority 0xfa; 1993's
+// 0x1780c and 23.10's 0x7320 the same), on a timer of CLIO's that counts 16 us steps: each task
+// switched in loads it with its quantum (0x16db8: t_MaxUSecs >> 4, less 1 -- 15,000 us unless
+// CREATETASK_TAG_MAXQ says otherwise, 0x161ec), so it ends (us >> 4) steps later. Then, when a task
+// of at least the running one's priority is ready, kb_PleaseReschedule is set -- the switch below,
+// at the next safe point -- else the quantum is added to the task's time and the timer reloaded.
+static uint64_t g_quantum_due;                  // when the running task's quantum ends
+
+static void quantum_end(uint64_t when) {
+    if (when != g_quantum_due || !g_running) return;
+    g_quantum_due = 0;                          // this end taken (another event at it is stale)
+    if (!g_ready.empty() && pri(g_running) <= pri(g_ready.front())) {
+        g_reschedule = true;
+        return;
+    }
+    g_quantum_due = when + (uint64_t)(g_running->quantum >> 4) * 16000;
+    pf_at(g_quantum_due, quantum_end);
+}
+
+static void arm_quantum() {
+    g_quantum_due = pf_now() + (uint64_t)(g_running->quantum >> 4) * 16000;
+    pf_at(g_quantum_due, quantum_end);
 }
 
 // ---- the switch at the end of an OS call (0x104fc) -----------------------------------------
@@ -409,8 +437,9 @@ uint32_t pf_create_task(ArmCpu& c, uint32_t tags) {
         default: pf_stop(c, "CreateTask: a tag the runtime does not take yet");
         }
     }
-    (void)maxq;
+    if (maxq && (maxq < 5000 || maxq > 1000000)) pf_stop(c, "CreateTask: a quantum out of 5,000 to 1,000,000 us: not yet");
     if (!sp && image) {
+        if (maxq) pf_stop(c, "CreateTask: a quantum for a task with its own image: not yet");
         if (!size_given) size = 0x100;
         return create_image_task(c, nm, p, size, argc, argp, base, image, imagesz, cmd);
     }
@@ -439,6 +468,7 @@ uint32_t pf_create_task(ArmCpu& c, uint32_t tags) {
     pf_w32(n + T_PC, pc);
     pf_w32(n + T_PSR, 0x10);                                // user mode
     Task* t = new Task{n, false, false};
+    if (maxq) t->quantum = maxq;
     g_tasks.push_back(t);
     make_ready(t);
     if (p > pf_r8(me + 10)) g_reschedule = true;
@@ -594,6 +624,7 @@ void pf_task_init() {
     pf_w8(main + 11, pf_r8(main + 11) | TASK_READY);
     g_running = new Task{main, true, false};
     g_tasks.push_back(g_running);
+    arm_quantum();
     pf_on_swi(0x10001, k_waitsignal);
     pf_on_slot(PF_KERNEL, -148, k_exit);
     pf_on_swi(0x10002, k_sendsignal);

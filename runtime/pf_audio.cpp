@@ -1114,9 +1114,14 @@ static int32_t iff_skip(IffRead& r, int32_t n) {
 
 // The 80-bit float of a COMM chunk as 16.16 (0x9f9c): 0 for 0; 0xFFFFFFFF for an infinity or
 // anything 2^16 and up; else the mantissa's top word shifted down by 0x400e less the exponent
-// (an ARM shift by a register: its low byte, 32 or more giving 0), negated for the sign.
+// (an ARM shift by a register: its low byte, 32 or more giving 0), negated for the sign. The ten
+// bytes are read one at a time (Doctor Hauzer's 20.27, 0x9d20, the same): in a COMM chunk they
+// start at +8, so the mantissa's words are not aligned.
+static uint32_t be32_bytes(uint32_t a) {
+    return pf_r8(a) << 24 | pf_r8(a + 1) << 16 | pf_r8(a + 2) << 8 | pf_r8(a + 3);
+}
 static uint32_t ext80_fix16(uint32_t a) {
-    uint32_t e = (pf_r8(a) & 0x7f) << 8 | pf_r8(a + 1), hi = pf_r32(a + 2), lo = pf_r32(a + 6);
+    uint32_t e = (pf_r8(a) & 0x7f) << 8 | pf_r8(a + 1), hi = be32_bytes(a + 2), lo = be32_bytes(a + 6);
     uint32_t v;
     if (!e && !hi && !lo) v = 0;
     else if (e == 0x7fff || (int32_t)(e - 0x400e) > 0) v = 0xFFFFFFFFu;
