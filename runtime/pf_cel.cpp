@@ -207,6 +207,36 @@ void fill_quad(const int32_t qx[4], const int32_t qy[4], uint32_t flags, Paint p
     }
 }
 
+// Which way the first span fill_quad would paint of a quad turns: 0 none painted, 1 clockwise (the
+// edge on its left going up: ACW), 2 counter-clockwise (ACCW). fill_quad's walk, stopping there.
+int quad_turn(const int32_t qx[4], const int32_t qy[4]) {
+    int32_t x[4], y[4];
+    for (int k = 0; k < 4; ++k) { x[k] = qx[k] >> 16; y[k] = qy[k] >> 16; }
+    int32_t top = std::min(std::min(y[0], y[1]), std::min(y[2], y[3]));
+    int32_t bot = std::max(std::max(y[0], y[1]), std::max(y[2], y[3]));
+    for (int32_t r = top; r < bot; ++r) {
+        int32_t xs[4];
+        bool down[4];
+        int n = 0;
+        for (int k = 0; k < 4; ++k) {
+            int u = k, v = (k + 1) & 3;
+            bool goes_down = y[v] > y[u];
+            int hi = goes_down ? u : v, lo = goes_down ? v : u;
+            if (y[hi] == y[lo] || r < y[hi] || r >= y[lo]) continue;
+            xs[n] = x[hi] + (int32_t)((int64_t)(x[lo] - x[hi]) * (r - y[hi]) / (y[lo] - y[hi]));
+            down[n++] = goes_down;
+        }
+        for (int i = 1; i < n; ++i)
+            for (int j = i; j > 0 && (xs[j] < xs[j - 1] || (xs[j] == xs[j - 1] && !down[j] && down[j - 1])); --j) {
+                std::swap(xs[j], xs[j - 1]);
+                std::swap(down[j], down[j - 1]);
+            }
+        for (int i = 0; i + 1 < n; i += 2)
+            if (xs[i] < xs[i + 1]) return down[i] ? 2 : 1;
+    }
+    return 0;
+}
+
 // One cel: its source pixels through the decoder and the pixel processor into the frame buffer.
 // The corner engine lays out the grid of the pixels' corners: row j's top edge starts at the
 // origin plus j times (VDX, VDY) and steps by (HDX, HDY), its bottom edge -- the next row's top --
@@ -223,7 +253,17 @@ void draw(ArmCpu& c, const Cel& cel, const Target& t) {
     if (cel.pre0 >> 24 & 15) pf_stop(c, "the cel engine: SKIPX: not yet");
     bool lrform = !(cel.flags & CCB_PACKED) && (cel.pre1 & PRE1_LRFORM);
     if (lrform && cel.bpp != 16) pf_stop(c, "the cel engine: an LRFORM cel not of 16 bits: not yet");
-    if (cel.flags & CCB_TWD) pf_stop(c, "the cel engine: TWD: not yet");
+    // TWD (the guide's "The TWD Flag"): the cel's first source pixel looked at; when it turns a way
+    // the cel does not allow, the cel is skipped -- left here with the engine's origin and steps as
+    // they were, which the guide does not say ("not ideal and may not be predictable"); when it
+    // paints nothing, TWD does nothing.
+    if (cel.flags & CCB_TWD) {
+        int32_t hx2 = g_ce.hdx + g_ce.hddx, hy2 = g_ce.hdy + g_ce.hddy;
+        int32_t qx[4] = {g_ce.x, g_ce.x + (g_ce.hdx >> 4), g_ce.x + g_ce.vdx + (hx2 >> 4), g_ce.x + g_ce.vdx};
+        int32_t qy[4] = {g_ce.y, g_ce.y + (g_ce.hdy >> 4), g_ce.y + g_ce.vdy + (hy2 >> 4), g_ce.y + g_ce.vdy};
+        int turn = quad_turn(qx, qy);
+        if (turn && !(cel.flags & (turn == 2 ? CCB_ACCW : CCB_ACW))) return;
+    }
     if (cel.flags & CCB_MARIA) pf_stop(c, "the cel engine: MARIA (no region fill): not yet");
     uint32_t pover = cel.flags >> 7 & 3;
     if (pover == 1) pf_stop(c, "the cel engine: POVER 01: not yet");

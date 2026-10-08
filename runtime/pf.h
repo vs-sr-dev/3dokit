@@ -44,6 +44,7 @@ uint32_t pf_folio_base(PfFolio folio);                      // the folio's node 
 // image at 0, its zero-initialised data cleared, r7 = KernelBase, and the
 // entry called with lr at the exit sentinel. Returns the exit code.
 int      pf_run(const uint8_t* image, size_t size, uint32_t bss_end, uint32_t entry);
+extern bool g_pf_boot_failed;               // pf_run's last boot failed: the program never ran
 // The same boot without the call: 0 when the program and the OS are in place.
 int      pf_boot(const uint8_t* image, size_t size, uint32_t bss_end);
 
@@ -285,6 +286,19 @@ void     pf_msg_init();
 void     pf_event_init();
 void     pf_io_init();
 void     pf_file_init();
+// The File folio's streams for the OS's own code (another folio reading a file in the caller's
+// task, as AUDIOFOLIO's IFF reader does): OpenDiskStream, ReadDiskStream, SeekDiskStream (whence
+// 1 set, 2 from the cursor, 3 from the end) and CloseDiskStream, each as the program's call does
+// it, run on a copy of `c` with the stack `below` bytes lower.
+// The shell running a disc as the console starts it (pfboot --boot): ^/system/scripts/startopera
+// and the scripts it runs, line by line -- aliases made, the OS's own programs (under the System
+// directory) left to the runtime, every other program run by `run` (its host path) until it ends,
+// a script run where it is named -- then $boot/LaunchMe. Returns what the last program returned.
+int      pf_shell_boot(int (*run)(const std::string& host));
+uint32_t pf_stream_open(const ArmCpu& c, uint32_t below, uint32_t name, int32_t bsize);
+int32_t  pf_stream_read(const ArmCpu& c, uint32_t below, uint32_t st, uint32_t dst, int32_t n);
+int32_t  pf_stream_seek(const ArmCpu& c, uint32_t below, uint32_t st, int32_t offset, uint32_t whence);
+void     pf_stream_close(const ArmCpu& c, uint32_t below, uint32_t st);
 void     pf_graphics_init();
 void     pf_audio_init();
 void     pf_math_init();

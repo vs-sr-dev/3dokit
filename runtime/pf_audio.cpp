@@ -174,7 +174,7 @@ struct Sample {
     int32_t release_end = -1;               // +0x38
     uint32_t numbytes = 0;                  // +0x48 AF_TAG_NUMBYTES
     uint32_t base_freq = 440u << 16;        // +0x4c AF_TAG_BASEFREQ: the frequency that plays it at its pitch
-    uint8_t flags = 0;                      // +0x50: bits 0 and 1 set for a delay line's memory
+    uint8_t flags = 0;                      // +0x50: bit 0 the folio's memory (bits 0 and 1 a delay line's)
     uint8_t numbits = 16;                   // +0x51
     uint8_t width = 2;                      // +0x52 bytes
     uint8_t channels = 1;                   // +0x53
@@ -183,8 +183,11 @@ struct Sample {
     uint8_t lownote = 0, highnote = 127;    // +0x56, +0x57
     uint8_t lowvelocity = 0, highvelocity = 127;    // +0x58, +0x59
     uint8_t compression_ratio = 1;          // +0x5a
+    uint32_t data_offset = 0;               // +0x60: where in its AIFF file the data begins
+    uint32_t ssnd_bytes = 0;                // +0x64: the data's bytes as its SSND chunk counts them
     uint32_t compression_type = 0;          // +0x68
     uint32_t rate = (uint32_t)kSampleRate << 16;    // +0x8c AF_TAG_SAMPLE_RATE, frac16 Hz
+    uint32_t free_fn = 0;                   // +0x90: LoadSampleHere's free function, or 0
 };
 
 static std::map<int32_t, Template> g_templates;
@@ -473,14 +476,60 @@ static uint32_t sample_set(ArmCpu& c, Sample& s, uint32_t tags) {
 // look for AF_TAG_SAMPLE (another sample's info copied) and AF_TAG_DELAY_LINE (memory of the
 // folio's), the frames from the bytes, the tags as SetAudioItemInfo takes them (an error there is
 // the creation's), and the base frequency. An item tag would reach 0x347c and be AF_ERR_BADTAG
-// there; neither they nor SAMPLE and DELAY_LINE are done yet.
+// there; neither they nor DELAY_LINE are done yet. AF_TAG_SAMPLE copies another sample's
+// information (0x3b00: a delay line's refused, before and after, AF_ERR_SECURITY); the folio's
+// check that the information may be read (vector -13) is not made.
+// A sample's information as the folio keeps it, from +0x24 to +0x98 of its node: what
+// AF_TAG_SAMPLE copies (0x3b00, the folio's bcopy of 0x74 bytes) and LoadSampleHere fills.
+static void sample_info_write(uint32_t a, const Sample& s) {
+    for (uint32_t k = 0x24; k < 0x98; k += 4) pf_w32(a + k, 0);
+    pf_w32(a + 0x24, s.address);
+    pf_w32(a + 0x28, s.frames);
+    pf_w32(a + 0x2c, (uint32_t)s.sustain_begin);
+    pf_w32(a + 0x30, (uint32_t)s.sustain_end);
+    pf_w32(a + 0x34, (uint32_t)s.release_begin);
+    pf_w32(a + 0x38, (uint32_t)s.release_end);
+    pf_w32(a + 0x48, s.numbytes);
+    pf_w32(a + 0x4c, s.base_freq);
+    const uint8_t b[11] = {s.flags, s.numbits, s.width, s.channels, s.basenote, s.detune, s.lownote,
+                           s.highnote, s.lowvelocity, s.highvelocity, s.compression_ratio};
+    for (uint32_t k = 0; k < 11; ++k) pf_w8(a + 0x50 + k, b[k]);
+    pf_w32(a + 0x60, s.data_offset);
+    pf_w32(a + 0x64, s.ssnd_bytes);
+    pf_w32(a + 0x68, s.compression_type);
+    pf_w32(a + 0x8c, s.rate);
+    pf_w32(a + 0x90, s.free_fn);
+}
+static void sample_info_read(uint32_t a, Sample& s) {
+    s.address = pf_r32(a + 0x24);
+    s.frames = pf_r32(a + 0x28);
+    s.sustain_begin = (int32_t)pf_r32(a + 0x2c);
+    s.sustain_end = (int32_t)pf_r32(a + 0x30);
+    s.release_begin = (int32_t)pf_r32(a + 0x34);
+    s.release_end = (int32_t)pf_r32(a + 0x38);
+    s.numbytes = pf_r32(a + 0x48);
+    s.base_freq = pf_r32(a + 0x4c);
+    uint8_t* b[11] = {&s.flags, &s.numbits, &s.width, &s.channels, &s.basenote, &s.detune, &s.lownote,
+                      &s.highnote, &s.lowvelocity, &s.highvelocity, &s.compression_ratio};
+    for (uint32_t k = 0; k < 11; ++k) *b[k] = (uint8_t)pf_r8(a + 0x50 + k);
+    s.data_offset = pf_r32(a + 0x60);
+    s.ssnd_bytes = pf_r32(a + 0x64);
+    s.compression_type = pf_r32(a + 0x68);
+    s.rate = pf_r32(a + 0x8c);
+    s.free_fn = pf_r32(a + 0x90);
+}
+
 static uint32_t create_sample(ArmCpu& c, const Tags& tags, uint32_t tag_ptr) {
-    for (auto [tag, v] : tags) {
-        (void)v;
-        if (tag < 10 || tag >= 0xfe) pf_stop(c, "an item tag at a sample's creation: not yet");
-        if (tag == AF_TAG_SAMPLE || tag == AF_TAG_DELAY_LINE) pf_stop(c, "AF_TAG_SAMPLE or DELAY_LINE: not yet");
-    }
     Sample s;
+    for (auto [tag, v] : tags) {
+        if (tag < 10 || tag >= 0xfe) pf_stop(c, "an item tag at a sample's creation: not yet");
+        if (tag == AF_TAG_DELAY_LINE) pf_stop(c, "AF_TAG_DELAY_LINE: not yet");
+        if (tag == AF_TAG_SAMPLE) {                 // another sample's information (0x3b00)
+            if (s.flags & 2) return AF_ERR_SECURITY;
+            sample_info_read(v, s);
+            if (s.flags & 2) return AF_ERR_SECURITY;
+        }
+    }
     s.frames = bytes_to_frames(c, s, s.numbytes);
     if (tag_ptr)
         if (uint32_t err = sample_set(c, s, tag_ptr)) return err;
@@ -760,6 +809,240 @@ static void a_unloadinstemplate(ArmCpu& c) {
 // CreateItem(MKNODEID(AUDIONODE, AUDIO_INSTRUMENT_NODE), {AF_TAG_TEMPLATE, AF_TAG_PRIORITY}).
 static void a_allocinstrument(ArmCpu& c) {
     c.r[0] = create(c, INSTRUMENT_NODE, {{AF_TAG_TEMPLATE, c.r[0]}, {AF_TAG_PRIORITY, c.r[1] & 0xFF}});
+}
+
+// audio -40: Item LoadInstrument(char* name, Item aux, uint8 priority) -- 0x14ec:
+// LoadInsTemplate(name, aux), and when that gives a template, AllocInstrument(template,
+// priority); else its error.
+static void a_loadinstrument(ArmCpu& c) {
+    uint32_t priority = c.r[2] & 0xFF;
+    a_loadinstemplate(c);
+    if ((int32_t)c.r[0] < 0) return;
+    c.r[1] = priority;
+    a_allocinstrument(c);
+}
+
+// ---- an AIFF file into a sample (LoadSample) -----------------------------------------------
+// The folio's IFF reader (iffParseFile, 0xa6d8), in the caller's task: the file opened as a
+// stream (OpenDiskStream(name, 0); the folio first changes to the name's directory and opens the
+// rest, and changes back -- here the whole path is opened, as that comes to the same file), the
+// FORM read (0xa500), its chunks (0xa0ec, 0xa188) handed to AUDIOFOLIO's AIFF handlers (0x2f64,
+// 0x2fe8), the stream closed. Every read is of an even count (0xaa50: one more byte when odd) and
+// must fit what is left of the enclosing chunk; after a handler the rest of its chunk is skipped
+// to the chunk's end, made even (0xab04). The IFF errors: 0xE18BF101 not a FORM, 0xE18BF102 the
+// file not opened, 0xE18BF105 a read past what is left.
+enum : uint32_t {
+    IFF_ERR_NOTFORM = 0xE18BF101u, IFF_ERR_OPEN = 0xE18BF102u, IFF_ERR_SHORT = 0xE18BF105u,
+    AF_ERR_BADFILETYPE = 0xD52BF114u, AF_ERR_NOMEM = 0xD52BF006u,
+    AF_ERR_TOOMANYMARKERS = 0xD52BF111u, AF_ERR_NOMARKER = 0xD52BF112u,
+};
+static uint32_t id4(const char* s) { return (uint32_t)s[0] << 24 | (uint32_t)s[1] << 16 | (uint32_t)s[2] << 8 | (uint32_t)s[3]; }
+static uint32_t be16(uint32_t a) { return pf_r8(a) << 8 | pf_r8(a + 1); }
+
+struct IffRead {
+    const ArmCpu& c;
+    uint32_t below, st;
+    int32_t left;                               // what is left of the enclosing chunk
+    uint32_t buf;                               // a chunk's bytes, on the caller's stack
+};
+static int32_t iff_read(IffRead& r, uint32_t dst, int32_t n) {
+    if (n & 1) ++n;
+    if (r.left - n < 0) return (int32_t)IFF_ERR_SHORT;
+    int32_t got = pf_stream_read(r.c, r.below, r.st, dst, n);
+    r.left -= n;
+    return got;
+}
+static int32_t iff_skip(IffRead& r, int32_t n) {
+    int32_t pos = pf_stream_seek(r.c, r.below, r.st, 0, 2), to = pos + n;
+    if (to & 1) ++to;
+    n = to - pos;
+    if (r.left - n < 0) return (int32_t)IFF_ERR_SHORT;
+    int32_t got = pf_stream_seek(r.c, r.below, r.st, n, 2);
+    r.left -= n;
+    return got;
+}
+
+// The 80-bit float of a COMM chunk as 16.16 (0x9f9c): 0 for 0; 0xFFFFFFFF for an infinity or
+// anything 2^16 and up; else the mantissa's top word shifted down by 0x400e less the exponent
+// (an ARM shift by a register: its low byte, 32 or more giving 0), negated for the sign.
+static uint32_t ext80_fix16(uint32_t a) {
+    uint32_t e = (pf_r8(a) & 0x7f) << 8 | pf_r8(a + 1), hi = pf_r32(a + 2), lo = pf_r32(a + 6);
+    uint32_t v;
+    if (!e && !hi && !lo) v = 0;
+    else if (e == 0x7fff || (int32_t)(e - 0x400e) > 0) v = 0xFFFFFFFFu;
+    else {
+        uint32_t sh = (0x400e - e) & 0xff;
+        v = sh >= 32 ? 0 : hi >> sh;
+    }
+    return pf_r8(a) & 0x80 ? 0u - v : v;
+}
+
+struct AiffMarkers { uint32_t count = 0; uint32_t id[32] = {}, pos[32] = {}; };
+
+// AUDIOFOLIO's handler of a chunk of the AIFF form (0x2fe8). The chunk's bytes are read first,
+// when there are some and no more than 500 (SSND reads its own); what reads more is skipped and
+// its handler would look at what the stack held before -- stopped here instead.
+static int32_t aiff_chunk(IffRead& r, Sample& s, AiffMarkers& mk, bool aifc, uint32_t alloc_fn, uint32_t id,
+                          int32_t size) {
+    const ArmCpu& c = r.c;
+    uint32_t b = r.buf;
+    bool known = id == id4("COMM") || id == id4("INST") || id == id4("MARK");
+    if (id != id4("SSND") && size > 0) {
+        int32_t got = size > 0x1f4 ? iff_skip(r, size) : iff_read(r, b, size);
+        if (got < 0) return got;
+    }
+    if (known && (size <= 0 || size > 0x1f4))
+        pf_stop(const_cast<ArmCpu&>(c), "an AIFF chunk the folio reads from a stale buffer: not done");
+    if (id == id4("COMM")) {                                        // 0x31c4
+        uint32_t w0 = pf_r32(b), w1 = pf_r32(b + 4);
+        s.channels = (uint8_t)(w0 >> 16);
+        s.frames = (w0 & 0xffff) << 16 | w1 >> 16;
+        s.numbits = (uint8_t)w1;
+        s.width = (uint8_t)(((s.numbits + 7) & 0xff) >> 3);
+        s.rate = ext80_fix16(b + 8);
+        if (aifc) s.compression_type = (pf_r32(b + 16) & 0xffff) << 16 | pf_r32(b + 20) >> 16;
+        uint32_t t = s.compression_type;
+        if (!t) s.compression_ratio = 1;
+        else if (t == id4("ADP4")) s.compression_ratio = 4;
+        else if (t == id4("SDX2")) s.compression_ratio = 2;
+        else if (t == id4("SDX3")) s.compression_ratio = 3;
+        else {
+            s.compression_ratio = (uint8_t)((t & 0xff) - '0');
+            if (s.compression_ratio < 1 || s.compression_ratio > 9) s.compression_ratio = 2;
+        }
+    } else if (id == id4("MARK")) {                                 // 0x32bc
+        mk.count = pf_r32(b) >> 16;
+        if ((int32_t)mk.count > 32) return (int32_t)AF_ERR_TOOMANYMARKERS;
+        uint32_t p = b + 2;
+        for (uint32_t i = 0; i < mk.count; ++i) {
+            mk.id[i] = be16(p);
+            mk.pos[i] = be16(p + 2) << 16 | be16(p + 4);
+            p += pf_r8(p + 6) + 7;
+            if (p & 1) ++p;
+        }
+    } else if (id == id4("INST")) {                                 // 0x3350
+        s.basenote = (uint8_t)pf_r8(b);
+        s.detune = (uint8_t)pf_r8(b + 1);
+        s.lownote = (uint8_t)pf_r8(b + 2);
+        s.highnote = (uint8_t)pf_r8(b + 3);
+        s.lowvelocity = (uint8_t)pf_r8(b + 4);
+        s.highvelocity = (uint8_t)pf_r8(b + 4);                     // the folio's: the low velocity's byte again
+        auto at = [&](uint32_t mid, int32_t& out) {
+            for (uint32_t i = 0; i < mk.count; ++i)
+                if (mk.id[i] == mid) { out = (int32_t)mk.pos[i]; return true; }
+            return false;
+        };
+        uint32_t w8 = pf_r32(b + 8), w12 = pf_r32(b + 12), w16 = pf_r32(b + 16);
+        if (!(w8 >> 16)) s.sustain_begin = s.sustain_end = -1;
+        else if (!at(w8 & 0xffff, s.sustain_begin) || !at(w12 >> 16, s.sustain_end)) return (int32_t)AF_ERR_NOMARKER;
+        if (!(w12 & 0xffff)) s.release_begin = s.release_end = -1;
+        else if (!at(w16 >> 16, s.release_begin) || !at(w16 & 0xffff, s.release_end)) return (int32_t)AF_ERR_NOMARKER;
+    } else if (id == id4("SSND")) {                                 // 0x30ec
+        int32_t got = iff_read(r, b, 8);
+        (void)got;
+        int32_t n = size - 8 - (int32_t)pf_r32(b);
+        s.ssnd_bytes = (uint32_t)n;
+        s.numbytes = (uint32_t)n;                                   // the data is loaded
+        s.data_offset = (uint32_t)iff_skip(r, (int32_t)pf_r32(b));
+        if (n <= 0) {
+            int32_t e = iff_skip(r, (int32_t)s.ssnd_bytes);
+            return e < 0 ? e : 0;
+        }
+        uint32_t p;
+        if (alloc_fn) {
+            p = pf_guest_call(c, alloc_fn, (uint32_t)n + 4, 0x100000);
+            if (p) { pf_w32(p, (uint32_t)n); p += 4; }
+        } else {                                                    // the folio's AllocMem (0xb264)
+            p = pf_alloc_mem(pf_r32(pf_current_task() + T_FREEMEMORYLISTS), n + 4, MEMTYPE_DMA, true);
+            if (p) { pf_w32(p, (uint32_t)n); p += 4; }
+        }
+        if (!p) return (int32_t)AF_ERR_NOMEM;
+        s.address = p;
+        s.flags |= 1;
+        int32_t e = iff_read(r, p, n);
+        if (e < 0) return e;
+    }
+    return 0;                                                       // APPL, FVER and the rest
+}
+
+static uint32_t parse_aiff(ArmCpu& c, uint32_t name, Sample& s, uint32_t alloc_fn) {
+    const uint32_t below = 0xb00;
+    uint32_t st = pf_stream_open(c, below, name, 0);
+    if (!st) return IFF_ERR_OPEN;
+    IffRead r{c, below, st, 8, c.r[13] - 0xa00};
+    AiffMarkers mk;
+    int32_t err = 0;
+    uint32_t h = r.buf + 0x200;
+    if ((err = iff_read(r, h, 8)) >= 0) {
+        uint32_t size = pf_r32(h + 4);
+        if (pf_r32(h) != id4("FORM")) err = (int32_t)IFF_ERR_NOTFORM;
+        else {
+            if (size & 1) ++size;
+            r.left = (int32_t)size;
+            if ((err = iff_read(r, h, 4)) >= 0) {
+                uint32_t type = pf_r32(h);
+                bool aifc = type == id4("AIFC");
+                if (!aifc && type != id4("AIFF")) err = (int32_t)AF_ERR_BADFILETYPE;
+                else {
+                    err = 0;
+                    while (r.left > 0 && err >= 0) {                // 0xa188
+                        if ((err = iff_read(r, h, 8)) < 0) break;
+                        uint32_t id = pf_r32(h);
+                        int32_t csize = (int32_t)pf_r32(h + 4);
+                        if (id == id4("FORM") || id == id4("XREF"))
+                            pf_stop(c, "an AIFF file with a FORM or XREF inside: not yet");
+                        int32_t end = pf_stream_seek(c, below, st, 0, 2) + csize;
+                        if (end & 1) ++end;
+                        if ((err = aiff_chunk(r, s, mk, aifc, alloc_fn, id, csize)) < 0) break;
+                        int32_t now = pf_stream_seek(c, below, st, 0, 2);
+                        if (now != end) err = iff_skip(r, end - now);
+                    }
+                }
+            }
+        }
+    }
+    pf_stream_close(c, below, st);
+    return err < 0 ? (uint32_t)err : 0;
+}
+
+// audio -12: Item LoadSample(char* name) -- 0x2878: LoadSampleHere(name, 0, 0) (0x2884): its
+// allocator and free function both given or neither (else AF_ERR_OUTOFRANGE); the sample's
+// information at its defaults (0x2c04), the AIFF file read into it (0x2d50), its data in memory
+// from the caller's lists (AllocMem, MEMTYPE_DMA: a word of its size first) or the allocator; then
+// CreateItem(sample, {AF_TAG_NAME name, AF_TAG_SAMPLE the information}), from the caller's stack.
+// An error after the data's memory was had leaves it had, as the folio does.
+static uint32_t load_sample_here(ArmCpu& c, uint32_t name, uint32_t alloc_fn, uint32_t free_fn) {
+    if ((alloc_fn == 0) != (free_fn == 0)) return AF_ERR_OUTOFRANGE;
+    Sample s;
+    uint32_t err = parse_aiff(c, name, s, alloc_fn);
+    if (g_pf_trace) pf_log("        LoadSample \"%s\" -> 0x%x\n", guest_string(name).c_str(), err);
+    if ((int32_t)err < 0) return err;
+    s.free_fn = free_fn;
+    uint32_t tags = c.r[13] - 32 - 0xb0, info = tags + 0x18;
+    sample_info_write(info, s);
+    const uint32_t t[5] = {AF_TAG_NAME, name, AF_TAG_SAMPLE, info, 0};
+    for (int k = 0; k < 5; ++k) pf_w32(tags + 4u * k, t[k]);
+    return audio_create(c, SAMPLE_NODE, tags);
+}
+static void a_loadsample(ArmCpu& c) { c.r[0] = load_sample_here(c, c.r[0], 0, 0); }
+
+// audio -44: Err UnloadSample(Item sample) -- 0x3c78: a sample (else AF_ERR_BADITEM); deleted; and
+// when that went well and its data is the folio's (bit 0), the data given back -- to the free
+// function it was loaded with (the address less 4 and the size word plus 4), or the folio's FreeMem
+// (0xb2d4: the size before the address, to the caller's lists).
+static void a_unloadsample(ArmCpu& c) {
+    int32_t item = (int32_t)c.r[0];
+    if (!pf_check_item(item, NST_AUDIO, SAMPLE_NODE)) { c.r[0] = AF_ERR_BADITEM; return; }
+    const Sample s = g_samples[item];
+    int32_t err = pf_delete_item(c, item);
+    if (s.address && !err && (s.flags & 1)) {
+        uint32_t p = s.address - 4, size = pf_r32(p);
+        if (s.free_fn) pf_guest_call(c, s.free_fn, p, size + 4);
+        else if ((int32_t)size > 0)
+            pf_free_mem(pf_r32(pf_current_task() + T_FREEMEMORYLISTS), p, (int32_t)size + 4);
+        else pf_stop(c, "UnloadSample: data of the system's lists: not yet");
+    }
+    c.r[0] = (uint32_t)err;
 }
 
 // audio -16: Item GrabKnob(Item instrument, char* name) -- 0x2508:
@@ -1146,6 +1429,9 @@ void pf_audio_init() {
     pf_on_slot(PF_AUDIO, -4, a_loadinstemplate);
     pf_on_slot(PF_AUDIO, -8, a_allocinstrument);
     pf_on_slot(PF_AUDIO, -16, a_grabknob);
+    pf_on_slot(PF_AUDIO, -40, a_loadinstrument);
+    pf_on_slot(PF_AUDIO, -12, a_loadsample);
+    pf_on_slot(PF_AUDIO, -44, a_unloadsample);
     pf_on_slot(PF_AUDIO, -92, a_unloadinstemplate);
     pf_on_slot(PF_AUDIO, -144, a_attachsample);
     pf_on_slot(PF_AUDIO, -148, a_detachsample);

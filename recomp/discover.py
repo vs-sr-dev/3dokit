@@ -25,10 +25,15 @@ word as code or data while it finds the functions:
 3. **Calls** are `bl`s *in reached code*: a `bl` decoded from data does not
    make a function (the read-only data decodes as plenty of them).
 4. **Indirect transfers**: `mov lr, pc` followed by a write to `pc` is a
-   call and returns to the word after it; a folio vector is
+   call and returns to the word after it -- and so is `add lr, pc, #0` (or
+   any `add`/`sub lr, pc, #k` that gives lr the same word); a folio vector is
    `ldr pc, [rB, #-slot]` (`portfolio`); a load of `pc` from the word the
    function stored `lr` in, both addresses computed from `pc`, is a return
    (hand-written code that parks its return address in a word of its own);
+   a word that `add`/`sub lr, pc, #k` puts in lr and the descent reaches
+   as the function's code is a local subroutine's return (`local_returns`:
+   a subroutine reached by a plain `b` comes back there; the word is not
+   followed from lr alone, as hand-written code points lr at tables too);
    anything else that writes `pc` is a jump through a pointer, listed.
 5. **The compiler's switch**: `cmp rI, #n` ... `addls pc, pc, rI, lsl #2`,
    then `b default`, then n+1 cases, each a `b case` word except perhaps the
@@ -57,7 +62,7 @@ EXIT_SWI = 0x11
 
 class Function:
     __slots__ = ('entry', 'code', 'calls', 'tails', 'origin', 'name',
-                 'problems', 'switches', 'indirect')
+                 'problems', 'switches', 'indirect', 'local_returns')
 
     def __init__(self, entry, origin):
         self.entry, self.origin = entry, origin
@@ -65,6 +70,7 @@ class Function:
         self.calls, self.tails = set(), set()
         self.name, self.problems = None, []
         self.switches, self.indirect = {}, []
+        self.local_returns = set()
 
     @property
     def end(self):
@@ -159,6 +165,7 @@ class Program:
     def _descend(self, f):
         f.code, f.calls, f.tails = set(), set(), set()
         f.problems, f.switches, f.indirect = [], {}, []
+        f.local_returns = set()
         todo = [f.entry]
         while todo:
             a = todo.pop()
@@ -177,6 +184,14 @@ class Program:
                 always = i.cond == 14
                 if i.sets_flags():
                     taken.clear()
+                if i.kind == 'dp' and i.op in (2, 4) and i.rd == LR and i.rn == PC and \
+                        i.op2[0] == 'imm' and not i.s:
+                    # lr set to a word that may be this function's code: a local
+                    # subroutine's return, if the descent reaches it by other ways (not
+                    # followed from here: hand-written code also points lr at tables)
+                    v = (a + 8 + (i.op2[1] if i.op == 4 else -i.op2[1])) & 0xFFFFFFFF
+                    if self.start <= v < self.end and (v == f.entry or v not in self.funcs):
+                        f.local_returns.add(v)
                 if i.kind == 'b':
                     if i.link:
                         taken.clear()
@@ -253,6 +268,10 @@ class Program:
         if prev is not None and prev.kind == 'dp' and prev.op == 13 and \
                 prev.rd == LR and prev.op2 == ('reg', PC, 'lsl', 0):
             return 'call'                                    # mov lr, pc first
+        if prev is not None and prev.kind == 'dp' and prev.op in (2, 4) and prev.rd == LR and \
+                prev.rn == PC and prev.op2[0] == 'imm' and not prev.s and \
+                (a - 4 + 8 + (prev.op2[1] if prev.op == 4 else -prev.op2[1])) & 0xFFFFFFFF == a + 4:
+            return 'call'                                    # add lr, pc, #0 first: the same lr
         return 'jump'
 
     def _pc_relative(self, f, a, reg, cond):

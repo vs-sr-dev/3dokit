@@ -12,7 +12,9 @@ instruction: the self-test (`recomp.selftest`) holds the two together.
 * `bl` as a C++ call with lr set first and the return checked (ARM_RET:
   the callee must come back to the word after the call); a `b` to another
   function's entry as a tail call; a return (`mov pc, lr`, `ldm ..., pc`,
-  `ldr pc, [sp], #4`) records where it went in `c.pc` and returns;
+  `ldr pc, [sp], #4`) records where it went in `c.pc` and returns -- or,
+  in a function with local subroutines (discovery's `local_returns`), goes
+  to the one of them it names;
 * the compiler's switch (`addls pc, pc, rI, lsl #2`) as a C++ `switch` over
   its branch table; any other write to pc after `mov lr, pc` as a call
   through `arm_call`, and otherwise a jump through it (a tail);
@@ -339,6 +341,10 @@ class Body:
         kind = self.p._pc_write(i, a, self.f)
         if kind == 'return':
             self._count('return')
+            local = sorted(t for t in getattr(self.f, 'local_returns', ()) if t in self.f.code)
+            if local:                                   # back from a local subroutine, or out
+                cases = ' '.join('case 0x%08Xu: goto L_%08X;' % (t, t) for t in local)
+                return '{ const uint32_t t = %s & ~3u; switch (t) { %s } c.pc = t; return; }' % (value, cases)
             return 'c.pc = %s & ~3u; return;' % value
         if kind == 'call':
             self._count('indirect call')
@@ -354,6 +360,7 @@ class Body:
                 out.add(i.target)
             if a in self.f.switches:
                 out |= {t for t in self.f.switches[a] if t in code}
+        out |= {t for t in getattr(self.f, 'local_returns', ()) if t in code}
         return out
 
     def _insn(self, a):

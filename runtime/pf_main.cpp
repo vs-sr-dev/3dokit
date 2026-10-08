@@ -30,6 +30,14 @@
 //
 // boots the same way but runs the allocator's test instead of the program
 // (pf_memtest.cpp; python -m 3dokit.pfcheck replays it on the 1993 kernel).
+//
+//     pfboot DISC --boot [the options above but --memtest and --disc]
+//
+// starts the disc as the console's shell does (pf_file.cpp's pf_shell_boot):
+// its scripts from ^/system/scripts/startopera on, each program they name run
+// to its end in turn -- every one of them must be in this build. Each program
+// boots a fresh OS; the guest's clock and the fields counted go on from the
+// last (the pad's fields are the whole run's).
 #include "pf.h"
 #include <cstdio>
 #include <cstdlib>
@@ -99,18 +107,35 @@ static uint32_t bl_target(const std::vector<uint8_t>& d, uint32_t at) {
     return at + 8 + (uint32_t)off * 4;
 }
 
+// A program the shell names (--boot): its AIF image read and run to its end.
+static int run_program(const std::string& path) {
+    std::ifstream f(path, std::ios::binary);
+    std::vector<uint8_t> d((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
+    if (d.size() < 0x100 || be32(d, 0x10) != 0xEF000011u) {
+        std::fprintf(stderr, "%s: not an AIF image\n", path.c_str());
+        std::exit(2);
+    }
+    uint32_t ro = be32(d, 0x14), rw = be32(d, 0x18), bss = be32(d, 0x20);
+    uint32_t stub = bl_target(d, 0x04);
+    if (!stub) stub = ro + rw;
+    int r = pf_run(d.data(), stub, ro + rw + bss, bl_target(d, 0x0C));
+    if (g_pf_boot_failed) std::exit(2);         // not run at all (no module): the shell would go round
+    return r;
+}
+
 int main(int argc, char** argv) {
     if (argc < 2) {
         std::fprintf(stderr, "usage: pfboot PROGRAM [--trace N] [--lenient] [--max-calls N] [--snap N DIR] [--disc DIR]\n"
                              "                      [--frames DIR [--frames-at FIRST[-LAST][/EVERY]]]\n"
                              "                      [--pad BUTTONS@FIELD[xN][/E][+H]]... [--window [--record FILE]]\n"
-                             "       pfboot PROGRAM --memtest DIR [--ops N] [--seed S]\n");
+                             "       pfboot PROGRAM --memtest DIR [--ops N] [--seed S]\n"
+                             "       pfboot DISC --boot [the options above]\n");
         return 2;
     }
     const char* memtest = nullptr;
     const char* disc = nullptr;
     const char* record = nullptr;
-    bool window = false;
+    bool window = false, boot = false;
     int ops = 2000;
     uint32_t seed = 1;
     for (int i = 2; i < argc; ++i) {
@@ -136,10 +161,31 @@ int main(int argc, char** argv) {
             }
         }
         else if (!std::strcmp(argv[i], "--window")) window = true;
+        else if (!std::strcmp(argv[i], "--boot")) boot = true;
         else if (!std::strcmp(argv[i], "--record") && i + 1 < argc) record = argv[++i];
         else if (!std::strcmp(argv[i], "--memtest") && i + 1 < argc) memtest = argv[++i];
         else if (!std::strcmp(argv[i], "--ops") && i + 1 < argc) ops = std::atoi(argv[++i]);
         else if (!std::strcmp(argv[i], "--seed") && i + 1 < argc) seed = (uint32_t)std::strtoul(argv[++i], nullptr, 0);
+    }
+    if (boot) {
+        if (memtest || disc) {
+            std::fprintf(stderr, "--boot: not with --memtest or --disc (the DISC is the disc)\n");
+            return 2;
+        }
+        g_pf_disc_root = argv[1];
+        if (window) {
+#ifdef TDK_WINDOW
+            return pf_window_run(argv[1], record, [] { return pf_shell_boot(run_program); });
+#else
+            std::fprintf(stderr, "--window: this pfboot was built without SDL3\n");
+            return 2;
+#endif
+        }
+        if (record) {
+            std::fprintf(stderr, "--record: only with --window\n");
+            return 2;
+        }
+        return pf_shell_boot(run_program);
     }
     if (disc) g_pf_disc_root = disc;
     else {

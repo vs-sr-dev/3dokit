@@ -307,8 +307,14 @@ int pf_boot(const uint8_t* image, size_t size, uint32_t bss_end) {
 
 const uint8_t* pf_os_memory() { return g_os; }
 
+bool g_pf_boot_failed;
+
 int pf_run(const uint8_t* image, size_t size, uint32_t bss_end, uint32_t entry) {
-    if (int bad = pf_boot(image, size, bss_end)) return bad;
+    g_pf_boot_failed = false;
+    if (int bad = pf_boot(image, size, bss_end)) {
+        g_pf_boot_failed = true;
+        return bad;
+    }
     const ArmModule* m = g_module;
     const uint32_t argv = PF_OS_BASE + 0x100;
     ArmCpu c{};

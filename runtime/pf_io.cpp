@@ -327,7 +327,7 @@ static void sport_vbl(uint64_t) {
 // BADIOARG); CMD_WRITE (0) is BADCOMMAND. Unit 1 and CMD_STATUS (2) stop the run: not yet.
 enum : uint32_t { TIMER_UNIT_VBLANK = 0, TIMERCMD_DELAY = 3, TIMERCMD_DELAYUNTIL = 4 };
 
-static uint64_t g_vbl_count;
+static uint64_t g_vbl_count;                    // the blanks since the boot
 static std::vector<uint32_t> g_timer_waiting;   // by ioi_Offset, as the Operator's list
 
 static int32_t timer_dispatch(uint32_t ior) {
@@ -379,7 +379,8 @@ void pf_io_init() {
     g_deleters.clear();
     g_sport_waiting.clear();
     g_timer_waiting.clear();
-    g_vbl_count = 0;
+    // g_vbl_count stays: the timer is the console's Operator's, counting from the boot, not the
+    // program's (the shell's next program, pfboot --boot, goes on from it)
     pf_on_swi(0x10000, k_createsizeditem);
     pf_on_swi(0x10018, k_sendio);
     pf_on_swi(0x10003, k_deleteitem);

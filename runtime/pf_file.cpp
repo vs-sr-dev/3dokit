@@ -704,6 +704,30 @@ done:                                                       // 0x55e8
     c.r[0] = dst - orig;
 }
 
+// The streams for the OS's own code: the program's calls, on a copy of its registers.
+static uint32_t stream_call(const ArmCpu& c, uint32_t below, void (*fn)(ArmCpu&), uint32_t r0, uint32_t r1,
+                            uint32_t r2) {
+    ArmCpu s = c;
+    s.r[13] = c.r[13] - below;
+    s.r[0] = r0;
+    s.r[1] = r1;
+    s.r[2] = r2;
+    fn(s);
+    return s.r[0];
+}
+uint32_t pf_stream_open(const ArmCpu& c, uint32_t below, uint32_t name, int32_t bsize) {
+    return stream_call(c, below, f_opendiskstream, name, (uint32_t)bsize, 0);
+}
+int32_t pf_stream_read(const ArmCpu& c, uint32_t below, uint32_t st, uint32_t dst, int32_t n) {
+    return (int32_t)stream_call(c, below, f_readdiskstream, st, dst, (uint32_t)n);
+}
+int32_t pf_stream_seek(const ArmCpu& c, uint32_t below, uint32_t st, int32_t offset, uint32_t whence) {
+    return (int32_t)stream_call(c, below, f_seekdiskstream, st, (uint32_t)offset, whence);
+}
+void pf_stream_close(const ArmCpu& c, uint32_t below, uint32_t st) {
+    stream_call(c, below, f_closediskstream, st, 0, 0);
+}
+
 // ---- the shell's start -----------------------------------------------------------------------
 // The program's aliases come from the shell that starts it: the disc's own (System/Tasks/shell,
 // 1993) makes `alias boot /` and the boot filesystem's name, goes to `$boot`, and runs the script
@@ -747,6 +771,107 @@ static void shell_start() {
     std::string at;
     std::set<std::string> ran;
     if (!walk("^/system/scripts/startopera", at)) shell_script(at, ran);
+}
+
+// ---- the shell, running the disc (pfboot --boot) ---------------------------------------------
+// The same scripts carried out line by line, as the console's shell does: the words of a line up
+// to one beginning with '#'; `alias NAME VALUE`; the shell's own commands that touch nothing here
+// (bg, bgkill, killkprintf, minmem) passed over -- `bg` most likely sends the programs after it,
+// the OS's own, to the background, and a trailing `#` (Crash 'n Burn's "^/ex #") may ask for a
+// program to be waited for; every program here is waited for, which is what the console shows
+// of that disc -- ; a name walked as the File folio walks it: an AIF
+// image is a program -- the OS's own (under /System: the daemons, the folios, the event broker)
+// are the runtime's and are not run; any other is run until it ends, then the next line --, any
+// other file a script, run there and then (as its last line, in its place: a disc's scripts can
+// name each other for ever, as Crash 'n Burn's runme1 and runme2 do). What is none of these is
+// reported and passed over.
+static int (*g_shell_run)(const std::string& host);
+static int g_shell_result;
+
+static bool is_aif_file(const std::string& host) {
+    std::ifstream f(host, std::ios::binary);
+    char h[0x14] = {};
+    f.read(h, sizeof h);
+    return f.gcount() == sizeof h && (uint8_t)h[0x10] == 0xEF && (uint8_t)h[0x13] == 0x11;
+}
+
+static std::vector<std::vector<std::string>> script_lines(const std::string& at) {
+    std::ifstream f(host_of(at), std::ios::binary);
+    std::string text((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
+    std::vector<std::vector<std::string>> out;
+    size_t i = 0;
+    while (i < text.size()) {
+        size_t j = text.find_first_of("\r\n", i);
+        if (j == std::string::npos) j = text.size();
+        std::string line = text.substr(i, j - i);
+        i = j + 1;
+        std::vector<std::string> words;
+        for (size_t k = 0; k < line.size();) {
+            size_t s = line.find_first_not_of(" \t", k);
+            if (s == std::string::npos) break;
+            size_t e = line.find_first_of(" \t", s);
+            if (e == std::string::npos) e = line.size();
+            if (line[s] == '#') break;
+            words.push_back(line.substr(s, e - s));
+            k = e;
+        }
+        if (!words.empty()) out.push_back(words);
+    }
+    return out;
+}
+
+static void shell_carry_out(std::string at, int depth) {
+    if (depth > 64) {
+        std::fprintf(stderr, "the shell: scripts nested more than 64 deep at %s\n", at.c_str());
+        std::exit(3);
+    }
+    for (;;) {
+        std::vector<std::vector<std::string>> lines = script_lines(at);
+        std::string next;
+        for (size_t n = 0; n < lines.size(); ++n) {
+            const std::vector<std::string>& w = lines[n];
+            const std::string cmd = lower(w[0]);
+            if (cmd == "alias") {
+                if (w.size() >= 3) g_aliases[0][lower(w[1])] = w[2];
+                continue;
+            }
+            if (cmd == "bg" || cmd == "bgkill" || cmd == "killkprintf" || cmd == "minmem") continue;
+            std::string to;
+            g_cwd = "/";                                // the shell's own directory, $boot
+            if (walk(w[0], to) || is_dir(to)) {
+                pf_log("the shell: %s: no such program or script here\n", w[0].c_str());
+                continue;
+            }
+            std::string host = host_of(to).string();
+            if (is_aif_file(host)) {
+                if (lower(to).rfind("/system/", 0) == 0) continue;     // the OS's own: the runtime's
+                pf_log("the shell: %s (%s)\n", w[0].c_str(), to.c_str());
+                g_shell_result = g_shell_run(host);
+                pf_log("the shell: %s ended, %d\n", w[0].c_str(), g_shell_result);
+                continue;
+            }
+            if (n + 1 == lines.size()) { next = to; break; }           // a script as the last line
+            shell_carry_out(to, depth + 1);
+        }
+        if (next.empty()) return;
+        at = next;
+    }
+}
+
+int pf_shell_boot(int (*run)(const std::string& host)) {
+    g_shell_run = run;
+    g_cwd = "/";
+    g_aliases.clear();
+    g_aliases[0]["boot"] = "/";
+    std::string at;
+    if (!walk("^/system/scripts/startopera", at)) shell_carry_out(at, 0);
+    else pf_log("the shell: no ^/system/scripts/startopera\n");
+    g_cwd = "/";
+    if (!walk("$boot/LaunchMe", at) && !is_dir(at)) {
+        pf_log("the shell: $boot/LaunchMe\n");
+        g_shell_result = run(host_of(at).string());
+    }
+    return g_shell_result;
 }
 
 void pf_file_init() {

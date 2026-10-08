@@ -60,9 +60,14 @@ static void write_frame(uint32_t vbl);
 
 PfTimeFn g_pf_display_vbl;
 
+// The fields counted so far, kept across a program's end: the folio, which on the console stays
+// loaded from one program to the next, starts the next one's count from it.
+static uint32_t g_vbl_number;
+
 static void graphics_vbl(uint64_t when) {
     uint32_t g = pf_folio_base(PF_GRAPHICS), n = pf_r32(g + GF_VBLNUMBER) + 1;
     pf_w32(g + GF_VBLNUMBER, n);
+    g_vbl_number = n;
     pf_w32(pf_r32(g + GF_VDLDISPLAYLINK), pf_r32(g + (n & 1 ? GF_CURRENTVDLODD : GF_CURRENTVDLEVEN)));
     if (g_pf_frames_dir && n >= g_pf_frames_first && n <= g_pf_frames_last && (n - g_pf_frames_first) % g_pf_frames_every == 0)
         write_frame(n);
@@ -145,7 +150,7 @@ void pf_graphics_init() {
     pf_on_vbl(graphics_vbl);
     uint32_t g = pf_folio_base(PF_GRAPHICS), kl = pf_kernel_lists();
     uint32_t page = pf_page_size(MEMTYPE_VRAM);             // the VRAM page, 2 KB
-    pf_w32(g + GF_VBLNUMBER, 0);
+    pf_w32(g + GF_VBLNUMBER, g_vbl_number);
     pf_w32(g + GF_VRAMPAGESIZE, page);
     pf_w32(g + GF_DEFAULTDISPLAYWIDTH, 320);
     pf_w32(g + GF_DEFAULTDISPLAYHEIGHT, 240);

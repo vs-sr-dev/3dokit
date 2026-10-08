@@ -64,11 +64,16 @@ static void vbl(uint64_t when) {
     pf_at(when + kFieldNs, vbl);
 }
 
+// The first program's boot starts the clock at 0; a later one's (the shell running the next
+// program, pfboot --boot) keeps it running, its first blank at the next field's.
+static bool g_started;
+
 void pf_time_init() {
     g_events = {};
-    g_now = g_seq = 0;
     g_vbl.clear();
-    pf_at(kFieldNs, vbl);
+    if (!g_started) g_now = g_seq = 0;
+    g_started = true;
+    pf_at((g_now / kFieldNs + 1) * kFieldNs, vbl);
 }
 
 bool g_pf_wait_forever;
