@@ -96,9 +96,13 @@ class AIF:
         self.name = h[0x40:0x60].split(b'\0')[0].decode('latin1')
         self.time = struct.unpack_from('>I', h, 0x60)[0]
         self.stub = self._bl_target(0x04)
+        # A NOP at 0x04: the image does not relocate itself, and has no list. Only the kernels
+        # linked at their own base have one there (1993's os_code and misc_code, 1994's os_code
+        # 20.21, all at 0x10000); every image linked at 0 has the BL.
+        self.fixed = struct.unpack_from('>I', data, 0x04)[0] == NOP
         if self.stub is None:
             self.stub = self.ro + self.rw + self.debug
-        self.relocs = [] if self.compressed else self._relocs()
+        self.relocs = [] if self.compressed or self.fixed else self._relocs()
 
     def _bl_target(self, at):
         w = struct.unpack_from('>I', self.d, at)[0]
