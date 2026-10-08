@@ -77,7 +77,7 @@ struct Fifo {
 };
 
 // ---- the instruments ----------------------------------------------------------------------------
-enum Kind { NONE, MIXER, SAMPLER, VARMONO8, DCSQXDHALFMONO, DCSQXDHALFSTEREO, ENVELOPE, FIXEDMONO, DIRECTOUT };
+enum Kind { NONE, MIXER, SAMPLER, VARMONO8, DCSQXDHALFMONO, DCSQXDHALFSTEREO, ENVELOPE, FIXEDMONO, DIRECTOUT, DCSQXDMONO, HALFMONO8, NOISE };
 
 struct Model {
     const char* file;
@@ -103,6 +103,9 @@ const Model kModels[] = {
     {"dcsqxdhalfmono.dsp", 0x7c904d9au, DCSQXDHALFMONO, 0, true},
     {"fixedmonosample.dsp", 0x379b0cfau, FIXEDMONO, 0},
     {"directout.dsp", 0x48203189u, DIRECTOUT, 0},
+    {"dcsqxdmono.dsp", 0xcbf1a686u, DCSQXDMONO, 0, true},
+    {"halfmono8.dsp", 0x9affb1e7u, HALFMONO8, 0, true},
+    {"noise.dsp", 0x547cb548u, NOISE, 0},
 };
 
 struct Input { int32_t src; uint32_t rsrc; };
@@ -128,6 +131,8 @@ struct Unit {
     int ecur = -1, esrc = -1, etgt = -1, ephase = -1, eincr = -1, ereq = -1;
     // directout.dsp's
     int ileft = -1, iright = -1;
+    // dcsqxdmono.dsp's
+    int dtoggle = -1;
     std::vector<int> in, left, right;
 };
 
@@ -395,6 +400,76 @@ void run_directout(Unit& u) {
     g_bus_r = wb(add_clip(word(g_bus_r), word(value(u, u.iright))));
 }
 
+// dcsqxdmono.dsp (23.10): SDX2 mono at the full rate, a byte a frame. Nothing at all while the
+// FIFO's status says it is empty. dc_toggle steps by 0x8000: on a frame it goes negative a new word
+// comes in (dc_hold) and its high byte is the frame's, otherwise the low byte of the one held; the
+// byte squared with its sign, an odd byte adding the square to the sum (with CLIP), an even one the
+// sum; Output the sum times Amplitude.
+void run_dcsqxd_full(int32_t item, Unit& u) {
+    if (!fifo_has(u, u.in_fifo)) return;
+    std::vector<int16_t>& m = u.mem;
+    auto& tg = m[(size_t)u.dtoggle];
+    auto& sq = m[(size_t)u.square];
+    auto& by = m[(size_t)u.byte];
+    auto& hd = m[(size_t)u.hold];
+    auto& ac = m[(size_t)u.accum];
+    uint32_t y = word(tg) + word((int16_t)0x8000);
+    tg = wb(y);
+    if (y >> 31) {
+        hd = (int16_t)fifo_read(item, u, u.in_fifo);
+        y = word(hd) & 0xFF000000u;
+    } else {
+        y = word(hd) << 8;
+    }
+    by = wb(y);
+    if (y >> 31) y = 0u - y;
+    sq = wb(mul_acc(by, y));
+    y = ((uint16_t)by & 0x100) ? add_clip(word(sq), word(ac)) : word(sq);
+    ac = wb(y);
+    m[(size_t)u.out] = wb(mul_acc(value(u, u.amp), y));
+}
+
+// halfmono8.dsp (23.10): 8-bit samples at half the rate, two to a word, the high byte first.
+// Nothing at all while the FIFO's status says it is empty. CurState counts the frames: on the
+// first of four a new word comes in (SampleHold) and the frame plays the mean of the last value
+// and its high byte; on the second the high byte is the last value, and plays; the third the mean
+// of it and the low byte; the fourth the low byte, the last value now. Output times Amplitude.
+void run_halfmono8(int32_t item, Unit& u) {
+    if (!fifo_has(u, u.in_fifo)) return;
+    std::vector<int16_t>& m = u.mem;
+    auto& cs = m[(size_t)u.state];
+    auto& sh = m[(size_t)u.hold];
+    auto& pv = m[(size_t)u.prev];
+    cs = wb(word(cs) + word(1));
+    uint32_t y;
+    bool low = cs & 2;
+    if (!(cs & 1)) {
+        if (!low) {
+            sh = (int16_t)fifo_read(item, u, u.in_fifo);
+            y = word(sh) & 0xFF000000u;
+        } else {
+            y = word(sh) << 8;
+        }
+        y = ((uint32_t)((int32_t)y >> 1)) & kAlu;
+        y = mul(pv, 0x4000) + y;
+    } else {
+        y = low ? word(sh) << 8 : word(sh) & 0xFF000000u;
+        pv = wb(y);
+    }
+    m[(size_t)u.out] = wb(mul_acc(value(u, u.amp), y));
+}
+
+// noise.dsp (23.10): the DSP's noise register (I memory 0x0EA, a new value each read) times
+// Amplitude. The hardware's sequence is not known (Opera reads a generic generator there): a fixed
+// xorshift32's top 16 bits, so that a run sounds the same every time.
+uint32_t g_noise = 0x2545F491u;
+void run_noise(Unit& u) {
+    g_noise ^= g_noise << 13;
+    g_noise ^= g_noise >> 17;
+    g_noise ^= g_noise << 5;
+    u.mem[(size_t)u.out] = wb(mul((int16_t)(g_noise >> 16), value(u, u.amp)));
+}
+
 // One frame: head.dsp first (the bus to the DAC, and cleared), then the running instruments.
 void frame() {
     g_out.push_back(g_bus_l);
@@ -414,6 +489,9 @@ void frame() {
         case ENVELOPE: run_envelope(u); break;
         case FIXEDMONO: run_fixedmono(item, u); break;
         case DIRECTOUT: run_directout(u); break;
+        case DCSQXDMONO: run_dcsqxd_full(item, u); break;
+        case HALFMONO8: run_halfmono8(item, u); break;
+        case NOISE: run_noise(u); break;
         case NONE: break;
         }
     }
@@ -487,7 +565,9 @@ void pf_dsp_new(int32_t ins, const std::string& file, const std::vector<std::str
     u.oldv = rsrc_named(u, "OldVal");
     u.newv = rsrc_named(u, "NewVal");
     u.toggle = rsrc_named(u, "Toggle");
-    u.hold = rsrc_named(u, u.kind == DCSQXDHALFMONO || u.kind == DCSQXDHALFSTEREO ? "dc_hold" : "SampleHold");
+    u.hold = rsrc_named(u, u.kind == DCSQXDHALFMONO || u.kind == DCSQXDHALFSTEREO || u.kind == DCSQXDMONO ? "dc_hold"
+                                                                                                      : "SampleHold");
+    u.dtoggle = rsrc_named(u, "dc_toggle");
     for (int s = 0; s < 2; ++s) {
         const std::string side = s ? "right" : "left", Side = s ? "Right" : "Left";
         u.sbyte[s] = rsrc_named(u, "dc_" + side + "byte");

@@ -648,6 +648,62 @@ static void g_setcecontrol(ArmCpu& c) {
     c.r[0] = 0;
 }
 
+// Graphics -132: Err DrawTo(Item bitmap, GrafCon* gc, Coord x, Coord y) -- SWI 33 (0x2648; 23.10's
+// graphix 0x2d78, the same): a line from the pen to (x, y) as one cel the folio builds on its
+// stack and draws with DrawCels -- a single 16-bit uncoded pixel of gc_FGPen (preamble 0x16 and 0,
+// the pixel in the high half of the next word), CCB flags 0x57260030 (LAST, SPABS, LDSIZE, LDPRS,
+// LDPPMP, YOXY, ACW, ACCW, BGND, NOBLK), PIXC 0x1f401f40, width and height 1. It runs downward,
+// from whichever end is higher: VDX and VDY the line, in 16.16. A line at least as wide as tall
+// steps its pixel by HDY -1 (12.20) and grows by one pixel each way (VDY + 1, VDX away from 0 by
+// 1, the start moved right by 1 when VDX is negative); a steeper one by HDX 1, VDX away from 0 by
+// 1, VDY + 1. The pen moves to (x, y); DrawCels' result back.
+static void g_drawto(ArmCpu& c) {
+    static uint32_t s_block;
+    if (!s_block) s_block = pf_os_alloc(0x50);
+    uint32_t gc = c.r[1];
+    int32_t x = (int32_t)c.r[2], y = (int32_t)c.r[3];
+    int32_t penx = (int32_t)pf_r32(gc + 0x1c), peny = (int32_t)pf_r32(gc + 0x20);
+    uint32_t b = s_block, ccb = b + 0xc;
+    for (uint32_t i = 0; i < 0x50; i += 4) pf_w32(b + i, 0);
+    pf_w32(b + 0, 0x16);
+    pf_w32(b + 8, pf_r32(gc + 0x14) << 16);
+    pf_w32(ccb + 0x00, 0x57260030u);
+    pf_w32(ccb + 0x08, b);
+    pf_w32(ccb + 0x30, 0x1f401f40u);
+    pf_w32(ccb + 0x3c, 1);
+    pf_w32(ccb + 0x40, 1);
+    auto fx = [](int32_t v) { return (int32_t)((uint32_t)v << 16); };    // 16.16
+    int32_t sx, sy, vdx, vdy;
+    if (y >= peny) {
+        sx = fx(penx); sy = fx(peny); vdx = fx(x) - sx; vdy = fx(y) - sy;
+    } else {
+        sx = fx(x); sy = fx(y); vdx = fx(penx) - sx; vdy = fx(peny) - sy;
+    }
+    int32_t hdx, hdy;
+    if ((vdx < 0 ? -vdx : vdx) >= vdy) {
+        hdx = 0;
+        hdy = (int32_t)0xFFF00000u;
+        vdy += 0x10000;
+        if (vdx >= 0) vdx += 0x10000;
+        else { vdx -= 0x10000; sx += 0x10000; }
+    } else {
+        hdx = 0x100000;
+        hdy = 0;
+        vdx += vdx < 0 ? -0x10000 : 0x10000;
+        vdy += 0x10000;
+    }
+    pf_w32(ccb + 0x10, (uint32_t)sx);
+    pf_w32(ccb + 0x14, (uint32_t)sy);
+    pf_w32(ccb + 0x18, (uint32_t)hdx);
+    pf_w32(ccb + 0x1c, (uint32_t)hdy);
+    pf_w32(ccb + 0x20, (uint32_t)vdx);
+    pf_w32(ccb + 0x24, (uint32_t)vdy);
+    pf_w32(gc + 0x1c, (uint32_t)x);
+    pf_w32(gc + 0x20, (uint32_t)y);
+    c.r[1] = ccb;
+    g_drawcels(c);
+}
+
 // Graphics -60: Err SetClipOrigin(Item bitmap, int32 x, int32 y) -- SWI 3 (0x1e98): the bitmap
 // (CheckItem, else GRAFERR_BADITEM), the caller's or open (else GRAFERR_NOTOWNER); y made even;
 // the clip rectangle must lie inside the bitmap -- x and y at least 0, x + bm_ClipWidth at most
@@ -783,6 +839,7 @@ static void graphics_slots() {
     pf_on_slot(PF_GRAPHICS, -100, g_setbgpen);
     pf_on_slot(PF_GRAPHICS, -120, g_moveto);
     pf_on_slot(PF_GRAPHICS, -152, g_setcecontrol);
+    pf_on_slot(PF_GRAPHICS, -132, g_drawto);
     pf_on_delete(NST_GRAPHICS, graphics_delete);
     pf_on_slot(PF_GRAPHICS, -160, g_displayscreen);
     pf_on_slot(PF_GRAPHICS, -172, g_drawcels);
