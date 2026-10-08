@@ -186,15 +186,16 @@ int32_t  pf_delete_task(ArmCpu& c, uint32_t task);  // DeleteItem's own part for
 void     pf_task_release(int32_t task);
 
 // Time (pf_time.cpp): the guest's clock, in nanoseconds since the boot. It is not the host's:
-// it moves on by a fixed amount at each safe point the recompiled code passes (backward branches
-// and calls, ARM_POLL), and when every task waits it jumps to the next event. So a run is the
-// same every time, however fast the host is. An event is what an interrupt does on the console
+// it moves on by the clocks the ARM60 would take over the recompiled code (ARM_TICK, counted at
+// the safe points it passes: backward branches and calls, ARM_POLL), and when every task waits
+// it jumps to the next event. So a run is the same every time, however fast the host is. The
+// OS's own work (the runtime's, native) takes no guest time. An event is what an interrupt does on the console
 // (the vertical blank, the audio clock's tick): at its time, at the next safe point or as the
 // waiting tasks idle, it runs and may signal tasks, and a higher-priority task made ready then
 // runs at once, as it would when the interrupt returns.
 typedef void (*PfTimeFn)(uint64_t when);
-enum : int32_t { PF_POLL_EVERY = 64 };              // safe points between two calls of arm_poll
-extern uint64_t g_pf_safe_point_ns;                 // the guest time a safe point stands for
+enum : int32_t { PF_POLL_EVERY = 1024 };            // ARM60 clocks between two calls of arm_poll
+extern uint64_t g_pf_clock_ns;                      // the guest time an ARM60 clock stands for (80)
 void     pf_time_init();
 uint64_t pf_now();
 void     pf_at(uint64_t when, PfTimeFn fn);         // fn(when) at that time (or now, if past)

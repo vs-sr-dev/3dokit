@@ -18,7 +18,11 @@ instruction: the self-test (`recomp.selftest`) holds the two together.
   through `arm_call`, and otherwise a jump through it (a tail);
 * `swi` as `arm_swi`, the OS's door; folio vectors are calls through
   `arm_call` to what the folio's table holds in guest memory;
-* safe points (ARM_POLL) at backward branches and before calls.
+* safe points (ARM_POLL) at backward branches and before calls;
+* the clocks the ARM60 would take (ARM_TICK): a block (from a label, or
+  from the word after one that can leave) pays at its start for every
+  instruction in it, a conditional one 1 clock there (a failed condition)
+  and the rest inside its `if` (`clocks`).
 
 What `armemu` refuses as unpredictable in user mode the emitter refuses
 too (`Unsupported`), so the C++ never quietly does something else.
@@ -173,6 +177,35 @@ def bdt_plan(i):
                   'const uint32_t fin = %s;' % fin]
 
 
+def clocks(i):
+    """The clocks the ARM60 takes over an instruction that executes, as
+    its datasheet counts the cycles: S (sequential), N (non-sequential),
+    I (internal); a failed condition is 1S. The 3DO's ARM60 has no cache
+    and an N cycle takes two clocks (as Opera counts it), S and I one. A
+    multiply's internal cycles depend on rs: arm_mul_m adds them where it
+    runs, so 1S here."""
+    k = i.kind
+    if k == 'dp':
+        n = 1 + (i.op2[0] == 'regreg')
+        if i.rd == PC and i.op not in TEST_OPS:
+            n += 3                                      # + S + N
+        return n
+    if k == 'sdt':
+        if i.l:
+            return 7 if i.rd == PC else 4               # S + N + I (+ S + N)
+        return 4                                        # 2N
+    if k == 'bdt':
+        x = bin(i.regs).count('1')
+        if i.l:
+            return x + (6 if i.regs >> PC & 1 else 3)   # xS + N + I (+ S + N)
+        return x + 3                                    # (x - 1)S + 2N
+    if k == 'swp':
+        return 6                                        # S + 2N + I
+    if k in ('b', 'swi'):
+        return 4                                        # 2S + N
+    return 1                                            # mul, mrs, msr: S
+
+
 def stmt(i, a):
     """C++ for one instruction that does not write pc (and is not a branch
     or a swi): a block of statements, or a single one."""
@@ -325,11 +358,13 @@ class Body:
 
     def _insn(self, a):
         """(C++ for the instruction at `a`, whether control can go on to
-        the next word)."""
+        the next word, the clocks its block pays for it, whether it can
+        leave the block)."""
         i = self.ops[a]
         k = i.kind
         cond = COND.get(i.cond)
         on = True
+        leaves = k in ('b', 'swi') or i.writes_pc() or a in self.f.switches
         if k == 'b':
             if i.link:
                 text = self._call(i.target, a + 4)
@@ -378,18 +413,25 @@ class Body:
                 raise Unsupported('%08X: %s writes pc' % (a, arm60.text(i)))
         else:
             text = stmt(i, a)
-        if cond is not None:
-            text = 'if (%s) { %s }' % (cond, text)
-        return text, on
+        if k == 'mul':
+            text = 'ARM_TICK(c, arm_mul_m(%s)); %s' % (R(i.rs), text)
+        full = clocks(i)
+        if cond is None:
+            return text, on, full, leaves
+        if full > 1:
+            text = 'ARM_TICK(c, %d); %s' % (full - 1, text)
+        return 'if (%s) { %s }' % (cond, text), on, 1, leaves
 
     def emit(self):
         """The C++ function, as a list of lines."""
         labels = self.labels()
         code = self.f.code
         order = sorted(code)
-        body = []
+        body, charge, leaves = [], {}, set()
         for n, a in enumerate(order):
-            text, on = self._insn(a)
+            text, on, charge[a], out = self._insn(a)
+            if out:
+                leaves.add(a)
             if self.comments:
                 text += '  // %08X %s' % (a, arm60.text(self.ops[a]))
             nxt = order[n + 1] if n + 1 < len(order) else None
@@ -408,9 +450,18 @@ class Body:
         if order and order[0] != self.f.entry:          # code shared from below the entry
             labels.add(self.f.entry)
             lines.append('    goto L_%08X;' % self.f.entry)
+        # each block's clocks, paid at its first word
+        tick, start = {}, None
+        for n, a in enumerate(order):
+            if start is None or a in labels or order[n - 1] in leaves or order[n - 1] + 4 != a:
+                start = a
+                tick[a] = 0
+            tick[start] += charge[a]
         for a, text, after in body:
             if a in labels:
                 lines.append('L_%08X:' % a)
+            if a in tick:
+                text = 'ARM_TICK(c, %d); %s' % (tick[a], text)
             lines.append('    ' + text)
             if after:
                 lines.append('    ' + after)

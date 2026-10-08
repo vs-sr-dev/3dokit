@@ -22,7 +22,7 @@ struct ArmCpu {
     uint32_t r[16];
     uint32_t n, z, c, v;                // the flags, 0 or 1 each
     uint32_t pc;                        // where the last return went: the caller checks it
-    int32_t  budget;                    // safe points left before arm_poll
+    int32_t  budget;                    // ARM60 clocks left before arm_poll
 };
 
 typedef void (*ArmFunc)(ArmCpu&);
@@ -48,8 +48,17 @@ void     arm_bad_return(ArmCpu& c, uint32_t expected);   // a return went elsewh
 uint32_t arm_io_read(uint32_t a, int size);          // outside DRAM and VRAM
 void     arm_io_write(uint32_t a, uint32_t v, int size);
 
-// A safe point: backward branches and calls.
-#define ARM_POLL(c) do { if (ARM_UNLIKELY(--(c).budget < 0)) arm_poll(c); } while (0)
+// The clocks the ARM60 would take: a block pays for its instructions at its start (recomp.emit's
+// `clocks`), from the budget.
+#define ARM_TICK(c, n) ((c).budget -= (int32_t)(n))
+// A multiply's internal cycles: Booth's algorithm two bits of rs a cycle, ending when the rest
+// are zero (1 to 16).
+static inline int32_t arm_mul_m(uint32_t rs) {
+    int32_t m = rs ? (32 - __builtin_clz(rs)) / 2 + 1 : 1;
+    return m > 16 ? 16 : m;
+}
+// A safe point (backward branches and calls): the budget spent, the runtime's turn.
+#define ARM_POLL(c) do { if (ARM_UNLIKELY((c).budget < 0)) arm_poll(c); } while (0)
 // After a call: the callee's return must have come back here.
 #define ARM_RET(c, a) do { if (ARM_UNLIKELY((c).pc != (a))) arm_bad_return(c, a); } while (0)
 
