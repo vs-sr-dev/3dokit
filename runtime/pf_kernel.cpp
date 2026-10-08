@@ -110,12 +110,52 @@ static void k_vfprintf(ArmCpu& c) {
 
 // Kernel -120: what the AIF startup calls before main, with argc and argv
 // in r0 and r1, and whose r0 and r1 main then receives. No SDK header or
-// library names it. In the 1993 kernel (os_code v0.16, at 0x10ea0) it is the
-// command line's parser: when the word at the top of the stack is not 0 the
-// loader left the command line there, and it is split at spaces into argv
-// words built below it, sp moved down past them. The loader here leaves no
-// command line (the word is 0), and then argc and argv go on untouched.
-static void k_startup(ArmCpu& c) { (void)c; }
+// library names it. In the 1993 kernel (os_code v0.16, at 0x10ea0) and in
+// 23.10's (0xdc4) it is the command line's parser: when the word at the top
+// of the stack is 0 (the program the runtime boots) argc and argv go on
+// untouched; otherwise CreateTask left the command line there. As 23.10 reads
+// it: a word ends at any character up to a space, and a word is counted at
+// each such end not after a space (so a leading space counts an empty word);
+// the line's bytes, its end included, are made room for below sp, word-aligned
+// down, then a 0 and the count's words of argv below that, sp left at argv.
+// The words are copied there, each ended with a 0, argv[i] its start (written
+// again at each space, which past the last word overwrites the 0 after argv).
+// argc in r0 and r4, argv in r1 and r5, r6 0.
+static void k_startup(ArmCpu& c) {
+    uint32_t sp = c.r[13];
+    if (!pf_r32(sp)) return;
+    uint32_t s = sp, count = 0;
+    uint8_t prev, ch = 0;
+    do {
+        prev = ch;
+        ch = (uint8_t)pf_r8(s++);
+        if (ch > 0x20) continue;
+        if (prev != 0x20) ++count;
+    } while (ch >= 0x20);
+    sp = (sp - (s - c.r[13])) & ~3u;
+    uint32_t to = sp, from = c.r[13];
+    sp -= 4;
+    pf_w32(sp, 0);
+    sp -= count * 4;
+    uint32_t argv = sp, n = 0;
+    ch = 0;
+    do {
+        pf_w32(argv + 4 * n, to);
+        do {
+            prev = ch;
+            ch = (uint8_t)pf_r8(from++);
+            if (ch > 0x20) pf_w8(to++, ch);
+        } while (ch > 0x20);
+        if (prev != 0x20) {
+            pf_w8(to++, 0);
+            ++n;
+        }
+    } while (ch >= 0x20);
+    c.r[13] = sp;
+    c.r[0] = c.r[4] = n;
+    c.r[1] = c.r[5] = argv;
+    c.r[6] = 0;
+}
 
 // Kernel -52: void* memset(void* p, int c, size_t n) -- the destination back
 static void k_memset(ArmCpu& c) {

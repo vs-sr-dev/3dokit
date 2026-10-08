@@ -310,6 +310,12 @@ int32_t pf_scavenge(bool user) {
     return any;
 }
 
+uint32_t pf_alloc_blocks(int32_t size, uint32_t flags) { return alloc_blocks(size, flags); }
+
+// ControlMem(p, size, MEMC_GIVE, 0) by the current task: its pages under [p, p + size) back to
+// the system.
+void pf_give_pages(uint32_t p, uint32_t size) { give_pages(pf_r32(pf_current_task() + T_FREEMEMORYLISTS), p, size); }
+
 static void k_allocmemfrommemlists(ArmCpu& c) { c.r[0] = pf_alloc_mem(c.r[0], (int32_t)c.r[1], c.r[2], true); }
 static void k_freememtomemlists(ArmCpu& c) { pf_free_mem(c.r[0], c.r[1], (int32_t)c.r[2]); }
 static void k_findmh(ArmCpu& c) { c.r[0] = pf_find_mh(c.r[0]); }
@@ -342,10 +348,12 @@ static uint32_t new_memhdr(const char* name, int pri, uint32_t types, uint32_t b
     return mh;
 }
 
-static uint32_t new_memlist(uint32_t mh, const char* name, bool writable) {
-    uint32_t ml = pf_os_alloc(ML_SIZE), l = pf_os_alloc(PF_LIST_SIZE);
+// A MemList for `mh`, with its list of free nodes in the OS's memory -- or, given `l`, none yet
+// (meml_l set later, when the task's stack is placed).
+static uint32_t new_memlist(uint32_t mh, const char* name, bool writable, bool own_list = true) {
+    uint32_t ml = pf_os_alloc(ML_SIZE), l = own_list ? pf_os_alloc(PF_LIST_SIZE) : 0;
     uint32_t words = pf_r8(mh + MH_BITSSIZE);
-    pf_list_init(l, name);
+    if (l) pf_list_init(l, name);
     pf_w8(ml + 8, KERNELNODE);
     pf_w8(ml + 9, MEMLISTNODE);
     pf_w8(ml + 10, 100);
@@ -368,6 +376,104 @@ static void claim(uint32_t ml, uint32_t from, uint32_t to) {
         set_bit(pf_r32(mh + MH_FREEPAGEBITS), pg, false);
         set_bit(pf_r32(ml + ML_OWNBITS), pg, true);
         set_bit(pf_r32(ml + ML_WRITEBITS), pg, true);
+    }
+}
+
+// ---- a task with an image of its own --------------------------------------------------------
+// 23.10's CreateTask (its kernel's 0x64e0) for a task the loader has read an image for: the task
+// gets its own MemLists (0x6924-0x6a6c: "List of Free Mem Lists", VRAM's "task vram ml" at the
+// tail, DRAM's "task dram ml" at the head, their own and write bits from the OS's memory); the
+// image's pages, [image, image + need), go from the creator to it (0x6b38-0x6b84: ControlMem's
+// MEMC_NOWRITE and MEMC_GIVE, 0x5b78) -- its own and writable, no longer the creator's. Then the
+// stack (0x6dd0-0x7004): when what the image leaves of its last page, from `need` rounded up to
+// 16, is more than the stack and 0x60, there, cleared; otherwise pages of their own, as many as
+// the stack and 0x60 take, from the image's MemHdr, cleared. At the top of that room the two
+// MemLists' lists (32 bytes each, VRAM's above), a word below them, the command line below that
+// (`cmdlen` bytes, or a word of 0 when there is none) and the stack pointer at it; the stack
+// under it, its base aligned down to 16 (the size grown by as much); and the room below the
+// stack free in the task's MemList. 23.10 means to fill the stack with 0xdeadcafe, but its fill
+// (0x4ad4) is a bare return. Returns the stack pointer, the stack's base and size in the task;
+// 0 when no pages could be had.
+uint32_t pf_mem_image_task(uint32_t creator, uint32_t task, uint32_t image, uint32_t need, uint32_t stack,
+                           uint32_t cmd, uint32_t cmdlen) {
+    uint32_t tl = pf_os_alloc(PF_LIST_SIZE);
+    pf_list_init(tl, "List of Free Mem Lists");
+    pf_w32(task + T_FREEMEMORYLISTS, tl);
+    uint32_t vram = 0, dram = 0;
+    uint32_t hdrs = kb(KB_MEMHDRLIST);
+    FOR_NODES(mh, hdrs) {
+        if (pf_r32(mh + MH_TYPES) & MEMTYPE_VRAM) vram = mh;
+        else if (!dram) dram = mh;
+    }
+    uint32_t vml = new_memlist(vram, "task vram ml", true, false);
+    pf_list_add_tail(tl, vml);
+    uint32_t dml = 0;
+    if (dram) {
+        dml = new_memlist(dram, "task dram ml", true, false);
+        pf_list_add_head(tl, dml);
+    }
+    // the image's pages: the creator's no more, the task's
+    uint32_t mh = pf_find_mh(image);
+    uint32_t from = memlist_for(pf_r32(creator + T_FREEMEMORYLISTS), mh), to = memlist_for(tl, mh);
+    uint32_t base = pf_r32(mh + MH_MEMBASE), shift = pf_r8(mh + MH_PAGESHIFT);
+    for (uint32_t pg = (image - base) >> shift; pg <= (image + need - 1 - base) >> shift; ++pg) {
+        if (from) {
+            set_bit(pf_r32(from + ML_OWNBITS), pg, false);
+            set_bit(pf_r32(from + ML_WRITEBITS), pg, false);
+        }
+        set_bit(pf_r32(to + ML_OWNBITS), pg, true);
+        set_bit(pf_r32(to + ML_WRITEBITS), pg, true);
+    }
+    // the room for the stack
+    uint32_t mask = pf_r32(mh + MH_PAGEMASK), off = image & mask;
+    uint32_t used = (need + off + 15) & ~15u, spare = ((used + mask) & ~mask) - used;
+    uint32_t room = 0, top = 0;
+    if (spare > stack + 0x60) {
+        room = image + used - off;
+        top = room + spare;
+    } else {
+        int32_t n = (int32_t)((stack + 0x60 + mask) >> shift);
+        room = alloc_pages(mh, task, n, 0);
+        if (!room) return 0;
+        top = room + ((uint32_t)n << shift);
+    }
+    for (uint32_t a = room; a < top; ++a) pf_w8(a, 0);
+    uint32_t vl = top - 0x20, dl = top - 0x40;
+    pf_list_init(vl, "Task VRAM MemList");
+    pf_w32(vml + ML_LIST, vl);
+    pf_list_init(dl, "Task DRAM MemList");
+    if (dml) pf_w32(dml + ML_LIST, dl);
+    uint32_t sp = dl - 4;
+    if (cmd) {
+        sp -= cmdlen;
+        uint32_t i = 0;
+        for (uint8_t ch; (ch = (uint8_t)pf_r8(cmd + i)) != 0; ++i) pf_w8(sp + i, ch);
+        pf_w8(sp + i, 0);
+    } else {
+        pf_w32(sp, 0);
+    }
+    uint32_t sbase = sp - stack;
+    stack += sbase & 15;
+    sbase &= ~15u;
+    pf_w32(task + T_STACKBASE, sbase);
+    pf_w32(task + T_STACKSIZE, stack);
+    if (sbase > room) free_to_memlist(memlist_holding(tl, room), room, sbase - room);
+    return sp;
+}
+
+// A task with lists of its own gone: every page its MemLists own back to the system, free.
+void pf_mem_task_gone(uint32_t task) {
+    uint32_t tl = pf_r32(task + T_FREEMEMORYLISTS);
+    if (!tl) return;
+    FOR_NODES(ml, tl) {
+        uint32_t mh = pf_r32(ml + ML_MEMHDR), own = pf_r32(ml + ML_OWNBITS), write = pf_r32(ml + ML_WRITEBITS);
+        uint32_t pages = pf_r8(mh + MH_BITSSIZE) * 32u;
+        for (uint32_t pg = 0; pg < pages; ++pg) {
+            if (!bit(own, pg)) continue;
+            set_bit(own, pg, false);
+            if (write) set_bit(write, pg, false);
+            set_bit(pf_r32(mh + MH_FREEPAGEBITS), pg, true);
+        }
     }
 }
 

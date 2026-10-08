@@ -449,6 +449,78 @@ static void g_addscreengroup(ArmCpu& c) {
     }
 }
 
+// Graphics -108: Err RemoveScreenGroup(Item group) -- SWI 18 (0x3278; 23.10's graphix, 0x39a0,
+// the same): the group checked as AddScreenGroup checks it, and then 0 when it was added,
+// GRAFERR_SGNOTINUSE when not. Neither folio clears sg_Add_SG_Called or changes the display.
+static void g_removescreengroup(ArmCpu& c) {
+    uint32_t sg = own_item(c, c.r[0], TYPE_SCREENGROUP);
+    if (!sg) c.r[0] = GRAFERR_BADITEM;
+    else c.r[0] = pf_r32(sg + SG_ADD_SG_CALLED) ? 0 : GRAFERR_SGNOTINUSE;
+}
+
+// The folio's ir_Delete (23.10's graphix 0x2398; the 1993 folio's DeleteScreenGroup is not
+// implemented, GRAFERR_NOTYET, so a program that deletes a group is a later one's): a screen
+// group (0x20b8) leaves the folio's list of them; a screen (0x2188) whose VDL is the one shown,
+// even or odd field, gives the display the blank VDL in both; a bitmap (0x22e0) nothing more; a
+// VDL (0x5380) gives its data back to the OS's lists. Each also frees its list of the tasks it is
+// shared with, which the runtime does not keep.
+static int32_t graphics_delete(ArmCpu& c, int type, int32_t item, uint32_t task) {
+    (void)c;
+    (void)task;
+    uint32_t n = pf_item_node(item), g = pf_folio_base(PF_GRAPHICS);
+    if (type == (int)TYPE_SCREEN) {
+        uint32_t data = pf_r32(pf_r32(n + SCR_VDLPTR) + VDL_DATAPTR);
+        if (pf_r32(g + GF_CURRENTVDLEVEN) == data || pf_r32(g + GF_CURRENTVDLODD) == data) {
+            pf_w32(g + GF_CURRENTVDLEVEN, graf(GF_VDLBLANK));
+            pf_w32(g + GF_CURRENTVDLODD, graf(GF_VDLBLANK));
+        }
+    } else if (type == (int)TYPE_VDL) {
+        if (uint32_t data = pf_r32(n + VDL_DATAPTR)) pf_free_mem(pf_kernel_lists(), data, (int32_t)pf_r32(n + VDL_DATASIZE));
+    }
+    return 0;
+}
+
+// Graphics -92: Err DeleteScreenGroup(Item group) -- 23.10's graphix 0x4724, in the caller's mode:
+// RemoveScreenGroup (its result not looked at); then for each screen of the group, each bitmap on
+// the screen's list -- its buffer given back to the task's lists when the folio allocated it
+// (bm_SysMalloc), the bitmap deleted -- then the screen's VDL and the screen deleted; then the
+// group; DeleteItem's result back. The runtime's groups are the 1993 folio's: no list of their
+// screens (the screens are the items that point at the group, in the order they were made), and
+// a screen's bitmap in scr_TempBitmap rather than on its list.
+static void g_deletescreengroup(ArmCpu& c) {
+    int32_t group = (int32_t)c.r[0];
+    uint32_t sg = pf_check_item(group, NST_GRAPHICS, TYPE_SCREENGROUP);
+    if (!sg) pf_stop(c, "DeleteScreenGroup of no screen group: not yet");
+    g_removescreengroup(c);
+    for (int32_t i = 1; i < pf_item_count(); ++i) {
+        uint32_t scr = pf_check_item(i, NST_GRAPHICS, TYPE_SCREEN);
+        if (!scr || pf_r32(scr + SCR_SCREENGROUPPTR) != sg) continue;
+        std::vector<uint32_t> bitmaps;
+        for (uint32_t b = pf_r32(scr + SCR_BITMAPLIST + PF_LIST_HEAD); b != scr + SCR_BITMAPLIST + PF_LIST_TAIL; b = pf_r32(b))
+            bitmaps.push_back(b);
+        if (uint32_t t = pf_r32(scr + SCR_TEMPBITMAP)) bitmaps.push_back(t);
+        for (uint32_t bm : bitmaps) {
+            if (pf_r32(bm + BM_SYSMALLOC))
+                pf_free_mem(pf_r32(pf_current_task() + T_FREEMEMORYLISTS), pf_r32(bm + BM_BUFFER),
+                            (int32_t)(pf_r32(bm + BM_WIDTH) * pf_r32(bm + BM_HEIGHT) * 2));
+            pf_delete_item(c, (int32_t)pf_r32(bm + 24));
+        }
+        pf_delete_item(c, (int32_t)pf_r32(scr + SCR_VDLITEM));
+        pf_delete_item(c, i);
+    }
+    c.r[0] = (uint32_t)pf_delete_item(c, group);
+}
+
+// The GrafCon's setters, code that runs in the caller (23.10's graphix): Graphics -96
+// SetFGPen(GrafCon* gc, Color c) -- 0x2b10, gc_FGPen (+0x14); -100 SetBGPen -- 0x2b18, gc_BGPen
+// (+0x18); -120 MoveTo(GrafCon* gc, Coord x, Coord y) -- 0x2b04, gc_PenX and gc_PenY (+0x1c, +0x20).
+static void g_setfgpen(ArmCpu& c) { pf_w32(c.r[0] + 0x14, c.r[1]); }
+static void g_setbgpen(ArmCpu& c) { pf_w32(c.r[0] + 0x18, c.r[1]); }
+static void g_moveto(ArmCpu& c) {
+    pf_w32(c.r[0] + 0x1c, c.r[1]);
+    pf_w32(c.r[0] + 0x20, c.r[2]);
+}
+
 // Enable/DisableHAVG and Enable/DisableVAVG(Item screen) -- SWIs 5 to 8 (0x1620): the
 // horizontal and vertical averaging bits (4 and 8) of the display control word of the screen
 // VDL's first entry.
@@ -559,6 +631,20 @@ static void g_drawcels(ArmCpu& c) {
     const uint32_t regctl[4] = {pf_r32(bm + BM_REGCTL0), pf_r32(bm + BM_REGCTL1), pf_r32(bm + BM_REGCTL2),
                                 pf_r32(bm + BM_REGCTL3)};
     pf_cel_draw(c, pf_r32(bm + BM_CECONTROL), regctl, c.r[1]);
+    c.r[0] = 0;
+}
+
+// Graphics -152: Err SetCEControl(Item bitmap, int32 word, int32 mask) -- SWI 41 (0x10e4): the
+// bitmap (CheckItem, else GRAFERR_BADITEM), the caller's or open (else GRAFERR_NOTOWNER); the
+// bits of bm_CEControl under the mask become the word's; 0.
+static void g_setcecontrol(ArmCpu& c) {
+    uint32_t bm = pf_check_item((int32_t)c.r[0], NST_GRAPHICS, TYPE_BITMAP);
+    if (!bm) { c.r[0] = GRAFERR_BADITEM; return; }
+    if (pf_r32(bm + 28) != task_item() && pf_item_opened((int32_t)task_item(), (int32_t)c.r[0]) < 0) {
+        c.r[0] = GRAFERR_NOTOWNER;
+        return;
+    }
+    pf_w32(bm + BM_CECONTROL, (pf_r32(bm + BM_CECONTROL) & ~c.r[2]) | (c.r[1] & c.r[2]));
     c.r[0] = 0;
 }
 
@@ -691,6 +777,13 @@ static void graphics_slots() {
     pf_on_slot(PF_GRAPHICS, -84, g_resetscreencolors);
     pf_on_slot(PF_GRAPHICS, -88, g_setscreencolors);
     pf_on_slot(PF_GRAPHICS, -104, g_addscreengroup);
+    pf_on_slot(PF_GRAPHICS, -108, g_removescreengroup);
+    pf_on_slot(PF_GRAPHICS, -92, g_deletescreengroup);
+    pf_on_slot(PF_GRAPHICS, -96, g_setfgpen);
+    pf_on_slot(PF_GRAPHICS, -100, g_setbgpen);
+    pf_on_slot(PF_GRAPHICS, -120, g_moveto);
+    pf_on_slot(PF_GRAPHICS, -152, g_setcecontrol);
+    pf_on_delete(NST_GRAPHICS, graphics_delete);
     pf_on_slot(PF_GRAPHICS, -160, g_displayscreen);
     pf_on_slot(PF_GRAPHICS, -172, g_drawcels);
 }

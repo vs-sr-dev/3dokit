@@ -45,13 +45,27 @@ uint32_t pointer(uint32_t field, bool absolute) {
     return absolute ? v : (field + v + 4) & 0xFFFFFF;
 }
 
+// A word of source data. Past the top of VRAM (0x300000) the engine reads what the runtime cannot
+// say: 0 here. Immercenary's full-screen LRFORM cels count 240 pairs (as Opera reads VCNT for
+// LRFORM, the 3D view's 240 lines twice over), so their last 120 pairs run past VRAM's end -- rows
+// that land below the clip and are never seen.
+uint32_t src_word(uint32_t a) {
+    if (a + 4 > ARM_MEM_SIZE && a < PF_OS_BASE) {
+        static bool told;
+        if (!told && g_pf_trace) pf_log("        (the cel engine reads source data past VRAM, at %08X: 0)\n", a);
+        told = true;
+        return 0;
+    }
+    return pf_r32(a);
+}
+
 // The source data's bits, most significant first, from a word-aligned start.
 struct Bits {
     uint32_t base, pos = 0;
     uint32_t take(unsigned n) {
         uint32_t v = 0;
         while (n) {
-            uint32_t w = pf_r32(base + (pos >> 5) * 4), have = 32 - (pos & 31), k = n < have ? n : have;
+            uint32_t w = src_word(base + (pos >> 5) * 4), have = 32 - (pos & 31), k = n < have ? n : have;
             v = v << k | ((w >> (have - k)) & ((1u << k) - 1));
             pos += k;
             n -= k;
@@ -347,7 +361,7 @@ void draw(ArmCpu& c, const Cel& cel, const Target& t) {
             uint32_t woff = (cel.bpp >= 8 ? cel.pre1 >> 16 & 0x3FF : cel.pre1 >> 24) + 2;
             if (lrform) {
                 for (uint32_t i = 0; i < w; ++i) {
-                    uint32_t v = pf_r32(row + i * 4);
+                    uint32_t v = src_word(row + i * 4);
                     pixel(j & 1 ? v & 0xFFFF : v >> 16);
                 }
                 if (j & 1) row += woff * 4;

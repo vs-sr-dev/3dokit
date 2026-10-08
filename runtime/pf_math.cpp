@@ -52,8 +52,136 @@ void m_mulmanyvec3mat33(ArmCpu& c) {
     }
 }
 
+// The engine's 4x4 product (23.10's operamath, Immercenary's disc: 0x1a54 one vector, 0x1b1c the
+// pipeline): v times m as operamath.h lays out a mat44f16, out[j] the sum over i of v[i] * m[i][j]
+// -- the folio loads m's columns into the engine's rows -- each the 64-bit sum shifted down 16, as
+// the 3x3 one.
+void mul4(const int32_t m[16], const int32_t v[4], int32_t out[4]) {
+    for (int j = 0; j < 4; ++j) {
+        int64_t s = 0;
+        for (int i = 0; i < 4; ++i) s += (int64_t)v[i] * m[4 * i + j];
+        out[j] = (int32_t)(s >> 16);
+    }
+}
+
+// count vectors of four through the engine, src to dest: one (0x1a54), or the pipeline (0x1b1c),
+// which reads vector k + 1 before it writes result k, so dest may be src. Below 1 the pipeline
+// runs about 2^32 times on the console: stopped here.
+void mul_many4(ArmCpu& c, uint32_t dest, uint32_t src, uint32_t mat, int32_t count, const char* who) {
+    if (count < 1) {
+        char why[96];
+        std::snprintf(why, sizeof why, "%s of no vectors (the matrix engine's routine runs on): not yet", who);
+        pf_stop(c, why);
+    }
+    int32_t m[16], v[4], next[4] = {}, out[4];
+    for (int i = 0; i < 16; ++i) m[i] = (int32_t)pf_r32(mat + 4 * i);
+    for (int i = 0; i < 4; ++i) v[i] = (int32_t)pf_r32(src + 4 * i);
+    for (int32_t k = 0; k < count; ++k) {
+        if (k + 1 < count)
+            for (int i = 0; i < 4; ++i) next[i] = (int32_t)pf_r32(src + 16 * (uint32_t)(k + 1) + 4 * i);
+        mul4(m, v, out);
+        for (int i = 0; i < 4; ++i) pf_w32(dest + 16 * (uint32_t)k + 4 * i, (uint32_t)out[i]);
+        for (int i = 0; i < 4; ++i) v[i] = next[i];
+    }
+}
+
+// swi 0x50007: void MulVec4Mat44_F16(vec4f16 dest, vec4f16 vec, mat44f16 mat) -- 0x1a54.
+void m_mulvec4mat44(ArmCpu& c) { mul_many4(c, c.r[0], c.r[1], c.r[2], 1, "MulVec4Mat44_F16"); }
+// swi 0x50008: void MulMat44Mat44_F16(mat44f16 dest, mat44f16 src1, mat44f16 src2) -- 0x1b18:
+// the pipeline over src1's four rows.
+void m_mulmat44mat44(ArmCpu& c) { mul_many4(c, c.r[0], c.r[1], c.r[2], 4, "MulMat44Mat44_F16"); }
+// swi 0x50009: void MulManyVec4Mat44_F16(vec4f16* dest, vec4f16* src, mat44f16 mat, int32 count).
+void m_mulmanyvec4mat44(ArmCpu& c) {
+    mul_many4(c, c.r[0], c.r[1], c.r[2], (int32_t)c.r[3], "MulManyVec4Mat44_F16");
+}
+
+// ---- the folio's vectors: code that runs in the caller (23.10's operamath, Immercenary's disc;
+// its eight user functions at 0x25a0, -4 the last) ----------------------------------------
+// DivUF16 (0x1c48): n / d in unsigned 16.16, a restoring division -- the integer part's bits
+// from bit 15 (from bit 7 when d > n >> 8, none when d > n), then sixteen fraction bits: the
+// quotient floor(n * 65536 / d) in r0, what is left in r1. When d <= n >> 16 (d 0 among them) the
+// quotient would not fit: r0 and r1 both -1.
+void div_uf16(ArmCpu& c, uint32_t n, uint32_t d) {
+    if (d <= n >> 16) {
+        c.r[0] = c.r[1] = 0xFFFFFFFFu;
+        return;
+    }
+    uint64_t num = (uint64_t)n << 16;
+    c.r[0] = (uint32_t)(num / d);
+    c.r[1] = (uint32_t)(num % d);
+}
+
+// Operamath -12: ufrac16 DivUF16(ufrac16 n, ufrac16 d).
+void m_divuf16(ArmCpu& c) { div_uf16(c, c.r[0], c.r[1]); }
+
+// Operamath -28: ufrac16 RecipUF16(ufrac16 d) -- 0x1c40: DivUF16 of 1.0 by d.
+void m_recipuf16(ArmCpu& c) { div_uf16(c, 0x10000u, c.r[0]); }
+
+// Operamath -16: ufrac16 DivRemUF16(ufrac16* rem, ufrac16 n, ufrac16 d) -- 0x1c24: DivUF16, what is
+// left stored at rem.
+void m_divremuf16(ArmCpu& c) {
+    uint32_t rem = c.r[0];
+    div_uf16(c, c.r[1], c.r[2]);
+    pf_w32(rem, c.r[1]);
+}
+
+// DivSF16 (0x1e5c): the same on the magnitudes, the integer part's bits from bit 14 -- so when
+// |d| <= |n| >> 15 (d 0 among them) r0 and r1 are both 0x7FFFFFFF, whatever the signs; otherwise
+// the quotient negated when the signs differ, what is left negated when n is negative.
+void div_sf16(ArmCpu& c, uint32_t n, uint32_t d) {
+    bool nneg = n >> 31, qneg = (n ^ d) >> 31;
+    uint32_t an = nneg ? 0u - n : n, ad = d >> 31 ? 0u - d : d;
+    if (ad <= an >> 15) {
+        c.r[0] = c.r[1] = 0x7FFFFFFFu;
+        return;
+    }
+    uint64_t num = (uint64_t)an << 16;
+    uint32_t q = (uint32_t)(num / ad), r = (uint32_t)(num % ad);
+    c.r[0] = qneg ? 0u - q : q;
+    c.r[1] = nneg ? 0u - r : r;
+}
+
+// MulUF16 (0x2068): a * b >> 16 from the halves, al * bl >> 16 plus a * bh plus ah * bl, in 32
+// bits -- floor(a * b / 65536), its low 32 bits.
+uint32_t mul_uf16(uint32_t a, uint32_t b) {
+    uint32_t ah = a >> 16, bh = b >> 16, al = a & 0xFFFF, bl = b & 0xFFFF;
+    return bh * a + ((al * bl) >> 16) + ah * bl;
+}
+
+void m_divsf16(ArmCpu& c) { div_sf16(c, c.r[0], c.r[1]); }     // Operamath -20
+void m_recipsf16(ArmCpu& c) { div_sf16(c, 0x10000u, c.r[0]); } // -32, 0x1e54
+
+// Operamath -24: frac16 DivRemSF16(frac16* rem, frac16 n, frac16 d) -- 0x1e38.
+void m_divremsf16(ArmCpu& c) {
+    uint32_t rem = c.r[0];
+    div_sf16(c, c.r[1], c.r[2]);
+    pf_w32(rem, c.r[1]);
+}
+
+// Operamath -4: ufrac16 MulUF16(ufrac16 a, ufrac16 b).
+void m_muluf16(ArmCpu& c) { c.r[0] = mul_uf16(c.r[0], c.r[1]); }
+
+// Operamath -8: frac16 MulSF16(frac16 a, frac16 b) -- 0x208c: MulUF16 of the magnitudes, negated
+// when the signs differ (toward zero).
+void m_mulsf16(ArmCpu& c) {
+    uint32_t a = c.r[0], b = c.r[1];
+    uint32_t p = mul_uf16(a >> 31 ? 0u - a : a, b >> 31 ? 0u - b : b);
+    c.r[0] = (a ^ b) >> 31 ? 0u - p : p;
+}
+
 } // namespace
 
 void pf_math_init() {
     pf_on_swi(0x50002, m_mulmanyvec3mat33);
+    pf_on_swi(0x50007, m_mulvec4mat44);
+    pf_on_swi(0x50008, m_mulmat44mat44);
+    pf_on_swi(0x50009, m_mulmanyvec4mat44);
+    pf_on_slot(PF_MATH, -4, m_muluf16);
+    pf_on_slot(PF_MATH, -8, m_mulsf16);
+    pf_on_slot(PF_MATH, -12, m_divuf16);
+    pf_on_slot(PF_MATH, -16, m_divremuf16);
+    pf_on_slot(PF_MATH, -20, m_divsf16);
+    pf_on_slot(PF_MATH, -24, m_divremsf16);
+    pf_on_slot(PF_MATH, -28, m_recipuf16);
+    pf_on_slot(PF_MATH, -32, m_recipsf16);
 }

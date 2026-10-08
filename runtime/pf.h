@@ -153,8 +153,17 @@ uint32_t pf_kernel_lists();                         // KernelBase->kb_MemFreeLis
 uint32_t pf_alloc_mem(uint32_t lists, int32_t size, uint32_t flags, bool user);
 void     pf_free_mem(uint32_t lists, uint32_t p, int32_t size);
 uint32_t pf_page_size(uint32_t flags);              // GetPageSize
+uint32_t pf_alloc_blocks(int32_t size, uint32_t flags);     // AllocMemBlocks
+void     pf_give_pages(uint32_t p, uint32_t size);  // the current task's ControlMem(MEMC_GIVE, to no task)
 uint32_t pf_find_mh(uint32_t p);                    // FindMH
 int32_t  pf_scavenge(bool user);                    // ScavengeMem, SystemScavengeMem
+// The memory of a task `creator` makes with an image of its own (23.10's CreateTask): its
+// MemLists, the image's pages its own, its stack, the command line at the stack's top. The stack
+// pointer back (and the stack's base and size in the task), 0 when no pages could be had.
+uint32_t pf_mem_image_task(uint32_t creator, uint32_t task, uint32_t image, uint32_t need, uint32_t stack,
+                           uint32_t cmd, uint32_t cmdlen);
+void     pf_mem_task_gone(uint32_t task);       // a task with its own lists ended: its pages free
+void     pf_unload_image(uint32_t image);       // a program's image gone: its module unloaded (pf_file.cpp)
 // 0 when every page of [p, p + size) is writable by `task`, else the kernel's BADPTR
 int32_t  pf_task_can_write(uint32_t task, uint32_t p, int32_t size);
 
@@ -224,6 +233,9 @@ int32_t  pf_unlock_item(int32_t item);                 // UnlockItem
 // the driver's own fields after it.
 typedef int32_t (*PfDispatchIO)(uint32_t ior);
 typedef int32_t (*PfDeleteDev)(uint32_t dev);
+// A driver's drv_AbortIO: a request not done yet, ended (and completed) by the driver.
+typedef void (*PfAbortIO)(uint32_t ior);
+void     pf_device_abort(uint32_t dev, PfAbortIO fn);
 uint32_t pf_device_new(const char* name, int max_unit, PfDispatchIO dispatch, PfDeleteDev del = nullptr,
                        uint32_t size = 0);
 void     pf_complete_io(uint32_t ior);

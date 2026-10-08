@@ -32,7 +32,7 @@ enum : uint32_t {
     // the folio's errors, as it builds them (operror.h's MakeErr: 'F' folio 'V', the standard class
     // below 0x100, the File folio's own -- filesystem.h's ER_Fs_ codes -- above)
     FERR_BADITEM = 0xD556F001u, FERR_NOMEM = 0xD556F006u, FERR_BADPTR = 0xD556F009u,
-    FERR_BADCOMMAND = 0xD556F00Cu, FERR_BADNAME = 0xD556F00Eu,
+    FERR_ABORTED = 0xD556F00Au, FERR_BADCOMMAND = 0xD556F00Cu, FERR_BADNAME = 0xD556F00Eu,
     FERR_NOFILE = 0xD556F101u, FERR_NOTADIRECTORY = 0xD556F102u, FERR_FS_BADNAME = 0xD556F104u,
     // nodes
     FILEFOLIO = 3, FILENODE = 2, FILEALIASNODE = 3, DEVICENODE = 15,
@@ -229,6 +229,7 @@ std::string pf_host_path(const char* path) {
 // own, which the folio briefly makes privileged), ofi_DeviceType FILE_DEVICE_OPENFILE, ofi_File
 // the File (one more use), and opened by the task.
 static int32_t file_dispatch(uint32_t ior);
+static void file_abort(uint32_t ior);
 static int32_t file_closed(uint32_t dev);
 static std::set<uint32_t> g_open_files;         // the OpenFile devices
 
@@ -236,6 +237,7 @@ static int32_t open_file(const std::string& at) {
     uint32_t file = file_node(at);
     std::string name = at == "/" ? "" : at.substr(at.find_last_of('/') + 1);
     uint32_t dev = pf_device_new(name.c_str(), 0, file_dispatch, file_closed, OFI_SIZE);
+    pf_device_abort(dev, file_abort);
     int32_t item = (int32_t)pf_r32(dev + 24);
     pf_w8(dev + 10, 1);
     pf_w32(dev + 28, task_item());
@@ -296,10 +298,20 @@ static void f_closediskfile(ArmCpu& c) { c.r[0] = (uint32_t)close_disk_file(c, (
 // stops the run: not yet. Every other command goes to the filesystem's queue, a CD's (0x117c):
 // only CMD_READ, of whole blocks (else BADPTR), queued -- IO_QUICK cleared -- for the file daemon;
 // a refusal is io_Error, CompleteIO, and SendIO's result. The daemon reads the blocks (a CD's
-// FileIOReq end action, 0x17c0: io_Actual the bytes the drive moved, whole blocks) -- here at the
-// next safe point, as the CD's reading time is not modelled. A read past the file's last block
-// stops the run: not yet.
-static std::vector<uint32_t> g_reads;           // queued reads, in order
+// FileIOReq end action, 0x17c0: io_Actual the bytes the drive moved, whole blocks). A read past
+// the file's last block stops the run: not yet.
+//
+// The drive's time: the console's is a double-speed CD-ROM drive, 150 blocks of 2048 bytes a
+// second, and it reads one request at a time, in the order they came. So a read is done when the
+// drive has moved its bytes at that rate, starting when it is asked or when the drive is done
+// with the reads before it, whichever is later. A seek, a spin-up and the drive's own buffer are
+// not modelled: a read costs its bytes and nothing else. (Without this a game's loading takes no
+// time at all, and code that races its loading against the display -- Immercenary's loading tube,
+// whose fade must end before the two signals its loading sends -- runs as it never does.)
+struct Read { uint32_t ior; uint64_t done; };
+static std::vector<Read> g_reads;               // queued reads, in order
+static uint64_t g_drive_free;                   // when the drive is done with them
+static const uint64_t kDriveBytesPerSecond = 150 * 2048;
 
 static const char kFill[] = "iamaduck";
 
@@ -326,12 +338,36 @@ static void read_blocks(uint32_t ior) {
     pf_w32(ior + IO_ACTUAL, pf_r32(ior + IO_ACTUAL) + len);
 }
 
-static void reads_done(uint64_t) {
-    std::vector<uint32_t> now;
-    now.swap(g_reads);
-    for (uint32_t ior : now) {
+// The reads the drive has finished by `when`, in order.
+static void reads_done(uint64_t when) {
+    while (!g_reads.empty() && g_reads.front().done <= when) {
+        uint32_t ior = g_reads.front().ior;
+        g_reads.erase(g_reads.begin());
         read_blocks(ior);
         pf_complete_io(ior);
+    }
+}
+
+// The file driver's drv_AbortIO (23.10's 0xe9c: the File's filesystem's own, a CD's 0x18ec), with
+// interrupts off: a read still in the filesystem's queue gets the folio's ABORTED (0xD556F00A),
+// leaves the queue and is completed. The one the drive is reading the folio stops at the drive
+// instead (the CD device's AbortIO of its own request, whose end then completes this one): here
+// it is ended the same way, and the drive is free at once -- the reads after it start now.
+static void file_abort(uint32_t ior) {
+    size_t i = 0;
+    while (i < g_reads.size() && g_reads[i].ior != ior) ++i;
+    if (i == g_reads.size()) return;
+    g_reads.erase(g_reads.begin() + (long)i);
+    pf_w32(ior + IO_ERROR, FERR_ABORTED);
+    pf_complete_io(ior);
+    if (i == 0) {
+        g_drive_free = pf_now();
+        for (Read& r : g_reads) {
+            uint32_t len = pf_r32(r.ior + IOI_RECV_LEN);
+            g_drive_free += (uint64_t)len * 1000000000ull / kDriveBytesPerSecond;
+            r.done = g_drive_free;
+            pf_at(r.done, reads_done);
+        }
     }
 }
 
@@ -375,8 +411,10 @@ static int32_t file_dispatch(uint32_t ior) {
     if (g_pf_trace >= 2)
         pf_log("        read %u blocks from block %u of \"%s\" into %08X\n", len / bs, pf_r32(ior + IOI_OFFSET),
                g_places[file].c_str(), pf_r32(ior + IOI_RECV_BUF));
-    if (g_reads.empty()) pf_at(pf_now(), reads_done);
-    g_reads.push_back(ior);
+    uint64_t start = std::max(pf_now(), g_drive_free);
+    g_drive_free = start + (uint64_t)len * 1000000000ull / kDriveBytesPerSecond;
+    g_reads.push_back({ior, g_drive_free});
+    pf_at(g_drive_free, reads_done);
     return 0;
 }
 
@@ -789,21 +827,57 @@ enum : uint32_t { LOADERR_NOTAIF = 0xD57B9118u, KERR_NOMEM = 0xD57B9006u, MEMSET
 
 static std::map<uint32_t, const ArmModule*> g_loaded_code;     // image -> its module
 
-static int32_t load_code(ArmCpu& c, const char* path, uint32_t& image) {
+// The image just read, before it has relocated itself, as the recompiled module whose read-only
+// area it is, loaded there; false (and said) when no module matches or that one is loaded already.
+static bool identify(const char* path, uint32_t img) {
+    const ArmModule* m = arm_identify(img);
+    if (!m) {
+        std::fprintf(stderr, "\"%s\": no recompiled module matches this code\n", path);
+        return false;
+    }
+    if (!arm_load(m, img)) {
+        std::fprintf(stderr, "\"%s\": module %s is loaded already: not yet\n", path, m->name);
+        return false;
+    }
+    g_loaded_code[img] = m;
+    return true;
+}
+
+// LoadProgram's half (0x6fac with `program` set). The file is the command line's first word (up to
+// a space, at most 255 characters, 0x7178). The image is whole pages of the task's own
+// (AllocMemBlocks, MEMTYPE_TASKMEM | MEMTYPE_DMA) as large as it needs, at the block's start, and
+// it is the block's length that the reads and the fill run to. Once the IOReq is deleted, a task
+// is made of it (CreateItem of a TASKNODE, 0x736c): named as the file is, at the priority given
+// (none for LoadProgram's -1: CreateTask's TAG_NOP), its image (CREATETASK_TAG_AIF), the file's
+// bytes (_IMAGESZ) and the whole command line (_CMDSTR), and for the File folio the file's
+// directory as its current and program directories (0x3000a, 0x3000b); then the file is closed.
+// Its item, or the first error -- the pages given back on one (ControlMem's MEMC_GIVE, 0x7448).
+static int32_t load(ArmCpu& c, uint32_t cmd, int32_t priority, bool program, uint32_t& image) {
+    char path[256];
+    pf_cstring(cmd, path, sizeof path);
     image = 0;
     uint32_t lists = pf_r32(pf_current_task() + T_FREEMEMORYLISTS);
     uint32_t info = c.r[13] - 0x6c;                     // the loader's frame: sp + 0x154
-    int32_t file = open_disk_file(path);
+    char first_word[256];
+    if (program) {
+        size_t i = 0;
+        while (i < 255 && path[i] && path[i] != ' ') {
+            first_word[i] = path[i];
+            ++i;
+        }
+        first_word[i] = 0;
+    }
+    const char* name = program ? first_word : path;
+    int32_t file = open_disk_file(name);
     if (file < 0) return file;
     int32_t ior = pf_create_ioreq(c, file);
     int32_t err = 0;
-    uint32_t img = 0, need = 0;
+    uint32_t img = 0, need = 0, bytes = 0, f = pf_r32(pf_item_node(file) + OFI_FILE);
     if (ior < 0) {
         err = ior;
     } else {
-        uint32_t f = pf_r32(pf_item_node(file) + OFI_FILE);
-        uint32_t bs = pf_r32(f + FI_BLOCKSIZE), bytes = pf_r32(f + FI_BYTECOUNT);
-        uint32_t count = pf_r32(f + FI_BLOCKCOUNT), chunk = 1;
+        uint32_t bs = pf_r32(f + FI_BLOCKSIZE), count = pf_r32(f + FI_BLOCKCOUNT), chunk = 1;
+        bytes = pf_r32(f + FI_BYTECOUNT);
         uint32_t ioreq = pf_item_node(ior);
         if (bytes < 0x80) {
             err = (int32_t)LOADERR_NOTAIF;
@@ -830,9 +904,14 @@ static int32_t load_code(ArmCpu& c, const char* path, uint32_t& image) {
                         need = std::max(ro + rw + ((bss + 15) & ~15u), bytes);
                 }
                 if (!err) {
-                    img = pf_alloc_mem(lists, (int32_t)(need + 16), MEMTYPE_DMA, true);
+                    if (program) {
+                        img = pf_alloc_blocks((int32_t)need, MEMTYPE_DMA | MEMTYPE_TASKMEM);
+                        if (img) need = pf_r32(img);
+                    } else {
+                        img = pf_alloc_mem(lists, (int32_t)(need + 16), MEMTYPE_DMA, true);
+                        if (img) img += 16;
+                    }
                     if (!img) err = (int32_t)KERR_NOMEM;
-                    else img += 16;
                 }
                 if (!err) {
                     if (need <= first) {
@@ -858,36 +937,59 @@ static int32_t load_code(ArmCpu& c, const char* path, uint32_t& image) {
         }
         pf_delete_item(c, ior);
     }
+    int32_t task = 0;
+    if (err >= 0 && program) {
+        if (!identify(name, img)) std::exit(3);
+        if (g_pf_trace)
+            pf_log("        LoadProgram \"%s\": module %s at %08X, %u bytes\n", name, g_loaded_code[img]->name, img, need);
+        uint32_t dir = pf_r32(pf_r32(f + FI_PARENT) + 24);
+        const uint32_t t[] = {1, f + FI_NAME, priority < 0 ? 0xffu : 2u, (uint32_t)priority, 0x13, img, 0x12, bytes,
+                              0x14, cmd, 0x3000a, dir, 0x3000b, dir, 0};
+        uint32_t tags = pf_os_alloc(sizeof t);
+        for (size_t i = 0; i < sizeof t / 4; ++i) pf_w32(tags + 4u * (uint32_t)i, t[i]);
+        err = task = (int32_t)pf_create_task(c, tags);
+        pf_os_free(tags);
+    }
     if (err < 0 && img) {
-        pf_free_mem(lists, img - 16, (int32_t)(need + 16));
+        if (program) pf_give_pages(img, need);
+        else pf_free_mem(lists, img - 16, (int32_t)(need + 16));
         img = 0;
     }
     close_disk_file(c, file);
-    if (err >= 0 && img) {
-        const ArmModule* m = arm_identify(img);
-        if (!m) {
-            std::fprintf(stderr, "LoadCode \"%s\": no recompiled module matches this code\n", path);
-            std::exit(3);
-        }
-        if (!arm_load(m, img)) {
-            std::fprintf(stderr, "LoadCode \"%s\": module %s is loaded already: not yet\n", path, m->name);
-            std::exit(3);
-        }
-        g_loaded_code[img] = m;
-        if (g_pf_trace) pf_log("        LoadCode \"%s\": module %s at %08X, %u bytes\n", path, m->name, img, need);
+    if (err >= 0 && img && !program) {
+        if (!identify(name, img)) std::exit(3);
+        if (g_pf_trace) pf_log("        LoadCode \"%s\": module %s at %08X, %u bytes\n", path, g_loaded_code[img]->name, img, need);
     }
     image = img;
-    return err;
+    return program ? (err < 0 ? err : task) : err;
+}
+
+// A program's image gone with its task: its recompiled module no longer loaded there.
+void pf_unload_image(uint32_t image) {
+    auto it = g_loaded_code.find(image);
+    if (it == g_loaded_code.end()) return;
+    arm_unload(it->second);
+    g_loaded_code.erase(it);
 }
 
 // File -44: Err LoadCode(char* name, CodeHandle* code)
 static void f_loadcode(ArmCpu& c) {
-    char path[256];
-    pf_cstring(c.r[0], path, sizeof path);
     uint32_t handle = c.r[1], image;
-    int32_t err = load_code(c, path, image);
+    int32_t err = load(c, c.r[0], -1, false, image);
     if (handle) pf_w32(handle, image);
     c.r[0] = (uint32_t)err;
+}
+
+// File -20: Item LoadProgram(char* cmdLine) -- 0x74f4: no priority, the creator's.
+static void f_loadprogram(ArmCpu& c) {
+    uint32_t image;
+    c.r[0] = (uint32_t)load(c, c.r[0], -1, true, image);
+}
+
+// File -24: Item LoadProgramPrio(char* cmdLine, int32 priority) -- 0x74e8.
+static void f_loadprogramprio(ArmCpu& c) {
+    uint32_t image;
+    c.r[0] = (uint32_t)load(c, c.r[0], (int32_t)c.r[1], true, image);
 }
 
 // File -48: void UnloadCode(CodeHandle code) -- 0x74a8: the block the image is 16 bytes into,
@@ -1129,6 +1231,8 @@ void pf_file_init() {
     pf_on_slot(PF_FILE, -8, f_readdiskstream);
     pf_on_slot(PF_FILE, -12, f_seekdiskstream);
     pf_on_slot(PF_FILE, -16, f_closediskstream);
+    pf_on_slot(PF_FILE, -20, f_loadprogram);
+    pf_on_slot(PF_FILE, -24, f_loadprogramprio);
     pf_on_slot(PF_FILE, -44, f_loadcode);
     pf_on_slot(PF_FILE, -48, f_unloadcode);
     pf_on_slot(PF_FILE, -52, f_executeassubroutine);

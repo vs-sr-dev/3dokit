@@ -37,6 +37,9 @@ enum : uint32_t {
 
 static std::map<uint32_t, PfDispatchIO> g_drivers;     // device node -> its driver
 static std::map<uint32_t, PfDeleteDev> g_delete_hooks; // device node -> its dev_DeleteDev
+static std::map<uint32_t, PfAbortIO> g_abort_hooks;    // device node -> its driver's drv_AbortIO
+
+void pf_device_abort(uint32_t dev, PfAbortIO fn) { g_abort_hooks[dev] = fn; }
 
 static uint32_t task_item() { return pf_r32(pf_current_task() + 24); }
 
@@ -203,6 +206,22 @@ int32_t pf_send_io(ArmCpu& c, int32_t item, uint32_t info) {
     return r;
 }
 
+// swi 0x10019: Err AbortIO(Item ior) -- 0x13fb4: an IOReq (else BADITEM), the caller's (else
+// NOTOWNER); then (0x13f64), with interrupts off, the device's driver's drv_AbortIO when the
+// request is not done yet; 0. The driver completes it, with its own error. A driver the runtime
+// has no abort for stops the run.
+static void k_abortio(ArmCpu& c) {
+    uint32_t ior = pf_check_item((int32_t)c.r[0], 1, IOREQNODE);
+    if (!ior) { c.r[0] = KERR_BADITEM; return; }
+    if (pf_r32(ior + 28) != task_item()) { c.r[0] = KERR_NOTOWNER; return; }
+    if (!(pf_r32(ior + IO_FLAGS) & IO_DONE)) {
+        auto a = g_abort_hooks.find(pf_r32(ior + IO_DEV));
+        if (a == g_abort_hooks.end()) pf_stop(c, "AbortIO of a request to a device without an abort: not yet");
+        a->second(ior);
+    }
+    c.r[0] = 0;
+}
+
 static void k_sendio(ArmCpu& c) { c.r[0] = (uint32_t)pf_send_io(c, (int32_t)c.r[0], c.r[1]); }
 
 // swi 0x10003: Err DeleteItem(Item) -- 0x138c8 and 0x1379c: the node, else BADITEM; the task must
@@ -246,6 +265,7 @@ static int32_t delete_as(ArmCpu& c, int32_t item, uint32_t task) {
         }
         g_drivers.erase(n);
         g_delete_hooks.erase(n);
+        g_abort_hooks.erase(n);
     } else if (kind == (1u << 8 | MESSAGENODE)) {
         pf_delete_msg(n);
     } else if (kind == (1u << 8 | MSGPORTNODE)) {
@@ -403,6 +423,7 @@ static void timer_vbl(uint64_t) {
 void pf_io_init() {
     g_drivers.clear();
     g_delete_hooks.clear();
+    g_abort_hooks.clear();
     g_creators.clear();                         // the folios after this one register theirs
     g_deleters.clear();
     g_sport_waiting.clear();
@@ -411,6 +432,7 @@ void pf_io_init() {
     // program's (the shell's next program, pfboot --boot, goes on from it)
     pf_on_swi(0x10000, k_createsizeditem);
     pf_on_swi(0x10018, k_sendio);
+    pf_on_swi(0x10019, k_abortio);
     pf_on_swi(0x10003, k_deleteitem);
     pf_device_new("SPORT", 0, sport_dispatch);
     pf_device_new("timer", 1, timer_dispatch);

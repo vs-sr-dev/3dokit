@@ -168,6 +168,27 @@ static Listener* listener_of(int32_t port) {
     return nullptr;
 }
 
+// A listener whose port is gone (0x1450): out of the list and freed; the messages out to it are
+// no one's now (0x1488: their listener cleared); and when it had the focus, the first focus
+// listener (LC_FocusListener, LC_FocusUI) left on the list takes it.
+static void drop(Listener* l) {
+    for (size_t i = 0; i < g_listeners.size(); ++i)
+        if (g_listeners[i] == l) { g_listeners.erase(g_listeners.begin() + (long)i); break; }
+    for (auto& [msg, to] : g_pending)
+        if (to == l) to = nullptr;
+    if (g_focus == l) {
+        g_focus = nullptr;
+        for (Listener* o : g_listeners)
+            if (o->category == LC_FOCUSLISTENER || o->category == LC_FOCUSUI) {
+                g_focus = o;
+                o->focus = true;
+                break;
+            }
+    }
+    if (g_pf_trace) pf_log("        event broker: the listener of port %d is gone\n", l->port);
+    delete l;
+}
+
 static void to_head(Listener* l) {
     for (size_t i = 0; i < g_listeners.size(); ++i)
         if (g_listeners[i] == l) { g_listeners.erase(g_listeners.begin() + (long)i); break; }
@@ -216,7 +237,7 @@ static void on_msg(int32_t port, int32_t) {
     for (int32_t msg; (msg = pf_get_msg(port)) > 0;) {
         auto back = g_pending.find(msg);
         if (back != g_pending.end()) {
-            if (back->second->in_transit) --back->second->in_transit;
+            if (back->second && back->second->in_transit) --back->second->in_transit;
             g_pending.erase(back);
             g_free.insert(g_free.begin(), msg);
             continue;
@@ -263,6 +284,11 @@ static void broker_vbl(uint64_t) {
     uint32_t ready = down ? (up ? 0xF0000000u : 0xB0000000u) : (up ? 0x70000000u : 0x10000000u);
     std::vector<Listener*> all = g_listeners;
     for (Listener* l : all) {
+        // 0x160c, first: the listener's port still a MsgPort (CheckItem), else it goes
+        if (!pf_check_item(l->port, 1, 10)) {
+            drop(l);
+            continue;
+        }
         if (l->category == LC_NOSEEUM) continue;
         bool focus_changed = l->focus != l->last_focus;
         if (!focus_changed && l->category == LC_FOCUSLISTENER && l != g_focus) continue;

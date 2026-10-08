@@ -1524,13 +1524,15 @@ static void a_getaudioiteminfo(ArmCpu& c) {
 // of the folio's (LocateItem, else AF_ERR_BADITEM); the kernel's check of 8 bytes at the tags
 // (vector 40 again, never refusing); then by its node type: a sample's tags (0x347c), an
 // envelope's (0x4fac), an attachment's (0x6088), a tuning's (0x6754); a template, an instrument,
-// a knob or a cue AF_ERR_UNIMPLEMENTED. For a number that names no item the folio goes on with a
-// null node and reads its type at address 9: stopped here.
+// a knob or a cue AF_ERR_UNIMPLEMENTED. For a number that names no item 23.10's folio (0xc54)
+// says AF_ERR_BADITEM; the 1993 folio goes on with a null node and reads its type at address 9,
+// where the console has its kernel's SWI vector, a branch (0xEA00xxxx): type 0, which also ends
+// in AF_ERR_BADITEM (0x1310). Immercenary asks it of item -1 (p, 0x2643c).
 static void a_setaudioiteminfo(ArmCpu& c) {
     if (!audio_open()) { c.r[0] = AF_ERR_AUDIOCLOSED; return; }
     int32_t item = (int32_t)c.r[0];
     uint32_t n = pf_item_node(item);
-    if (!n) pf_stop(c, "SetAudioItemInfo of no item (the folio reads a null node)");
+    if (!n) { c.r[0] = AF_ERR_BADITEM; return; }
     if (pf_r8(n + 8) != NST_AUDIO) { c.r[0] = AF_ERR_BADITEM; return; }
     switch (pf_r8(n + 9)) {
     case TEMPLATE_NODE: case INSTRUMENT_NODE: case KNOB_NODE: case CUE_NODE: c.r[0] = AF_ERR_UNIMPLEMENTED; break;

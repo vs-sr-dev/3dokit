@@ -29,7 +29,10 @@ enum : uint32_t {
     SIGF_ABORT = 4, SIGF_DEADTASK = 0x10,
     // CREATETASK_TAG_* (task.h), TAG_NOP (types.h)
     TAG_NAME = 1, TAG_PRI = 2, TAG_PC = 10, TAG_MAXQ = 11, TAG_STACKSIZE = 12, TAG_ARGC = 13,
-    TAG_ARGP = 14, TAG_SP = 15, TAG_BASE = 16, TAG_ALLOCDTHREADSP = 24, TAG_NOP = 255,
+    TAG_ARGP = 14, TAG_SP = 15, TAG_BASE = 16, TAG_IMAGESZ = 18, TAG_AIF = 19, TAG_CMDSTR = 20,
+    TAG_ALLOCDTHREADSP = 24, TAG_NOP = 255,
+    // the File folio's own (its task callback's): the task's current and program directories
+    FILETASK_TAG_CURRENTDIRECTORY = 0x3000a, FILETASK_TAG_PROGRAMDIRECTORY = 0x3000b,
     // the shell's spawnpri (System/Tasks/shell, 0x64f0): a program it starts runs at 100
     SPAWN_PRI = 100,
 };
@@ -38,12 +41,13 @@ enum : uint32_t {
 enum : uint32_t {
     KERR_BADITEM = 0xD57B9001u, KERR_BADTAG = 0xD57B9002u, KERR_BADTAGVAL = 0xD57B9003u,
     KERR_NOTPRIV = 0xD57B9004u, KERR_BADPRIORITY = 0xD57B910Cu, KERR_SMALLSTACK = 0xD57B910Fu,
-    KERR_ILLEGALSIGNAL = 0xD57B9116u,
+    KERR_ILLEGALSIGNAL = 0xD57B9116u, KERR_NOTAIF = 0xD57B9118u, KERR_THREADTASK = 0xD57B910Du,
 };
 
 struct Task {
     uint32_t node;
     bool started, dead;
+    uint32_t image;                             // a task with its own image: its AIF header
 };
 
 static std::vector<Task*> g_tasks;              // every task alive; never freed
@@ -55,6 +59,7 @@ static std::mutex* g_lock = new std::mutex;
 static std::condition_variable* g_turn = new std::condition_variable;
 
 static const uint32_t kThreadExit = 0xFFFFFFD0u;    // where a thread's function returns
+static const uint32_t kTaskExit = 0x410u;           // 23.10's lr for a task: its kernel's exit
 
 static uint8_t pri(const Task* t) { return (uint8_t)pf_r8(t->node + 10); }
 static const char* name(const Task* t) {
@@ -151,6 +156,49 @@ static void k_exit(ArmCpu& c) {
     throw PfExit{(int)c.r[0]};
 }
 
+// A task with its own image starts at the image's AIF header, where the kernel leaves its pc: the
+// header's four words call, in turn, its decompression, its self-relocation (which makes its own
+// word 0x04 a no-op), its zero-init and its entry, and the word at 0x10, `swi 0x11`, is the exit.
+// The header is read word by word as it stands in memory (code that changes itself is not
+// recompiled); what each BL calls is the program's own recompiled code.
+static void run_image(ArmCpu& c, uint32_t image) {
+    for (uint32_t off = 0; off < 0x10; off += 4) {
+        uint32_t w = pf_r32(image + off);
+        if (w == 0xE1A00000u) continue;                 // mov r0, r0
+        if (w >> 24 != 0xEB) pf_stop(c, "a task's AIF header word that is no BL or no-op: not yet");
+        uint32_t disp = w & 0xFFFFFF;
+        uint32_t to = image + off + 8 + 4 * (disp & 0x800000 ? disp - 0x1000000 : disp);
+        c.r[14] = image + off + 4;
+        arm_call(c, to);
+        if (c.pc != image + off + 4) arm_bad_return(c, image + off + 4);
+    }
+    if (pf_r32(image + 0x10) != 0xEF000011u) pf_stop(c, "a task's AIF header without its exit: not yet");
+    arm_swi(c, 0x11, image + 0x10);
+}
+
+// A task with its own image that has ended (its exit, or its code's return to the kernel's 0x410,
+// which exits): the kernel deletes it, as DeleteItem of a task does (pf_delete_task) -- the items
+// it owns deleted as by it, the last made first (its threads among them), its semaphores
+// unlocked, its owner sent SIGF_DEADTASK -- and with it its memory: every page its own MemLists
+// own goes back to the system. Its recompiled module is unloaded from its image, and the task's
+// item is gone.
+static void end_image_task(ArmCpu& c, Task* t) {
+    uint32_t node = t->node;
+    int32_t me = (int32_t)pf_r32(node + 24);
+    for (int32_t i = pf_item_count() - 1; i > 0; --i) {
+        uint32_t n = pf_item_node(i);
+        if (n && n != node && (int32_t)pf_r32(n + 28) == me) pf_delete_item_as_owner(c, i);
+    }
+    pf_task_release(me);
+    if (uint32_t owner = pf_item_node((int32_t)pf_r32(node + 28))) pf_signal(owner, SIGF_DEADTASK);
+    for (size_t i = 0; i < g_tasks.size(); ++i)
+        if (g_tasks[i] == t) { g_tasks.erase(g_tasks.begin() + (long)i); break; }
+    pf_mem_task_gone(node);
+    pf_unload_image(t->image);
+    pf_item_free(me);
+    pf_scavenge(false);
+}
+
 static void run_task(Task* t) {
     {
         std::unique_lock<std::mutex> l(*g_lock);
@@ -162,12 +210,27 @@ static void run_task(Task* t) {
     c.r[14] = kThreadExit;
     c.budget = PF_POLL_EVERY;
     try {
-        arm_call(c, pf_r32(t->node + T_PC));
-        if (c.pc != kThreadExit) arm_fault(c, c.pc, "a thread returned somewhere other than the kernel");
-        if (g_pf_trace) pf_log("        (thread \"%s\" returns: gone)\n", name(t));
-        give_back_stack(t->node);
-    } catch (const PfExit&) {
-        if (g_pf_trace) pf_log("        (thread \"%s\" exits: gone)\n", name(t));
+        if (t->image) {
+            run_image(c, t->image);
+        } else {
+            arm_call(c, pf_r32(t->node + T_PC));
+            if (c.pc != kThreadExit) arm_fault(c, c.pc, "a thread returned somewhere other than the kernel");
+            if (g_pf_trace) pf_log("        (thread \"%s\" returns: gone)\n", name(t));
+            give_back_stack(t->node);
+        }
+    } catch (const PfExit& e) {
+        if (t->image) {
+            if (g_pf_trace) pf_log("        (task \"%s\" exits with %d: gone)\n", name(t), e.code);
+            char who[64];
+            std::snprintf(who, sizeof who, "%s", name(t));
+            t->dead = true;
+            set_flags(t, 0, TASK_READY | TASK_WAITING);
+            end_image_task(c, t);                       // its node freed with its item
+            switch_to(take_ready(who));
+            return;
+        } else if (g_pf_trace) {
+            pf_log("        (thread \"%s\" exits: gone)\n", name(t));
+        }
     }
     t->dead = true;
     set_flags(t, 0, TASK_READY | TASK_WAITING);
@@ -312,10 +375,14 @@ static void k_setitempri(ArmCpu& c) {
 // waits for the next quantum tick. Without a timer here, the reschedule is asked for when the new
 // task's priority is above the creator's: it runs as the OS call returns, as it would a tick
 // later on the console.
+static uint32_t create_image_task(ArmCpu& c, uint32_t nm, uint32_t p, uint32_t size, uint32_t argc, uint32_t argp,
+                                  uint32_t base, uint32_t image, uint32_t imagesz, uint32_t cmd);
+
 uint32_t pf_create_task(ArmCpu& c, uint32_t tags) {
     uint32_t me = pf_current_task();
     uint32_t nm = 0, p = pf_r8(me + 10), pc = 0, size = 0, argc = 0, argp = 0, sp = 0, base = 0, maxq = 0;
-    uint32_t flags = 0;
+    uint32_t flags = 0, image = 0, imagesz = 0, cmd = 0;
+    bool size_given = false;
     for (uint32_t a = tags; a; a += 8) {
         uint32_t tag = pf_r32(a), v = pf_r32(a + 4);
         if (!tag) break;
@@ -324,18 +391,27 @@ uint32_t pf_create_task(ArmCpu& c, uint32_t tags) {
         case TAG_PRI: p = v & 0xFF; break;
         case TAG_PC: pc = v & ~0xFC000003u; break;
         case TAG_MAXQ: maxq = v; break;
-        case TAG_STACKSIZE: size = v; break;
+        case TAG_STACKSIZE: size = v; size_given = true; break;
         case TAG_ARGC: argc = v; break;
         case TAG_ARGP: argp = v; break;
         case TAG_SP: sp = v; break;
         case TAG_BASE: base = v; break;
+        case TAG_IMAGESZ: imagesz = v; break;
+        case TAG_AIF: image = v; break;
+        case TAG_CMDSTR: cmd = v; break;
         case TAG_ALLOCDTHREADSP: flags |= TASK_ALLOCATED_SP; break;
         case TAG_NOP: break;
-        default: pf_stop(c, "CreateTask: a tag of a task with its own image: not yet");
+        // the File folio's, which its callback reads: the program's directory, the root's here
+        case FILETASK_TAG_CURRENTDIRECTORY: case FILETASK_TAG_PROGRAMDIRECTORY: break;
+        default: pf_stop(c, "CreateTask: a tag the runtime does not take yet");
         }
     }
     (void)maxq;
-    if (!sp) pf_stop(c, "CreateTask: a task rather than a thread: not yet");
+    if (!sp && image) {
+        if (!size_given) size = 0x100;
+        return create_image_task(c, nm, p, size, argc, argp, base, image, imagesz, cmd);
+    }
+    if (!sp) pf_stop(c, "CreateTask: a task with neither a stack nor an image: not yet");
     if (!nm) return KERR_BADTAGVAL;
     if (!(pf_r8(me + 11) & TASK_SUPER) && (p < 10 || p > 199)) return KERR_BADPRIORITY;
     if (size < 0x80) return KERR_SMALLSTACK;
@@ -364,6 +440,85 @@ uint32_t pf_create_task(ArmCpu& c, uint32_t tags) {
     make_ready(t);
     if (p > pf_r8(me + 10)) g_reschedule = true;
     if (g_pf_trace) pf_log("        thread \"%s\" at %06X, priority %u, stack %08X-%08X\n", s, pc, p, stack_base, sp);
+    return (uint32_t)item;
+}
+
+// ---- making a task with its own image (23.10's CreateTask, its kernel's 0x64e0) -----------------
+// What the File folio's loader asks for (LoadProgram): CREATETASK_TAG_AIF, the image it read;
+// _IMAGESZ, the file's bytes; _CMDSTR, the command line. In 23.10's order: a thread may not make a
+// task (0x65c8); the stack, 0x100 unless given, is at least the command line's length (rounded to
+// words with its 0, 0x6640: when shorter, that and 0x100); a name; a priority of 10 to 199 from a
+// task that is not privileged; a stack of at least 0x100. The image's header (0x6a84): ro of at
+// least 0x80, rw and bss not negative, and it needs ro + rw + bss (rounded up to 16), or the file's
+// bytes when more. When its AIF header says it has the 3DO header (+0x2c, bit 30), that header's
+// stack (+0x28; at least 0x100, or the command line's as above), version and revision (+0x14) and
+// priority (+0x0a) are the task's (0x6bd4); a signed image (+0x34) or one with flag 0x20 (+0x24)
+// stops the run. The task's memory is pf_mem_image_task's. Its registers (0x7008): r0 and r5
+// _ARGC, r1 and r6 _ARGP, r7 and r9 _BASE (KernelBase unless given), sl its stack's base + 0x80,
+// lr the kernel's 0x410, pc the image; its program's startup (Kernel -120) reads the command line
+// left at its stack's top. Made ready as a thread is (see pf_create_task).
+static uint32_t create_image_task(ArmCpu& c, uint32_t nm, uint32_t p, uint32_t size, uint32_t argc, uint32_t argp,
+                                  uint32_t base, uint32_t image, uint32_t imagesz, uint32_t cmd) {
+    uint32_t me = pf_current_task();
+    bool super = pf_r8(me + 11) & TASK_SUPER;
+    if (pf_r32(me + T_THREADTASK)) return KERR_THREADTASK;
+    uint32_t cmdlen = 0;
+    if (cmd) {
+        while (pf_r8(cmd + cmdlen)) ++cmdlen;
+        cmdlen = (cmdlen + 4) & ~3u;
+    }
+    if (size < cmdlen) size = cmdlen + 0x100;
+    if (!nm) return KERR_BADTAGVAL;
+    if (!super && (p < 10 || p > 199)) return KERR_BADPRIORITY;
+    if (size < 0x100) return KERR_SMALLSTACK;
+    int32_t ro = (int32_t)pf_r32(image + 0x14), rw = (int32_t)pf_r32(image + 0x18), bss = (int32_t)pf_r32(image + 0x20);
+    uint32_t need = (uint32_t)(ro + rw) + (((uint32_t)bss + 15) & ~15u);
+    if (ro < 0x80 || rw < 0 || bss < 0 || !need) return KERR_NOTAIF;
+    if (need < imagesz) need = imagesz;
+    uint8_t version = 0, revision = 0;
+    if (pf_r32(image + 0x2c) & 0x40000000u) {
+        uint32_t hdr = image + 0x80;
+        if (uint32_t hs = pf_r32(hdr + 0x28)) {
+            size = hs < cmdlen ? cmdlen + 0x100 : hs;
+            if (size < 0x100) return KERR_SMALLSTACK;
+        }
+        version = (uint8_t)pf_r8(hdr + 0x14);
+        revision = (uint8_t)pf_r8(hdr + 0x15);
+        if (pf_r8(hdr + 0x24) & 0x20) pf_stop(c, "CreateTask: an image whose 3DO header has flag 0x20: not yet");
+        if (pf_r32(hdr + 0x34)) pf_stop(c, "CreateTask: a signed image: not yet");
+        if (uint32_t hp = pf_r8(hdr + 0x0a)) {
+            p = hp;
+            if (!super && (p < 10 || p > 199)) return KERR_BADPRIORITY;
+        }
+    }
+    size = (size + 3) & ~3u;
+    char s[64];
+    pf_cstring(nm, s, sizeof s);
+    uint32_t n = pf_os_alloc(PF_TASK_SIZE);
+    pf_w32(n + 12, PF_TASK_SIZE);
+    int32_t item = pf_item_new(n, KERNELNODE, TASKNODE, s);
+    pf_w8(n + 10, p);
+    pf_w8(n + 20, version);
+    pf_w8(n + 21, revision);
+    pf_w32(n + 28, pf_r32(me + 24));                        // n_Owner: the creator
+    pf_w32(n + T_ALLOCATEDSIGS, 0xFF);
+    uint32_t sp = pf_mem_image_task(me, n, image, need, size, cmd, cmdlen);
+    if (!sp) pf_stop(c, "CreateTask: no pages for a task's stack: not yet");
+    if (!base) base = pf_folio_base(PF_KERNEL);
+    uint32_t sbase = pf_r32(n + T_STACKBASE);
+    const uint32_t regs[13] = {argc, argp, 0, 0, 0, argc, argp, base, 0, base, sbase + 0x80, 0, 0};
+    for (int i = 0; i < 13; ++i) pf_w32(n + T_REGS + 4u * i, regs[i]);
+    pf_w32(n + T_SP, sp);
+    pf_w32(n + T_LK, kTaskExit);
+    pf_w32(n + T_PC, image);
+    pf_w32(n + T_PSR, 0x10);                                // user mode
+    Task* t = new Task{n, false, false, image};
+    g_tasks.push_back(t);
+    make_ready(t);
+    if (p > pf_r8(me + 10)) g_reschedule = true;
+    if (g_pf_trace)
+        pf_log("        task \"%s\" with its image at %08X (%u bytes), priority %u, stack %08X-%08X\n", s, image, need, p,
+               sbase, sp);
     return (uint32_t)item;
 }
 

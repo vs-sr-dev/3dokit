@@ -328,13 +328,25 @@ both discs:
   runs beside it: the subroutine relocates itself with its own AIF stub,
   makes its DataStream's ports and threads, and plays the game's three
   opening films -- the 3DO/EA logo, the Five Miles Out logo and the intro,
-  to the Immercenary title, 105 seconds -- with their sound (23.10's
+  to the Immercenary title, 108 seconds -- with their sound (23.10's
   `dcsqxdhalfstereo`, `dcsqxdhalfmono`, `envelope` and `mixer2x2`
   transliterated), then shows its title and main menu ("New Jump") over its
   credits, with the menu's music (`launchme`'s SoundSpooler streaming
   `$Music/Intro.music` through 23.10's `fixedmonosample` and `directout`,
   sample for sample the AIFF's), and on A unloads itself; `launchme` then asks for
-  `LoadProgramPrio("$boot/p")`, 291,636 OS calls in. The
+  `LoadProgramPrio("$boot/p")`. That is 23.10's loader with `program` set
+  and its kernel's CreateTask of a task with an image of its own (the
+  image's pages its, its own MemLists, its stack in the image's last page,
+  the command line at the stack's top for the startup's Kernel -120 to
+  split): `p` runs as a second task beside `launchme`, talks to it over
+  "ShellMsgPort", plays the jump film and the loading tube, loads the
+  world and plays the game -- the Garden, the HUD, the 3D world, its
+  people -- and when the player dies exits; the kernel deletes it, its
+  items, threads and pages, and `launchme` goes on. On the way: the
+  drive's reading time (150 blocks a second: the loading tube waits for
+  it), AbortIO, the event broker's listener whose port is gone,
+  Remove/DeleteScreenGroup and the Graphics folio's ir_Delete, SetCEControl,
+  the GrafCon setters, Operamath's eight vectors and its 4x4 engine. The
   emitter computes every flag it sets
   (no liveness pass yet), reads literal pools from memory rather than
   folding them, and a return to anywhere but its call's next word stops
