@@ -267,7 +267,10 @@ void draw(ArmCpu& c, const Cel& cel, const Target& t) {
     // that carries it looks wrong.
     if ((cel.pre0 & PRE0_BGND) && !(cel.flags & CCB_BGND))
         pf_stop(c, "the cel engine: PRE0's BGND bit without the CCB's: not yet");
-    if (cel.pre0 >> 24 & 15) pf_stop(c, "the cel engine: SKIPX: not yet");
+    // SKIPX (PRE0 bits 24-27): the first so many source pixels of each row are read and not drawn,
+    // and the drawing does not move for them -- the row's first pixel drawn is at its start (the
+    // guide's "skip pixels"; Opera's PackedSkipPixels and its unpacked rows read them so).
+    uint32_t skipx = cel.pre0 >> 24 & 15;
     bool lrform = !(cel.flags & CCB_PACKED) && (cel.pre1 & PRE1_LRFORM);
     if (lrform && cel.bpp != 16) pf_stop(c, "the cel engine: an LRFORM cel not of 16 bits: not yet");
     // TWD (the guide's "The TWD Flag"): the cel's first source pixel looked at; when it turns a way
@@ -343,10 +346,16 @@ void draw(ArmCpu& c, const Cel& cel, const Target& t) {
             // transparent, 3 repeat), 6 of count less 1, the pixels. The row also ends where its
             // words do (Opera; the guide calls the end-of-row packet optional).
             uint32_t len = (cel.bpp >= 8 ? in.take(16) & 0x3FF : in.take(8)) + 2, end = len * 32;
+            uint32_t to_skip = skipx;
             while (in.pos + 2 <= end) {
                 uint32_t type = in.take(2);
                 if (!type) break;
                 uint32_t n = in.take(6) + 1;
+                uint32_t gone = to_skip < n ? to_skip : n;    // SKIPX: read, not drawn, not moved over
+                to_skip -= gone;
+                if (type == 1)
+                    for (uint32_t i = 0; i < gone; ++i) in.take((unsigned)cel.bpp);
+                n -= gone;
                 if (type == 2) { skip(n); continue; }
                 uint32_t v = type == 3 ? in.take((unsigned)cel.bpp) : 0;
                 for (uint32_t i = 0; i < n; ++i) pixel(type == 1 ? in.take((unsigned)cel.bpp) : v);
@@ -360,13 +369,16 @@ void draw(ArmCpu& c, const Cel& cel, const Target& t) {
             uint32_t w = (cel.pre1 & 0x7FF) + 1;
             uint32_t woff = (cel.bpp >= 8 ? cel.pre1 >> 16 & 0x3FF : cel.pre1 >> 24) + 2;
             if (lrform) {
-                for (uint32_t i = 0; i < w; ++i) {
+                for (uint32_t i = skipx; i < w; ++i) {
                     uint32_t v = src_word(row + i * 4);
                     pixel(j & 1 ? v & 0xFFFF : v >> 16);
                 }
                 if (j & 1) row += woff * 4;
             } else {
-                for (uint32_t i = 0; i < w; ++i) pixel(in.take((unsigned)cel.bpp));
+                for (uint32_t i = 0; i < w; ++i) {
+                    uint32_t v = in.take((unsigned)cel.bpp);
+                    if (i >= skipx) pixel(v);
+                }
                 row += woff * 4;
             }
         }
