@@ -42,6 +42,7 @@ enum : uint32_t {
     KERR_BADITEM = 0xD57B9001u, KERR_BADTAG = 0xD57B9002u, KERR_BADTAGVAL = 0xD57B9003u,
     KERR_NOTPRIV = 0xD57B9004u, KERR_BADPRIORITY = 0xD57B910Cu, KERR_SMALLSTACK = 0xD57B910Fu,
     KERR_ILLEGALSIGNAL = 0xD57B9116u, KERR_NOTAIF = 0xD57B9118u, KERR_THREADTASK = 0xD57B910Du,
+    KERR_BADSIGNATURE = 0xD57B9112u,            // 23.10's, for a signature that is not the image's
 };
 
 struct Task {
@@ -451,12 +452,39 @@ uint32_t pf_create_task(ArmCpu& c, uint32_t tags) {
 // task that is not privileged; a stack of at least 0x100. The image's header (0x6a84): ro of at
 // least 0x80, rw and bss not negative, and it needs ro + rw + bss (rounded up to 16), or the file's
 // bytes when more. When its AIF header says it has the 3DO header (+0x2c, bit 30), that header's
-// stack (+0x28; at least 0x100, or the command line's as above), version and revision (+0x14) and
-// priority (+0x0a) are the task's (0x6bd4); a signed image (+0x34) or one with flag 0x20 (+0x24)
-// stops the run. The task's memory is pf_mem_image_task's. Its registers (0x7008): r0 and r5
+// stack (+0x28; at least 0x100, or the command line's as above), version and revision (+0x14) are
+// the task's, and its signature and privilege are looked at (pf_image_header); an image with flag
+// 0x20 (+0x24) stops the run. The task's memory is pf_mem_image_task's. Its registers (0x7008): r0 and r5
 // _ARGC, r1 and r6 _ARGP, r7 and r9 _BASE (KernelBase unless given), sl its stack's base + 0x80,
 // lr the kernel's 0x410, pc the image; its program's startup (Kernel -120) reads the command line
 // left at its stack's top. Made ready as a thread is (see pf_create_task).
+// The 3DO header's signature, privilege and priority, as 23.10's CreateTask takes them (0x6cc0): a
+// signature (its length at +0x34) must end the file -- the image's signed bytes (+0x30) and it, the
+// file's bytes, else 0xD57B9112 --, and then the kernel checks it against the 3DO Company's key
+// (0xacd0), which the runtime does not: an image on the disc is taken as the console takes the
+// disc's own, signed. An image flagged privileged (+0x24, bit 1) must be signed (else 0xD57B9112)
+// and makes a privileged task (TASK_SUPER, which the creator's privilege does not give). The
+// header's priority (+0x0a), when not 0, is the task's; a task neither privileged nor signed
+// may have only 10 to 199 (else BADPRIORITY).
+int32_t pf_image_header(uint32_t image, uint32_t imagesz, uint32_t& p, bool& privileged) {
+    uint32_t hdr = image + 0x80;
+    bool signed_ok = false;
+    privileged = false;
+    if (uint32_t siglen = pf_r32(hdr + 0x34)) {
+        if (siglen + pf_r32(hdr + 0x30) != imagesz) return (int32_t)KERR_BADSIGNATURE;
+        signed_ok = true;
+    }
+    if (pf_r8(hdr + 0x24) & 2) {
+        if (!signed_ok) return (int32_t)KERR_BADSIGNATURE;
+        privileged = true;
+    }
+    if (uint32_t hp = pf_r8(hdr + 0x0a)) {
+        p = hp;
+        if (!privileged && !signed_ok && (p < 10 || p > 199)) return (int32_t)KERR_BADPRIORITY;
+    }
+    return 0;
+}
+
 static uint32_t create_image_task(ArmCpu& c, uint32_t nm, uint32_t p, uint32_t size, uint32_t argc, uint32_t argp,
                                   uint32_t base, uint32_t image, uint32_t imagesz, uint32_t cmd) {
     uint32_t me = pf_current_task();
@@ -476,6 +504,7 @@ static uint32_t create_image_task(ArmCpu& c, uint32_t nm, uint32_t p, uint32_t s
     if (ro < 0x80 || rw < 0 || bss < 0 || !need) return KERR_NOTAIF;
     if (need < imagesz) need = imagesz;
     uint8_t version = 0, revision = 0;
+    bool privileged = false;
     if (pf_r32(image + 0x2c) & 0x40000000u) {
         uint32_t hdr = image + 0x80;
         if (uint32_t hs = pf_r32(hdr + 0x28)) {
@@ -485,11 +514,8 @@ static uint32_t create_image_task(ArmCpu& c, uint32_t nm, uint32_t p, uint32_t s
         version = (uint8_t)pf_r8(hdr + 0x14);
         revision = (uint8_t)pf_r8(hdr + 0x15);
         if (pf_r8(hdr + 0x24) & 0x20) pf_stop(c, "CreateTask: an image whose 3DO header has flag 0x20: not yet");
-        if (pf_r32(hdr + 0x34)) pf_stop(c, "CreateTask: a signed image: not yet");
-        if (uint32_t hp = pf_r8(hdr + 0x0a)) {
-            p = hp;
-            if (!super && (p < 10 || p > 199)) return KERR_BADPRIORITY;
-        }
+        int32_t err = pf_image_header(image, imagesz, p, privileged);
+        if (err) return (uint32_t)err;
     }
     size = (size + 3) & ~3u;
     char s[64];
@@ -498,6 +524,7 @@ static uint32_t create_image_task(ArmCpu& c, uint32_t nm, uint32_t p, uint32_t s
     pf_w32(n + 12, PF_TASK_SIZE);
     int32_t item = pf_item_new(n, KERNELNODE, TASKNODE, s);
     pf_w8(n + 10, p);
+    if (privileged) pf_w8(n + 11, pf_r8(n + 11) | TASK_SUPER);
     pf_w8(n + 20, version);
     pf_w8(n + 21, revision);
     pf_w32(n + 28, pf_r32(me + 24));                        // n_Owner: the creator

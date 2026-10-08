@@ -321,7 +321,7 @@ const uint8_t* pf_os_memory() { return g_os; }
 
 bool g_pf_boot_failed;
 
-int pf_run(const uint8_t* image, size_t size, uint32_t bss_end, uint32_t entry) {
+int pf_run(const uint8_t* image, size_t size, uint32_t bss_end, uint32_t entry, size_t file_size, const char* cmdline) {
     g_pf_boot_failed = false;
     if (int bad = pf_boot(image, size, bss_end)) {
         g_pf_boot_failed = true;
@@ -334,6 +334,24 @@ int pf_run(const uint8_t* image, size_t size, uint32_t bss_end, uint32_t entry) 
     c.r[6] = argv;
     c.r[7] = pf_folio_base(PF_KERNEL);          // KernelBase
     c.r[13] = 0x00200000u - 16;                 // the stack: the top of DRAM
+    // A program the shell starts is the task CreateTask makes of it (pf_task.cpp): its 3DO header's
+    // privilege and priority, and its command line at its stack's top for its startup to read
+    // (Kernel -120), the stack below it.
+    if (file_size && (pf_r32(0x2c) & 0x40000000u)) {
+        uint32_t task = pf_current_task(), p = pf_r8(task + 10);
+        bool privileged = false;
+        if (int32_t err = pf_image_header(0, (uint32_t)file_size, p, privileged)) {
+            pf_log("boot %s: its 3DO header refused, %08X\n", m->name, (uint32_t)err);
+            return err;
+        }
+        pf_w8(task + 10, p);
+        if (privileged) pf_w8(task + 11, pf_r8(task + 11) | 8);     // TASK_SUPER
+    }
+    if (cmdline) {
+        uint32_t len = ((uint32_t)std::strlen(cmdline) + 4) & ~3u;
+        c.r[13] -= len;
+        for (uint32_t i = 0; i < len; ++i) pf_w8(c.r[13] + i, i < std::strlen(cmdline) ? (uint8_t)cmdline[i] : 0);
+    }
     c.r[10] = kStackBase;                       // sl, 64 KB below
     c.r[14] = kExitSentinel;
     c.budget = PF_POLL_EVERY;

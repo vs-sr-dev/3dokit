@@ -45,8 +45,12 @@ uint32_t pf_folio_base(PfFolio folio);                      // the folio's node 
 
 // Boot a program (an AIF image's bytes) the way the OS's loader does: the
 // image at 0, its zero-initialised data cleared, r7 = KernelBase, and the
-// entry called with lr at the exit sentinel. Returns the exit code.
-int      pf_run(const uint8_t* image, size_t size, uint32_t bss_end, uint32_t entry);
+// entry called with lr at the exit sentinel. Returns the exit code. With the
+// file's size, its 3DO header's privilege and priority are the task's (as
+// CreateTask takes them, pf_image_header); with a command line, that is at the
+// stack's top for the program's startup to read, as CreateTask leaves it.
+int      pf_run(const uint8_t* image, size_t size, uint32_t bss_end, uint32_t entry, size_t file_size = 0,
+                const char* cmdline = nullptr);
 extern bool g_pf_boot_failed;               // pf_run's last boot failed: the program never ran
 // The same boot without the call: 0 when the program and the OS are in place.
 int      pf_boot(const uint8_t* image, size_t size, uint32_t bss_end);
@@ -197,6 +201,10 @@ uint32_t pf_create_task(ArmCpu& c, uint32_t tags);  // CreateSizedItem of a TASK
 int32_t  pf_delete_task(ArmCpu& c, uint32_t task);  // DeleteItem's own part for a TASKNODE
 // A deleted task's opened items closed and its semaphores unlocked (pf_kernel.cpp).
 void     pf_task_release(int32_t task);
+// An image's 3DO header (at image + 0x80) as CreateTask takes it: its signature (whose length
+// must make the file's `imagesz` bytes), its privilege and its priority. 0 with `p` the task's
+// priority and `privileged` whether it is a privileged task, or CreateTask's Err.
+int32_t  pf_image_header(uint32_t image, uint32_t imagesz, uint32_t& p, bool& privileged);
 
 // Time (pf_time.cpp): the guest's clock, in nanoseconds since the boot. It is not the host's:
 // it moves on by the clocks the ARM60 would take over the recompiled code (ARM_TICK, counted at
@@ -242,6 +250,15 @@ void     pf_device_abort(uint32_t dev, PfAbortIO fn);
 uint32_t pf_device_new(const char* name, int max_unit, PfDispatchIO dispatch, PfDeleteDev del = nullptr,
                        uint32_t size = 0);
 void     pf_complete_io(uint32_t ior);
+// The Operator's "ram" device (pf_nvram.cpp), made with its others; its unit 3 is the NVRAM. The
+// NVRAM's 32 KB outlive each program's boot: blank unless pf_nvram_dir names a host directory
+// (pfboot --nvram DIR), whose nvram.bin they are, read at the first use and written by
+// pf_nvram_written after each change.
+void     pf_ram_init();
+uint32_t pf_ram_device();                       // its node
+void     pf_nvram_dir(const char* dir);
+std::vector<uint8_t>& pf_nvram();
+void     pf_nvram_written();
 // What the OS's own code asks of the kernel, as a program's SWI would: CreateIOReq on a device
 // (CREATEIOREQ_TAG_DEVICE alone), SendIO with the IOInfo at guest address `info`, DeleteItem.
 int32_t  pf_create_ioreq(ArmCpu& c, int32_t device);
@@ -306,6 +323,9 @@ uint32_t pf_os_release();
 // changed between them its own version is what says which way the runtime goes.
 #define PF_VERSION(v, r) (((uint32_t)(v) << 8) | (uint32_t)(r))
 uint32_t pf_system_version(const char* path);
+// The same of System/Kernel/os_code's images (pf_err.cpp), by their order in it: 0 the kernel, 1
+// the Operator, 2 the File folio (20.19 on Crash 'n Burn's disc, 20.30 on Doctor Hauzer's).
+uint32_t pf_os_code_version(int index);
 // A compressed AIF image (a System file's bytes, os_code's boot header and all) unpacked as its
 // own decompressor unpacks it (pf_aif.cpp): `out` the bytes from its base, the header with its
 // NOP at 0 and the unpacked words from 0x100 on -- the image's ro + rw, then its relocation stub
@@ -326,9 +346,12 @@ void     pf_file_init();
 // it, run on a copy of `c` with the stack `below` bytes lower.
 // The shell running a disc as the console starts it (pfboot --boot): ^/system/scripts/startopera
 // and the scripts it runs, line by line -- aliases made, the OS's own programs (under the System
-// directory) left to the runtime, every other program run by `run` (its host path) until it ends,
-// a script run where it is named -- then $boot/LaunchMe. Returns what the last program returned.
-int      pf_shell_boot(int (*run)(const std::string& host));
+// directory) left to the runtime, every other program run by `run` (its host path, and its
+// command line when the line gives it arguments, else "") until it ends, a script run where it is
+// named -- then $boot/LaunchMe. The System directory's own programs (System/Programs: lmadm and
+// its like) are run when the build has their modules, and passed over when not.
+// Returns what the last program returned.
+int      pf_shell_boot(int (*run)(const std::string& host, const std::string& cmdline));
 uint32_t pf_stream_open(const ArmCpu& c, uint32_t below, uint32_t name, int32_t bsize);
 int32_t  pf_stream_read(const ArmCpu& c, uint32_t below, uint32_t st, uint32_t dst, int32_t n);
 int32_t  pf_stream_seek(const ArmCpu& c, uint32_t below, uint32_t st, int32_t offset, uint32_t whence);

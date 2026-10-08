@@ -1,7 +1,7 @@
 // 3dokit runtime -- pfboot: run a recompiled 3DO program on the Portfolio
 // runtime, tracing its OS calls.
 //
-//     pfboot PROGRAM [--trace N] [--lenient] [--max-calls N] [--snap N DIR] [--disc DIR]
+//     pfboot PROGRAM [--trace N] [--lenient] [--max-calls N] [--snap N DIR] [--disc DIR] [--nvram DIR]
 //                    [--frames DIR [--frames-at FIRST[-LAST][/EVERY]]] [--pad BUTTONS@FIELD[xN][/E][+H]]...
 //                    [--window [--record FILE]] [--wav FILE] [--dsp-code] [--dsp-check]
 //
@@ -13,7 +13,9 @@
 // with the memory before and after it and the call in DIR (pf_memtest.cpp;
 // python -m 3dokit.pfcheck replays it on the 1993 OS). --disc DIR is the
 // disc's root, where the program's files are; by default the program's own
-// directory. --frames DIR writes what the display shows, at each vertical
+// directory. --nvram DIR keeps the console's NVRAM in DIR/nvram.bin between
+// runs (pf_nvram.cpp); without it the NVRAM is blank at each start, as a
+// fresh console's. --frames DIR writes what the display shows, at each vertical
 // blank that changes it, as a PPM (pf_graphics.cpp); --frames-at FIRST[-LAST][/EVERY]
 // looks only at the fields from FIRST to LAST, every EVERY-th of them (a long race
 // writes some 230 KB a field). --pad BUTTONS@FIELD[xN][/E][+H]
@@ -42,9 +44,11 @@
 //
 // starts the disc as the console's shell does (pf_file.cpp's pf_shell_boot):
 // its scripts from ^/system/scripts/startopera on, each program they name run
-// to its end in turn -- every one of them must be in this build. Each program
-// boots a fresh OS; the guest's clock and the fields counted go on from the
-// last (the pad's fields are the whole run's).
+// to its end in turn -- every one of them must be in this build, but for the
+// System directory's own programs (lmadm), which run when they are in it and
+// are passed over when they are not. Each program boots a fresh OS; the
+// guest's clock and the fields counted go on from the last (the pad's fields
+// are the whole run's).
 //
 //     pfboot FILE --unpack OUT
 //
@@ -119,8 +123,9 @@ static uint32_t bl_target(const std::vector<uint8_t>& d, uint32_t at) {
     return at + 8 + (uint32_t)off * 4;
 }
 
-// A program the shell names (--boot): its AIF image read and run to its end.
-static int run_program(const std::string& path) {
+// A program the shell names (--boot): its AIF image read and run to its end, with its command line
+// when the shell gives one.
+static int run_program(const std::string& path, const std::string& cmdline) {
     std::ifstream f(path, std::ios::binary);
     std::vector<uint8_t> d((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
     if (d.size() < 0x100 || be32(d, 0x10) != 0xEF000011u) {
@@ -130,7 +135,7 @@ static int run_program(const std::string& path) {
     uint32_t ro = be32(d, 0x14), rw = be32(d, 0x18), bss = be32(d, 0x20);
     uint32_t stub = bl_target(d, 0x04);
     if (!stub) stub = ro + rw;
-    int r = pf_run(d.data(), stub, ro + rw + bss, bl_target(d, 0x0C));
+    int r = pf_run(d.data(), stub, ro + rw + bss, bl_target(d, 0x0C), d.size(), cmdline.empty() ? nullptr : cmdline.c_str());
     if (g_pf_boot_failed) std::exit(2);         // not run at all (no module): the shell would go round
     return r;
 }
@@ -173,6 +178,7 @@ int main(int argc, char** argv) {
             g_pf_snap_dir = argv[++i];
         }
         else if (!std::strcmp(argv[i], "--disc") && i + 1 < argc) disc = argv[++i];
+        else if (!std::strcmp(argv[i], "--nvram") && i + 1 < argc) pf_nvram_dir(argv[++i]);
         else if (!std::strcmp(argv[i], "--frames") && i + 1 < argc) g_pf_frames_dir = argv[++i];
         else if (!std::strcmp(argv[i], "--frames-at") && i + 1 < argc) {
             if (!frames_at_option(argv[++i])) {

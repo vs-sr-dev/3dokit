@@ -459,6 +459,7 @@ void pf_io_init() {
     pf_on_swi(0x10003, k_deleteitem);
     pf_device_new("SPORT", 0, sport_dispatch);
     pf_device_new("timer", 1, timer_dispatch);
+    pf_ram_init();
     pf_on_vbl(sport_vbl);
     pf_on_vbl(timer_vbl);
 }

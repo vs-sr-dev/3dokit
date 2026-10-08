@@ -10,7 +10,10 @@
 //
 // The disc is the boot volume's root, a directory on the host (g_pf_disc_root). On the console
 // "/" is the folio's own root, whose entries are the mounted filesystems, and the shell's `$boot`
-// names one of them ("/cd-rom"); here "/" is the disc's root, and `$boot` is "/".
+// names one of them ("/cd-rom"); here "/" is the disc's root, and `$boot` is "/". The other
+// filesystems mounted -- the NVRAM's ("/nvram") -- are named at the root before the disc's
+// entries; their code (below, "linked-memory filesystems") is the File folio 20.30's, the third
+// image of Doctor Hauzer's os_code, with its addresses.
 #include "pf.h"
 #include <algorithm>
 #include <cctype>
@@ -20,6 +23,7 @@
 #include <filesystem>
 #include <fstream>
 #include <map>
+#include <memory>
 #include <set>
 #include <string>
 #include <system_error>
@@ -46,9 +50,10 @@ enum : uint32_t {
     FILE_DEVICE_OPENFILE = 2, FILEIOREQ_SIZE = 0x8c,
     // IOReq (io.h) and its IOInfo
     IO_DEV = 0x2c, IO_ACTUAL = 0x54, IO_FLAGS = 0x58, IO_ERROR = 0x5c, IO_MSGITEM = 0x68,
-    IOI_COMMAND = 0x34, IOI_OFFSET = 0x40, IOI_RECV_BUF = 0x4c, IOI_RECV_LEN = 0x50,
+    IOI_COMMAND = 0x34, IOI_OFFSET = 0x40, IOI_SEND_BUF = 0x44, IOI_SEND_LEN = 0x48, IOI_RECV_BUF = 0x4c,
+    IOI_RECV_LEN = 0x50,
     IO_DONE = 1, IO_QUICK = 2, SIGF_IODONE = 8, MESSAGENODE = 9,
-    CMD_READ = 1, CMD_STATUS = 2, FILECMD_GETPATH = 4,
+    CMD_WRITE = 0, CMD_READ = 1, CMD_STATUS = 2, FILECMD_GETPATH = 4,
     // FileStatus (filesystem.h): a DeviceStatus (io.h), then fs_ByteCount
     FILESTATUS_SIZE = 0x28,
     // Stream (filestream.h)
@@ -70,6 +75,15 @@ static bool same_name(const std::string& a, const std::string& b) {
 
 static uint32_t task_item() { return pf_r32(pf_current_task() + 24); }
 
+// The linked-memory filesystems (the NVRAM, below): a place "/NAME" and what is under it, when
+// NAME is a mounted one's, is on one, and not on the disc.
+struct LmFs;
+static LmFs* lm_of(const std::string& at);
+static std::string lm_top(const std::string& name);         // "/NAME" of the one so named, or ""
+static std::string lm_child(const std::string& dir, const std::string& name);
+static void lm_run(LmFs& d, uint32_t ior, uint32_t file);
+static uint32_t file_node(const std::string& at);
+
 // ---- the disc --------------------------------------------------------------------------------
 // A place on the disc is its path from the root, each name as the host spells it ("/" the root).
 static fs::path host_of(const std::string& at) {
@@ -84,8 +98,15 @@ static std::string parent_of(const std::string& at) {
 }
 
 // The entry `name` of the directory `at`, matched without case (the folio's 0x61e0, as the
-// kernel's FindNamedNode matches); "" when there is none.
+// kernel's FindNamedNode matches); "" when there is none. At the root a mounted filesystem's name
+// comes first (the folio's root holds the filesystems: 20.30's walk, 0x3078), and a linked-memory
+// directory's entries are its own (lm_child).
 static std::string child_of(const std::string& at, const std::string& name) {
+    if (at == "/") {
+        std::string top = lm_top(name);
+        if (!top.empty()) return top;
+    }
+    if (lm_of(at)) return lm_child(at, name);
     std::error_code ec;
     std::string found;
     for (const auto& e : fs::directory_iterator(host_of(at), ec)) {
@@ -97,6 +118,7 @@ static std::string child_of(const std::string& at, const std::string& name) {
 }
 
 static bool is_dir(const std::string& at) {
+    if (lm_of(at)) return pf_r32(file_node(at) + 0x54) & 1;     // fi_Flags' FILE_IS_DIRECTORY
     std::error_code ec;
     return fs::is_directory(host_of(at), ec);
 }
@@ -112,6 +134,10 @@ static std::map<uint32_t, std::string> g_places;        // File node -> place
 static uint32_t file_node(const std::string& at) {
     auto it = g_files.find(at);
     if (it != g_files.end()) return it->second;
+    if (lm_of(at)) {
+        std::fprintf(stderr, "File: \"%s\" has no File (a linked-memory filesystem's are made by its walk)\n", at.c_str());
+        std::exit(3);
+    }
     std::string name = at == "/" ? "" : at.substr(at.find_last_of('/') + 1);
     uint32_t parent = at == "/" ? 0 : file_node(parent_of(at));
     uint32_t n = pf_os_alloc(FI_SIZE);
@@ -176,7 +202,8 @@ static std::string g_cwd = "/";                 // the current directory (one fo
 // far (NOTADIRECTORY if it is not one, NOFILE if there is no such entry); a name has at most 31
 // characters (else BADNAME). A name that starts with '$' is an alias: the path is made again with
 // the alias's value in its place and walked on from there (an unknown alias is BADNAME). The
-// alternatives a name can hold ({a|b}) stop the run: not yet.
+// alternatives a name can hold ({a|b}) stop the run: not yet. In a linked-memory filesystem "^" is
+// its root (0x2f44: the directory's filesystem's root).
 static int32_t walk(const std::string& path, std::string& at) {
     std::string p = path;
     at = g_cwd;
@@ -208,7 +235,7 @@ static int32_t walk(const std::string& path, std::string& at) {
         i = j < p.size() ? j + 1 : j;
         if (name == ".") continue;
         if (name == "..") { at = parent_of(at); continue; }
-        if (name == "^") { at = "/"; continue; }
+        if (name == "^") { at = lm_of(at) ? at.substr(0, at.find('/', 1)) : "/"; continue; }
         if (!is_dir(at)) return (int32_t)FERR_NOTADIRECTORY;
         std::string next = child_of(at, name);
         if (next.empty()) return (int32_t)FERR_NOFILE;
@@ -219,7 +246,7 @@ static int32_t walk(const std::string& path, std::string& at) {
 
 std::string pf_host_path(const char* path) {
     std::string at;
-    if (walk(path, at)) return "";
+    if (walk(path, at) || lm_of(at)) return "";
     return host_of(at).string();
 }
 
@@ -294,7 +321,9 @@ static void f_closediskfile(ArmCpu& c) { c.r[0] = (uint32_t)close_disk_file(c, (
 // block size and count, fi_Flags as ds_DeviceFlagWord, DS_USAGE_READONLY (0x20000000) in the
 // usage flags for a read-only file, fs_ByteCount -- copied to ioi_Recv: 0x28 bytes when it is
 // shorter (the folio's max where a min was meant), and when it is longer the folio copies its
-// stack past the status, here nothing; io_Actual stays 0; CompleteIO, and 0. FILECMD_GETPATH (4)
+// stack past the status, here nothing; io_Actual stays 0; CompleteIO, and 0. That is the 1993
+// folio's (20.19, Crash 'n Burn's os_code too); from 20.30 (0x134c; 23.10's 0x1198 the same) the
+// copy is as long as ioi_Recv, 0x28 at most. FILECMD_GETPATH (4)
 // stops the run: not yet. Every other command goes to the filesystem's queue, a CD's (0x117c):
 // only CMD_READ, of whole blocks (else BADPTR), queued -- IO_QUICK cleared -- for the file daemon;
 // a refusal is io_Error, CompleteIO, and SendIO's result. The daemon reads the blocks (a CD's
@@ -379,25 +408,45 @@ static int32_t refuse(uint32_t ior, uint32_t err) {
 
 static int32_t file_dispatch(uint32_t ior) {
     uint32_t cmd = pf_r8(ior + IOI_COMMAND);
-    if (cmd > 10) return (int32_t)FERR_BADCOMMAND;
     uint32_t file = pf_r32(pf_r32(ior + IO_DEV) + OFI_FILE);
+    LmFs* lm = lm_of(g_places[file]);
+    if (cmd > (lm ? 11u : 10u)) return (int32_t)FERR_BADCOMMAND;
     if (cmd == CMD_STATUS) {
-        uint32_t buf = pf_r32(ior + IOI_RECV_BUF), flags = pf_r32(file + FI_FLAGS);
-        for (uint32_t i = 0; i < FILESTATUS_SIZE; i += 4) pf_w32(buf + i, 0);
-        pf_w8(buf + 0, 5);
-        pf_w8(buf + 2, 3);
-        pf_w32(buf + 0x04, FILESTATUS_SIZE);
-        pf_w32(buf + 0x08, pf_r32(file + FI_BLOCKSIZE));
-        pf_w32(buf + 0x0c, pf_r32(file + FI_BLOCKCOUNT));
-        pf_w32(buf + 0x10, flags);
-        pf_w32(buf + 0x14, flags & FILE_IS_READONLY ? 0x20000000u : 0);
-        pf_w32(buf + 0x24, pf_r32(file + FI_BYTECOUNT));
+        uint32_t buf = pf_r32(ior + IOI_RECV_BUF), flags = pf_r32(file + FI_FLAGS), n = FILESTATUS_SIZE;
+        if (pf_os_code_version(2) >= PF_VERSION(20, 30)) n = std::min(n, pf_r32(ior + IOI_RECV_LEN));
+        uint32_t st[FILESTATUS_SIZE / 4] = {0x05000300u, FILESTATUS_SIZE, pf_r32(file + FI_BLOCKSIZE),
+                                            pf_r32(file + FI_BLOCKCOUNT), flags,
+                                            flags & FILE_IS_READONLY ? 0x20000000u : 0, 0, 0, 0,
+                                            pf_r32(file + FI_BYTECOUNT)};
+        for (uint32_t i = 0; i < n; ++i) pf_w8(buf + i, st[i / 4] >> (24 - 8 * (i % 4)) & 0xff);
         pf_complete_io(ior);
         return 0;
     }
     if (cmd == FILECMD_GETPATH) {
         std::fprintf(stderr, "File: FILECMD_GETPATH: not yet\n");
         std::exit(3);
+    }
+    if (lm) {
+        // 20.30's dispatch (0x109c, 0x1264) and the filesystem's queue (0x4b30): READ and WRITE of
+        // whole blocks inside the file (else BADPTR, as the CD's), READDIR and READENTRY with a
+        // buffer to receive into (else BADPTR), OPENENTRY done at once; a refusal is io_Error,
+        // CompleteIO and SendIO's result. The request queued (IO_QUICK cleared), then run to its
+        // end (lm_run) and completed.
+        uint32_t bs = pf_r32(file + FI_BLOCKSIZE);
+        if (cmd == CMD_READ || cmd == CMD_WRITE) {
+            uint32_t len = pf_r32(ior + (cmd == CMD_READ ? IOI_RECV_LEN : IOI_SEND_LEN));
+            if (len % bs || (pf_r32(file + FI_BLOCKCOUNT) - pf_r32(ior + IOI_OFFSET)) * bs < len)
+                return refuse(ior, FERR_BADPTR);
+        } else if (cmd == 3 || cmd == 5) {
+            if (!pf_r32(ior + IOI_RECV_BUF)) return refuse(ior, FERR_BADPTR);
+        } else if (cmd == 11) {
+            pf_complete_io(ior);
+            return 0;
+        }
+        pf_w32(ior + IO_FLAGS, pf_r32(ior + IO_FLAGS) & ~IO_QUICK);
+        lm_run(*lm, ior, file);
+        pf_complete_io(ior);
+        return 0;
     }
     if (cmd != CMD_READ) return refuse(ior, FERR_BADCOMMAND);
     uint32_t bs = pf_r32(file + FI_BLOCKSIZE), len = pf_r32(ior + IOI_RECV_LEN);
@@ -416,6 +465,855 @@ static int32_t file_dispatch(uint32_t ior) {
     g_reads.push_back({ior, g_drive_free});
     pf_at(g_drive_free, reads_done);
     return 0;
+}
+
+// ---- linked-memory filesystems: the NVRAM ----------------------------------------------------
+// The NVRAM holds a linked-memory filesystem: its blocks in a ring, each beginning with a header --
+// a fingerprint, the next block and the one before it, the block's length in blocks (its header's
+// own included) and its header's -- and, in a file's, the entry: the file's bytes, an identifier,
+// a type and a name of 32 characters; 0x40 bytes in all. The disc's own FORMAT
+// (System/Programs, which LMADM runs on a blank NVRAM) lays a fresh one out: a label at the first
+// block (a DiscLabel of 0x84 bytes, version 2), an anchor block after it -- the root directory's
+// one avatar, which the label names -- and one free block for the rest, the anchor and the free
+// block each the other's next and previous.
+//
+// What follows is the File folio 20.30's (os_code's third image, linked at 0), with its addresses:
+// the mount, the walk through such a directory, CreateFile and DeleteFile, and the filesystem's own
+// requests. A request is a run of steps (0x513c), each one transfer through the ram device -- a
+// block's header into or out of one of two buffers, or file data -- after which the next step
+// is taken (the request's end action, 0x4ff8). On the console the folio's daemon sends each
+// transfer and the device does it; the NVRAM is memory, which its driver copies at once, and here
+// the transfers are done one after the other there and then, and the request is complete when
+// SendIO returns. The device's state from one request to the next and its buffers -- two headers
+// and 0x100 bytes of data -- are kept as the folio keeps them (LinkedMemDisk +0x108 to +0x1c8): a
+// header written back is written whole, fields left from an earlier request and all.
+//
+// The mount makes a FileSystem node and the root directory's File; the high-level device the
+// folio also makes (its LinkedMemDisk) and its IOReq are not made here: their state is LmFs's.
+enum : uint32_t {
+    LM_FILE = 0xBE4F32A6u, LM_FREE = 0x7AA565BDu, LM_ANCHOR = 0x855A02B6u,     // the blocks' fingerprints
+    H_FP = 0x00, H_FLINK = 0x04, H_BLINK = 0x08, H_COUNT = 0x0c, H_HDR = 0x10, H_BYTES = 0x14, H_UID = 0x18,
+    H_TYPE = 0x1c, H_NAME = 0x20, H_SIZE = 0x40,
+    // FileSystem (filesystem.h, as 20.30 fills it)
+    FILESYSTEMNODE = 1, FS_SIZE = 0x64, FS_NAME = 0x24, FS_FLAGS = 0x48, FS_VOLBLOCKSIZE = 0x4c,
+    FS_VOLBLOCKCOUNT = 0x50, FS_VOLID = 0x54, FS_RATIO = 0x5c, FS_ROOT = 0x60,
+    // File's other fields (20.30)
+    FI_FILESYSTEM = 0x44, FI_UNIQUEID = 0x4c, FI_TYPE = 0x50, FI_BURST = 0x68, FI_GAP = 0x6c, FI_LASTAVATAR = 0x70,
+    FI_AVATAR = 0x78, FILE_TYPE_DIRECTORY = 0x2a646972,                   // '*dir'
+    LM_ROOT_FLAGS = 0x2d,   // a directory, the filesystem's, that can be scanned and has entries
+    // the label (discdata.h's DiscLabel)
+    DL_SIZE = 0x84, DL_VERSION = 0x06, DL_ID = 0x28, DL_VOLID = 0x48, DL_BLOCKSIZE = 0x4c, DL_BLOCKCOUNT = 0x50,
+    DL_ROOTBLOCKCOUNT = 0x58, DL_ROOTBLOCKSIZE = 0x5c, DL_LASTAVATAR = 0x60, DL_AVATARS = 0x64,
+    // the commands
+    FILECMD_READDIR = 3, FILECMD_READENTRY = 5, FILECMD_ALLOCBLOCKS = 6, FILECMD_SETEOF = 7,
+    FILECMD_ADDENTRY = 8, FILECMD_DELETEENTRY = 9, FILECMD_SETTYPE = 10, FILECMD_OPENENTRY = 11,
+    DE_SIZE = 0x48,                                     // a DirectoryEntry (directory.h)
+    FERR_BADIOARG = 0xD556F00Du, FERR_NOFILESYSTEM = 0xD556F103u, FERR_BUSY = 0xD556F10Bu,
+    FERR_DUPLICATE = 0xD556F10Cu, FERR_READONLY = 0xD556F10Du,
+    KERR_BADIOARG = 0xD57B900Du,                        // the ram driver's
+    RAM_NVRAM_UNIT = 3,
+};
+
+struct LmFs {
+    std::string name;                   // the label's volume identifier: the filesystem's name
+    uint32_t node = 0, root = 0;        // its FileSystem node, its root directory's File
+    uint32_t unit = 0, offset = 0;      // the ram device's unit, and the filesystem's first block there
+    uint32_t bs = 0, blocks = 0;        // the device's block size and count (+0xfc, +0x100)
+    uint32_t chunk_max = 0, hdr = 0;    // 0x100 / bs, and a header's blocks: (bs + 0x3f) / bs (+0x138, +0x13c)
+    // the device's state (+0x108 to +0x144): the last entry READDIR found and its index, the File of
+    // the request, the headers' blocks (A's and B's), an entry's index, a block saved, where a
+    // search began, the blocks wanted, data's place, blocks left and blocks a transfer, the step
+    uint32_t dir_block = 0, dir_index = 0, file = 0, a = 0, count = 0, b = 0, saved = 0, start = 0;
+    uint32_t want = 0, at = 0, left = 0, chunk = 0, state = 0;
+    uint8_t ha[H_SIZE] = {}, hb[H_SIZE] = {}, data[0x100] = {};      // +0x148, +0x188, +0x1c8
+    int last_io = 0;                    // the device's request's last transfer
+};
+static std::vector<std::unique_ptr<LmFs>> g_lm;     // mounted, in the folio's list's order
+static uint32_t g_next_id;                          // the folio's identifier for an entry without one (+0xf4)
+
+static uint32_t hw(const uint8_t* h, uint32_t o) {
+    return (uint32_t)h[o] << 24 | (uint32_t)h[o + 1] << 16 | (uint32_t)h[o + 2] << 8 | h[o + 3];
+}
+static void hs(uint8_t* h, uint32_t o, uint32_t v) {
+    for (uint32_t i = 0; i < 4; ++i) h[o + i] = (uint8_t)(v >> (24 - 8 * i));
+}
+
+// The folio's strncpy (0x6b54): up to n bytes, those after the string's end 0.
+static void lm_strncpy(uint8_t* d, const uint8_t* s, uint32_t n) {
+    bool end = false;
+    for (uint32_t i = 0; i < n; ++i) {
+        d[i] = end ? 0 : s[i];
+        if (!s[i]) end = true;
+    }
+}
+static void lm_strncpy_guest(uint8_t* d, uint32_t s, uint32_t n) {
+    bool end = false;
+    for (uint32_t i = 0; i < n; ++i) {
+        d[i] = end ? 0 : (uint8_t)pf_r8(s + i);
+        if (!d[i]) end = true;
+    }
+}
+
+// The folio's comparison of names (0x6cc0), each character through its toupper (0x6f30); here
+// within the 32 bytes of a header's name.
+static bool lm_same(const uint8_t* x, const uint8_t* y) {
+    for (uint32_t i = 0; i < 32; ++i) {
+        if (std::toupper(x[i]) != std::toupper(y[i])) return false;
+        if (!x[i]) return true;
+    }
+    return true;
+}
+
+// The linked-memory filesystem a place is on ("/NAME" and below, NAME a mounted one's), or null.
+static LmFs* lm_of(const std::string& at) {
+    if (at.size() < 2 || at[0] != '/') return nullptr;
+    size_t e = at.find('/', 1);
+    std::string first = at.substr(1, e == std::string::npos ? std::string::npos : e - 1);
+    for (auto& fs : g_lm)
+        if (fs->name == first) return fs.get();
+    return nullptr;
+}
+
+static std::string lm_top(const std::string& name) {
+    for (auto& fs : g_lm)
+        if (same_name(fs->name, name)) return "/" + fs->name;
+    return "";
+}
+
+// A transfer of the folio's request to the ram device's unit (pf_nvram.cpp's driver: the request
+// has a callback, so the NVRAM takes a write): `len` bytes at block `block`; the driver's error
+// (BADIOARG for a block or a length outside the unit), else 0.
+static uint32_t lm_dev(const LmFs& d, bool write, int32_t block, uint8_t* p, int32_t len) {
+    std::vector<uint8_t>& nv = pf_nvram();
+    if (block < 0) return KERR_BADIOARG;
+    if (len == 0) return 0;
+    if (len < 0 || (int32_t)((uint32_t)block * d.bs + (uint32_t)len) > (int32_t)(d.blocks * d.bs)) return KERR_BADIOARG;
+    uint32_t at = (uint32_t)block * d.bs;
+    if (write) {
+        std::memcpy(&nv[at], p, (size_t)len);
+        pf_nvram_written();
+    } else {
+        std::memcpy(p, &nv[at], (size_t)len);
+    }
+    return 0;
+}
+
+// A step's transfer (0x58e0-0x59ec): 1 a header into A from block a, 2 into B from block b, 3 A
+// to a, 4 B to b, 0x40 bytes each; 5 `chunk` blocks of data into the buffer from a + at, 6 from
+// it to b + at. The blocks are the device's own: the filesystem's first block is not added (the
+// NVRAM's is 0).
+static uint32_t lm_transfer(LmFs& d, int io) {
+    switch (io) {
+    case 1: return lm_dev(d, false, (int32_t)d.a, d.ha, H_SIZE);
+    case 2: return lm_dev(d, false, (int32_t)d.b, d.hb, H_SIZE);
+    case 3: return lm_dev(d, true, (int32_t)d.a, d.ha, H_SIZE);
+    case 4: return lm_dev(d, true, (int32_t)d.b, d.hb, H_SIZE);
+    case 5: return lm_dev(d, false, (int32_t)(d.a + d.at), d.data, (int32_t)(d.chunk * d.bs));
+    case 6: return lm_dev(d, true, (int32_t)(d.b + d.at), d.data, (int32_t)(d.chunk * d.bs));
+    }
+    return 0;
+}
+
+// One step (0x513c), by the device's state: what it does to the headers and the request, the
+// transfer it asks for (`io`, 0 for none) and the state after it (2 unless said). 1 while the
+// request goes on, 0 when it is done, or its error. The steps, as the folio's switch has them:
+//   3, 4, 5: grow a file where it is (ALLOCBLOCKS): A its block, B the next one -- after it, free
+//      and long enough for the blocks wanted -- taken into A; else a free block found (0xb);
+//   6 to 0xa: the block A, now a file's, cut to the blocks wanted when 0x60 or more are left over
+//      (the rest a free block after it, its neighbours' links mended), and the File's block count
+//      its length less the header; then a block left behind, if any, freed (0x11);
+//   0xb, 0xc: the first free block long enough, from the anchor round (else the folio's 0xD556F009);
+//      it becomes the file's: for ADDENTRY a new entry -- no bytes, identifier 0, type "    ",
+//      the name --, for ALLOCBLOCKS the file's entry, and its data copied over (0xd, 0xe, 0x100
+//      bytes at a time) and the old block given up (0xf: A and B change places, the File's avatar
+//      is the new block);
+//   0x11 to 0x16: block A freed, back to the first free block before it and every free block
+//      after that joined to it;
+//   0x17, 0x18: the directory's entries from the last one READDIR found (or from the anchor) round
+//      to where it began: READDIR's by index, READENTRY's and DELETEENTRY's by name (NOFILE when
+//      none); a DirectoryEntry for the caller, or the entry freed (0x11);
+//   0x19, 0x1a: SETEOF, the entry's bytes and the File's (the File the last request was on: the
+//      folio does not set it for this one); 0x1b, 0x1c: SETTYPE, the entry's type.
+static int32_t lm_step(LmFs& d, uint32_t ior, int& io) {
+    uint32_t cmd = pf_r8(ior + IOI_COMMAND), file = d.file, next = 2;
+    int32_t ret = 1;
+    io = 0;
+    auto anchor = [&] { return pf_r32(pf_r32(pf_r32(file + FI_FILESYSTEM) + FS_ROOT) + FI_AVATAR); };
+    auto find_free = [&] { d.b = anchor(); io = 2; next = 0xc; };                     // 0x544c
+    auto free_a = [&] { d.dir_block = d.dir_index = 0; hs(d.ha, H_FP, LM_FREE); io = 3; next = 0x12; };  // 0x5634
+    auto next_entry = [&] {                                                         // 0x5884
+        d.a = hw(d.ha, H_FLINK);
+        if (d.a == d.start) {
+            ret = (int32_t)FERR_NOFILE;
+            next = 1;
+        } else {
+            io = 1;
+            next = 0x18;
+        }
+    };
+    auto found_entry = [&] {                                                        // 0x57f4
+        ret = 0;
+        uint8_t de[DE_SIZE] = {};
+        hs(de, 0x04, hw(d.ha, H_UID));
+        hs(de, 0x08, hw(d.ha, H_TYPE));
+        hs(de, 0x0c, pf_r32(file + FI_BLOCKSIZE));
+        hs(de, 0x10, hw(d.ha, H_BYTES));
+        hs(de, 0x14, hw(d.ha, H_COUNT) - hw(d.ha, H_HDR));
+        hs(de, 0x18, 0xFFFFFFFFu);
+        hs(de, 0x1c, 0xFFFFFFFFu);
+        hs(de, 0x20, 1);
+        lm_strncpy(de + 0x24, d.ha + H_NAME, 0x20);
+        hs(de, 0x44, d.a);
+        uint32_t n = std::min<uint32_t>(pf_r32(ior + IOI_RECV_LEN), DE_SIZE);
+        for (uint32_t i = 0; i < n; ++i) pf_w8(pf_r32(ior + IOI_RECV_BUF) + i, de[i]);
+        pf_w32(ior + IO_ACTUAL, n);
+    };
+    switch (d.state) {
+    case 0: case 1:                                                                 // 0x52a0
+        next = 0;
+        ret = 0;
+        break;
+    case 2:                                                                         // 0x52ac
+        ret = 0;
+        break;
+    case 3:                                                                         // 0x52b8
+        d.saved = 0;
+        if (cmd != FILECMD_ADDENTRY) {
+            io = 1;
+            next = 4;
+        } else {
+            find_free();
+        }
+        break;
+    case 4:                                                                         // 0x52d8
+        if (hw(d.ha, H_FLINK) >= d.a) {
+            d.b = hw(d.ha, H_FLINK);
+            io = 2;
+            next = 5;
+        } else {
+            find_free();
+        }
+        break;
+    case 5:                                                                         // 0x52f8
+        if (hw(d.hb, H_FP) != LM_FREE || d.want - hw(d.ha, H_COUNT) > hw(d.hb, H_COUNT)) {
+            find_free();
+            break;
+        }
+        hs(d.ha, H_COUNT, hw(d.ha, H_COUNT) + hw(d.hb, H_COUNT));
+        hs(d.ha, H_FLINK, hw(d.hb, H_FLINK));
+        io = 3;
+        next = 6;
+        break;
+    case 6: {                                                                       // 0x5340
+        if (cmd == FILECMD_ADDENTRY) {
+            std::memcpy(d.ha, d.hb, H_SIZE);
+            d.a = d.b;
+        }
+        uint32_t excess = hw(d.ha, H_COUNT) - d.want;
+        if (excess < 0x60) {
+            d.b = hw(d.ha, H_FLINK);
+            io = 2;
+            next = 9;
+        } else {
+            d.b = d.a + d.want;
+            hs(d.hb, H_FP, LM_FREE);
+            hs(d.hb, H_COUNT, excess);
+            hs(d.hb, H_FLINK, hw(d.ha, H_FLINK));
+            hs(d.hb, H_BLINK, d.a);
+            hs(d.hb, H_HDR, 0);
+            io = 4;
+            next = 7;
+        }
+        break;
+    }
+    case 7:                                                                         // 0x53c8
+        hs(d.ha, H_COUNT, d.want);
+        hs(d.ha, H_FLINK, d.b);
+        io = 3;
+        next = 8;
+        break;
+    case 8:                                                                         // 0x53e4
+        d.b = hw(d.hb, H_FLINK);
+        io = 2;
+        next = 9;
+        break;
+    case 9:                                                                         // 0x53f8
+        hs(d.hb, H_BLINK, d.b == hw(d.ha, H_FLINK) ? d.a : hw(d.ha, H_FLINK));
+        io = 4;
+        next = 0xa;
+        break;
+    case 0xa:                                                                       // 0x5418
+        pf_w32(file + FI_BLOCKCOUNT, hw(d.ha, H_COUNT) - d.hdr);
+        if (!d.saved) {
+            next = 1;
+            ret = 0;
+        } else {
+            d.a = d.saved;
+            io = 1;
+            next = 0x11;
+        }
+        break;
+    case 0xb:                                                                       // 0x544c
+        find_free();
+        break;
+    case 0xc:                                                                       // 0x5468
+        if (hw(d.hb, H_FP) != LM_FREE || hw(d.hb, H_COUNT) < d.want) {
+            d.b = hw(d.hb, H_FLINK);
+            if (anchor() == d.b) {
+                ret = (int32_t)FERR_BADPTR;                 // the folio's own, for a filesystem full
+            } else {
+                io = 2;
+                next = 0xc;
+            }
+            break;
+        }
+        hs(d.hb, H_FP, LM_FILE);                                                    // 0x54b8
+        hs(d.hb, H_HDR, d.hdr);
+        if (cmd == FILECMD_ALLOCBLOCKS) {                                           // 0x550c
+            hs(d.hb, H_BYTES, hw(d.ha, H_BYTES));
+            hs(d.hb, H_TYPE, hw(d.ha, H_TYPE));
+            hs(d.hb, H_UID, hw(d.ha, H_UID));
+            lm_strncpy(d.hb + H_NAME, d.ha + H_NAME, 0x20);
+            next = 0xd;
+            d.at = hw(d.hb, H_HDR);
+            d.left = (hw(d.hb, H_BYTES) + d.bs - 1) / d.bs;
+            if ((int32_t)d.left <= 0) next = 0xf;
+            io = 4;
+            d.chunk = 0;
+        } else if (cmd == FILECMD_ADDENTRY) {
+            hs(d.hb, H_BYTES, 0);
+            hs(d.hb, H_TYPE, 0x20202020u);
+            hs(d.hb, H_UID, 0);
+            lm_strncpy_guest(d.hb + H_NAME, pf_r32(ior + IOI_SEND_BUF), 0x20);
+            io = 4;
+            next = 6;
+        }
+        break;
+    case 0xd:                                                                       // 0x556c
+        d.at += d.chunk;
+        d.chunk = d.left;
+        if ((int32_t)d.chunk > (int32_t)d.chunk_max) d.chunk = d.chunk_max;
+        io = 5;
+        next = 0xe;
+        break;
+    case 0xe:                                                                       // 0x55a0
+        io = 6;
+        d.left -= d.chunk;
+        next = (int32_t)d.left > 0 ? 0xd : 0xf;
+        break;
+    case 0xf: {                                                                     // 0x55c8
+        uint8_t t[H_SIZE];
+        std::memcpy(t, d.ha, H_SIZE);
+        std::memcpy(d.ha, d.hb, H_SIZE);
+        std::memcpy(d.hb, t, H_SIZE);
+        hs(d.hb, H_FP, LM_FREE);
+        d.saved = d.a;
+        uint32_t was_b = d.b;
+        d.b = d.a;
+        d.a = was_b;
+        pf_w32(file + FI_AVATAR, d.a);
+        pf_w32(file + FI_BLOCKCOUNT, hw(d.ha, H_COUNT) - d.hdr);
+        io = 4;
+        next = 6;
+        break;
+    }
+    case 0x10:                                                                      // 0x5440
+        io = 1;
+        next = 0x11;
+        break;
+    case 0x11:
+        free_a();
+        break;
+    case 0x12:                                                                      // 0x5654
+        if (hw(d.ha, H_FP) == LM_FREE) {
+            d.a = hw(d.ha, H_BLINK);
+            next = 0x12;
+        } else {
+            d.a = hw(d.ha, H_FLINK);
+            next = 0x13;
+        }
+        io = 1;
+        break;
+    case 0x13:                                                                      // 0x567c
+        d.b = hw(d.ha, H_FLINK);
+        io = 2;
+        next = 0x14;
+        break;
+    case 0x14:                                                                      // 0x5690
+        if (hw(d.hb, H_FP) == LM_FREE) {
+            hs(d.ha, H_COUNT, hw(d.ha, H_COUNT) + hw(d.hb, H_COUNT));
+            hs(d.ha, H_FLINK, hw(d.hb, H_FLINK));
+            d.b = hw(d.hb, H_FLINK);
+            io = 2;
+            next = 0x14;
+        } else {
+            hs(d.hb, H_BLINK, d.a);
+            io = 4;
+            next = 0x15;
+        }
+        break;
+    case 0x15:                                                                      // 0x56e0
+        io = 3;
+        next = 0x16;
+        break;
+    case 0x16:                                                                      // 0x56ec
+        ret = 0;
+        break;
+    case 0x17:                                                                      // 0x56f8
+        d.count = d.dir_index;
+        d.a = d.dir_block;
+        if ((int32_t)d.a <= 0 || (int32_t)d.count <= 0) {
+            d.a = anchor();
+            d.count = 0;
+        }
+        d.start = d.a;
+        io = 1;
+        next = 0x18;
+        break;
+    case 0x18: {                                                                    // 0x5748
+        uint32_t fp = hw(d.ha, H_FP);
+        if (fp == LM_ANCHOR) {
+            d.count = 0;
+            next_entry();
+            break;
+        }
+        if (fp != LM_FILE) {
+            next_entry();
+            break;
+        }
+        if (d.a != d.dir_block) {
+            ++d.count;
+            d.dir_index = d.count;
+            d.dir_block = d.a;
+        }
+        if (cmd == FILECMD_DELETEENTRY && lm_same(d.ha + H_NAME, d.data)) free_a();
+        else if (cmd == FILECMD_READDIR && d.count == pf_r32(ior + IOI_OFFSET)) found_entry();
+        else if (cmd == FILECMD_READENTRY && lm_same(d.ha + H_NAME, d.data)) found_entry();
+        else next_entry();
+        break;
+    }
+    case 0x19:                                                                      // 0x58b0
+        io = 1;
+        next = 0x1a;
+        break;
+    case 0x1a: {                                                                    // 0x58bc
+        uint32_t v = pf_r32(ior + IOI_OFFSET);
+        pf_w32(file + FI_BYTECOUNT, v);
+        hs(d.ha, H_BYTES, v);
+        io = 3;
+        next = 1;
+        break;
+    }
+    case 0x1b:                                                                      // 0x58d4
+        io = 1;
+        next = 0x1c;
+        break;
+    case 0x1c:                                                                      // 0x5218
+        hs(d.ha, H_TYPE, pf_r32(ior + IOI_OFFSET));
+        io = 3;
+        next = 1;
+        break;
+    }
+    d.state = next;
+    return ret;
+}
+
+// A request to the filesystem, on `file` (the open file's File), started (0x4cd0) and run to its
+// end; its io_Error and io_Actual are the request's, and the caller completes it. READ and WRITE
+// (0x4d90) are the caller's own transfer, to or from its buffer, at the file's data on the device
+// -- its avatar plus ioi_Offset, in the filesystem's blocks, past the header, from the
+// filesystem's first block -- and the request's io_Actual is what the device's was (a write to
+// the NVRAM leaves it 0). The others set the device's state and take the first step:
+// READDIR, READENTRY and DELETEENTRY (the name, 32 characters at most, in the data buffer cleared
+// first) step 0x17; ALLOCBLOCKS step 3, the blocks wanted the File's, ioi_Offset's and a header's,
+// from the file's avatar; SETEOF (when the File's blocks hold ioi_Offset bytes, else 0xD556F00D)
+// step 0x19; ADDENTRY step 3, a header's blocks wanted; SETTYPE step 0x1b; any other is
+// BADCOMMAND. Then each transfer done and the next step taken until one is the last (0x4ff8): a
+// request whose last transfer was asked with step 1 after it is done without looking at that
+// transfer's error; another transfer's error is the request's.
+static void lm_run(LmFs& d, uint32_t ior, uint32_t file) {
+    uint32_t cmd = pf_r8(ior + IOI_COMMAND);
+    if (cmd == CMD_READ || cmd == CMD_WRITE) {
+        d.state = 0;
+        uint32_t fs = pf_r32(file + FI_FILESYSTEM);
+        uint32_t block = ((pf_r32(file + FI_AVATAR) & 0xFFFFFF) + pf_r32(ior + IOI_OFFSET)) * pf_r32(fs + FS_RATIO) + d.hdr +
+                         d.offset;
+        bool write = cmd == CMD_WRITE;
+        uint32_t buf = pf_r32(ior + (write ? IOI_SEND_BUF : IOI_RECV_BUF));
+        int32_t len = (int32_t)pf_r32(ior + (write ? IOI_SEND_LEN : IOI_RECV_LEN));
+        std::vector<uint8_t> t(len > 0 ? (size_t)len : 0);
+        if (write)
+            for (int32_t i = 0; i < len; ++i) t[(size_t)i] = (uint8_t)pf_r8(buf + (uint32_t)i);
+        uint32_t err = lm_dev(d, write, (int32_t)block, t.data(), len);
+        if (!err && !write) {
+            for (int32_t i = 0; i < len; ++i) pf_w8(buf + (uint32_t)i, t[(size_t)i]);
+            pf_w32(ior + IO_ACTUAL, pf_r32(ior + IO_ACTUAL) + (uint32_t)len);
+        }
+        pf_w32(ior + IO_ERROR, err);
+        if (g_pf_trace)
+            pf_log("        %s %d bytes at block %u of \"%s\": %08X\n", write ? "wrote" : "read", len, block,
+                   g_places[file].c_str(), err);
+        return;
+    }
+    switch (cmd) {
+    case FILECMD_READDIR:                                                           // 0x4e90
+        d.state = 0x17;
+        d.file = file;
+        break;
+    case FILECMD_READENTRY: case FILECMD_DELETEENTRY: {                             // 0x4e64
+        std::memset(d.data, 0, sizeof d.data);
+        int32_t n = (int32_t)pf_r32(ior + IOI_SEND_LEN);
+        lm_strncpy_guest(d.data, pf_r32(ior + IOI_SEND_BUF), (uint32_t)(n > 0x20 ? 0x20 : n < 0 ? 0 : n));
+        d.state = 0x17;
+        d.file = file;
+        break;
+    }
+    case FILECMD_ALLOCBLOCKS:                                                       // 0x4e2c
+        d.file = file;
+        d.want = pf_r32(file + FI_BLOCKCOUNT) + pf_r32(ior + IOI_OFFSET) + d.hdr;
+        d.state = 3;
+        d.a = pf_r32(file + FI_AVATAR);
+        break;
+    case FILECMD_SETEOF:                                                            // 0x4eac
+        if (pf_r32(file + FI_BLOCKCOUNT) * pf_r32(file + FI_BLOCKSIZE) < pf_r32(ior + IOI_OFFSET)) {
+            pf_w32(ior + IO_ERROR, FERR_BADIOARG);
+            return;
+        }
+        d.state = 0x19;
+        d.a = pf_r32(file + FI_AVATAR);
+        break;
+    case FILECMD_ADDENTRY: {                                                        // 0x4e00
+        d.file = file;
+        uint32_t vbs = pf_r32(pf_r32(file + FI_FILESYSTEM) + FS_VOLBLOCKSIZE);
+        d.want = (vbs + 0x3f) / vbs;
+        d.state = 3;
+        break;
+    }
+    case FILECMD_SETTYPE:                                                           // 0x4d70
+        d.state = 0x1b;
+        d.a = pf_r32(file + FI_AVATAR);
+        break;
+    default:
+        pf_w32(ior + IO_ERROR, FERR_BADCOMMAND);
+        return;
+    }
+    int io = 0;
+    int32_t r = lm_step(d, ior, io);
+    while (r > 0) {
+        if (io) d.last_io = io;
+        if (!d.last_io) {
+            std::fprintf(stderr, "File: a linked-memory request whose first step asks for no transfer: not yet\n");
+            std::exit(3);
+        }
+        uint32_t err = lm_transfer(d, d.last_io);
+        if (d.state == 1) {                                 // 0x5034: done, whatever the transfer said
+            d.state = 0;
+            r = 0;
+            break;
+        }
+        if (err) {
+            d.state = 0;
+            r = (int32_t)err;
+            break;
+        }
+        r = lm_step(d, ior, io);
+    }
+    pf_w32(ior + IO_ERROR, (uint32_t)r);
+    if (g_pf_trace)
+        pf_log("        filesystem \"%s\": command %u on \"%s\": %08X\n", d.name.c_str(), cmd, g_places[file].c_str(),
+               (uint32_t)r);
+}
+
+// A request the folio makes itself (the walk's, DeleteFile's) on `file`: an IOReq of its own, its
+// buffers in the OS's memory; its io_Error, and the DirectoryEntry it got into `de`.
+static uint32_t lm_own_request(LmFs& d, uint32_t file, uint32_t cmd, const std::string& name, uint8_t* de = nullptr) {
+    uint32_t ior = pf_os_alloc(0x70), entry = pf_os_alloc(DE_SIZE), s = pf_os_string(name.c_str());
+    for (uint32_t i = 0; i < 0x70; i += 4) pf_w32(ior + i, 0);
+    for (uint32_t i = 0; i < DE_SIZE; i += 4) pf_w32(entry + i, 0);
+    pf_w8(ior + IOI_COMMAND, cmd);
+    pf_w32(ior + IOI_SEND_BUF, s);
+    pf_w32(ior + IOI_SEND_LEN, (uint32_t)name.size());
+    if (de) {
+        pf_w32(ior + IOI_RECV_BUF, entry);
+        pf_w32(ior + IOI_RECV_LEN, DE_SIZE);
+    }
+    lm_run(d, ior, file);
+    uint32_t err = pf_r32(ior + IO_ERROR);
+    if (de)
+        for (uint32_t i = 0; i < DE_SIZE; ++i) de[i] = (uint8_t)pf_r8(entry + i);
+    pf_os_free(s);
+    pf_os_free(entry);
+    pf_os_free(ior);
+    return err;
+}
+
+// The entry `name` of the linked-memory directory `dir` (a place): the folio's File for it when it
+// has one (the walk looks in its list first, 0x2f68: a File of that parent and name, its
+// information cached), else FILECMD_READENTRY to the directory (0x3114) -- its error is NOFILE,
+// whatever it was -- and a File made of the DirectoryEntry (0x31a4): named as the walk names it,
+// the directory's filesystem, the directory its parent (one use more), the entry's identifier (or
+// the folio's next, from -1 down), type, flags, block size, bytes, blocks, burst and gap, its last
+// avatar's index (the count less one) and its first avatar. FILECMD_OPENENTRY on it then is done at
+// once (0x4b88). "" when there is none.
+static std::string lm_child(const std::string& dir, const std::string& name) {
+    for (const auto& f : g_files) {
+        if (f.first.size() <= dir.size() + 1 || f.first.compare(0, dir.size() + 1, dir + "/") ||
+            f.first.find('/', dir.size() + 1) != std::string::npos)
+            continue;
+        if (same_name(f.first.substr(dir.size() + 1), name)) return f.first;
+    }
+    LmFs* d = lm_of(dir);
+    uint32_t dirfile = file_node(dir);
+    uint8_t de[DE_SIZE];
+    if (lm_own_request(*d, dirfile, FILECMD_READENTRY, name, de)) return "";
+    pf_w32(dirfile + FI_USECOUNT, pf_r32(dirfile + FI_USECOUNT) + 1);
+    std::string at = dir + "/" + name;
+    uint32_t n = pf_os_alloc(FI_SIZE);
+    for (uint32_t i = 0; i < FI_SIZE; i += 4) pf_w32(n + i, 0);
+    pf_w32(n + 12, FI_SIZE);
+    pf_item_new(n, FILEFOLIO, FILENODE, name.c_str());
+    for (size_t i = 0; i < name.size() && i < 32; ++i) pf_w8(n + FI_NAME + (uint32_t)i, (uint8_t)name[i]);
+    pf_w32(n + FI_FILESYSTEM, pf_r32(dirfile + FI_FILESYSTEM));
+    pf_w32(n + FI_PARENT, dirfile);
+    uint32_t id = hw(de, 0x04);
+    pf_w32(n + FI_UNIQUEID, id ? id : g_next_id--);
+    pf_w32(n + FI_FLAGS, hw(de, 0x00));
+    pf_w32(n + FI_BURST, hw(de, 0x18));
+    pf_w32(n + FI_GAP, hw(de, 0x1c));
+    pf_w32(n + FI_BLOCKSIZE, hw(de, 0x0c));
+    pf_w32(n + FI_BLOCKCOUNT, hw(de, 0x14));
+    pf_w32(n + FI_BYTECOUNT, hw(de, 0x10));
+    pf_w32(n + FI_LASTAVATAR, hw(de, 0x20) - 1);
+    pf_w32(n + FI_AVATAR, hw(de, 0x44));
+    pf_w32(n + FI_TYPE, hw(de, 0x08));
+    g_files[at] = n;
+    g_places[n] = at;
+    return at;
+}
+
+// A File of a linked-memory filesystem deleted (the folio's ir_Delete for one, 0xd94): its
+// parent has one use less, and it is gone from the folio's list.
+static void lm_forget(uint32_t file) {
+    uint32_t parent = pf_r32(file + FI_PARENT);
+    pf_w32(parent + FI_USECOUNT, pf_r32(parent + FI_USECOUNT) - 1);
+    g_files.erase(g_places[file]);
+    g_places.erase(file);
+    pf_item_free((int32_t)pf_r32(file + 24));
+}
+
+// The mount (0x1e18) of the ram device's unit `unit` from block `offset`: the unit's status (the
+// ram driver's: blocks of a byte), and nothing (0) for a unit of 0xe1 blocks or fewer; then a
+// label looked for -- at the first block, then at 0xe1, then each 0x8012 blocks on, nine places
+// in all -- whose record type is 1, whose five sync bytes are 0x5a, whose version is 1 or 2 and
+// whose root directory has at most eight avatars; none is -1. A name already mounted is
+// DuplicateFile. Version 2 is a linked-memory filesystem (0x2260; version 1, a CD's, is not
+// here): the FileSystem named as the label names the volume, its block size, count and
+// identifier the label's, and its root directory's File (0x22f8: of 0x80 bytes and a word more
+// for each avatar after the first): named the same, the folio's root its parent (one use more),
+// type '*dir', flags 0x2d, one use, the label's root block size, count and identifier, its bytes
+// their product, the label's avatars. The FileSystem's item.
+static uint32_t lm_mount(uint32_t unit, uint32_t offset) {
+    if (unit != RAM_NVRAM_UNIT) {
+        std::fprintf(stderr, "File: a mount of the ram device's unit %u (the console's ROM or memory): not yet\n", unit);
+        std::exit(3);
+    }
+    LmFs probe;
+    probe.bs = 1;
+    probe.blocks = (uint32_t)pf_nvram().size();
+    if (probe.blocks <= 0xe1) return 0;
+    uint32_t lbytes = (probe.bs + 0x83) / probe.bs * probe.bs;
+    std::vector<uint8_t> label(lbytes > DL_SIZE ? lbytes : DL_SIZE);
+    bool found = false;
+    uint32_t pos = 0;
+    for (int32_t k = -1;;) {
+        if (!lm_dev(probe, false, (int32_t)(pos + offset), label.data(), (int32_t)lbytes) && label[0] == 1 &&
+            label[1] == 0x5a && label[2] == 0x5a && label[3] == 0x5a && label[4] == 0x5a && label[5] == 0x5a &&
+            (label[DL_VERSION] == 1 || label[DL_VERSION] == 2) && hw(label.data(), DL_LASTAVATAR) <= 7)
+            found = true;
+        pos = k >= 0 ? pos + 0x8012 : 0xe1;
+        if (++k > 7 || found) break;
+    }
+    if (!found) return 0xFFFFFFFFu;
+    std::string name;
+    for (uint32_t i = 0; i < 32 && label[DL_ID + i]; ++i) name += (char)label[DL_ID + i];
+    for (const auto& fs : g_lm)
+        if (same_name(fs->name, name)) return FERR_DUPLICATE;
+    if (label[DL_VERSION] != 2) {
+        std::fprintf(stderr, "File: an optimized (a CD's) filesystem on the ram device: not yet\n");
+        std::exit(3);
+    }
+    auto d = std::make_unique<LmFs>(probe);
+    d->name = name;
+    d->unit = unit;
+    d->offset = offset;
+    d->chunk_max = 0x100 / d->bs;
+    d->hdr = (d->bs + 0x3f) / d->bs;
+    uint32_t fsn = pf_os_alloc(FS_SIZE);
+    for (uint32_t i = 0; i < FS_SIZE; i += 4) pf_w32(fsn + i, 0);
+    pf_w32(fsn + 12, FS_SIZE);
+    int32_t item = pf_item_new(fsn, FILEFOLIO, FILESYSTEMNODE, name.c_str());
+    uint32_t last = hw(label.data(), DL_LASTAVATAR), size = 0x80 + 4 * last;
+    uint32_t root = pf_os_alloc(size);
+    for (uint32_t i = 0; i < size; i += 4) pf_w32(root + i, 0);
+    pf_w32(root + 12, size);
+    pf_item_new(root, FILEFOLIO, FILENODE, name.c_str());
+    for (uint32_t i = 0; i < 32; ++i) {
+        pf_w8(fsn + FS_NAME + i, label[DL_ID + i]);
+        pf_w8(root + FI_NAME + i, label[DL_ID + i]);
+    }
+    uint32_t top = file_node("/");
+    pf_w32(root + FI_FILESYSTEM, fsn);
+    pf_w32(root + FI_PARENT, top);
+    pf_w32(top + FI_USECOUNT, pf_r32(top + FI_USECOUNT) + 1);
+    pf_w32(root + FI_TYPE, FILE_TYPE_DIRECTORY);
+    pf_w32(root + FI_FLAGS, LM_ROOT_FLAGS);
+    pf_w32(root + FI_USECOUNT, 1);
+    pf_w32(root + FI_BURST, 1);
+    pf_w32(root + FI_BLOCKSIZE, hw(label.data(), DL_ROOTBLOCKSIZE));
+    pf_w32(root + FI_BLOCKCOUNT, hw(label.data(), DL_ROOTBLOCKCOUNT));
+    pf_w32(root + FI_BYTECOUNT, hw(label.data(), DL_ROOTBLOCKSIZE) * hw(label.data(), DL_ROOTBLOCKCOUNT));
+    pf_w32(root + FI_UNIQUEID, hw(label.data(), DL_VOLID));
+    pf_w32(root + FI_LASTAVATAR, last);
+    for (uint32_t i = 0; i <= last; ++i) pf_w32(root + FI_AVATAR + 4 * i, hw(label.data(), DL_AVATARS + 4 * i));
+    pf_w32(fsn + FS_VOLBLOCKSIZE, hw(label.data(), DL_BLOCKSIZE));
+    pf_w32(fsn + FS_VOLBLOCKCOUNT, hw(label.data(), DL_BLOCKCOUNT));
+    pf_w32(fsn + FS_VOLID, hw(label.data(), DL_VOLID));
+    pf_w32(fsn + FS_RATIO, hw(label.data(), DL_BLOCKSIZE) / d->bs);
+    pf_w32(fsn + FS_ROOT, root);
+    d->node = fsn;
+    d->root = root;
+    g_files["/" + name] = root;
+    g_places[root] = "/" + name;
+    g_lm.push_back(std::move(d));
+    if (g_pf_trace) pf_log("        mounted \"%s\", the ram device's unit %u from block %u\n", name.c_str(), unit, offset);
+    return (uint32_t)item;
+}
+
+// swi 0x30004: Item MountFileSystem(Item device, int32 unit, uint32 blockOffset) -- 0x2770: a
+// device (else -1), mounted (the ram device's; any other stops the run: not yet).
+static void f_mountfilesystem(ArmCpu& c) {
+    uint32_t dev = pf_check_item((int32_t)c.r[0], 1, DEVICENODE);
+    if (!dev) {
+        c.r[0] = 0xFFFFFFFFu;
+        return;
+    }
+    if (dev != pf_ram_device()) pf_stop(c, "MountFileSystem: a device other than the ram device: not yet");
+    c.r[0] = lm_mount(c.r[1] & 0xff, c.r[2]);
+    if (g_pf_trace) pf_log("        MountFileSystem unit %u from %u -> %08X\n", c.r[1] & 0xff, c.r[2], c.r[0]);
+}
+
+// swi 0x3000d: Err DismountFileSystem(char* name) -- 0x25d8: the name (a leading '/' passed over)
+// a mounted filesystem's, else NOFILESYSTEM; every File of it no one uses deleted, and BUSY when
+// any other one is used than its root, or its root by more than its own use; then the root and
+// the filesystem gone. 0.
+static void f_dismountfilesystem(ArmCpu& c) {
+    char path[256];
+    pf_cstring(c.r[0], path, sizeof path);
+    const char* name = path[0] == '/' ? path + 1 : path;
+    LmFs* d = nullptr;
+    size_t at = 0;
+    for (; at < g_lm.size(); ++at)
+        if (same_name(g_lm[at]->name, name)) {
+            d = g_lm[at].get();
+            break;
+        }
+    if (!d) {
+        c.r[0] = FERR_NOFILESYSTEM;
+        return;
+    }
+    std::string top = "/" + d->name;
+    uint32_t used = 0;
+    for (bool again = true; again;) {
+        again = false;
+        used = 0;
+        for (const auto& f : g_files) {
+            if (f.first != top && f.first.compare(0, top.size() + 1, top + "/")) continue;
+            if (pf_r32(f.second + FI_USECOUNT)) {
+                ++used;
+            } else {
+                lm_forget(f.second);
+                again = true;
+                break;
+            }
+        }
+    }
+    if (used > 1 || pf_r32(d->root + FI_USECOUNT) > 1) {
+        c.r[0] = FERR_BUSY;
+        return;
+    }
+    pf_w32(d->root + FI_USECOUNT, 0);
+    lm_forget(d->root);
+    pf_item_free((int32_t)pf_r32(d->node + 24));
+    g_lm.erase(g_lm.begin() + (long)at);
+    if (g_pf_trace) pf_log("        DismountFileSystem \"%s\"\n", name);
+    c.r[0] = 0;
+}
+
+// swi 0x30009: Item CreateFile(char* path) -- 0x403c: the path walked in its creating mode (0x2b1c
+// with 1): when its last name is not in its directory (FILECMD_READENTRY fails), FILECMD_ADDENTRY
+// of it there (0x38b4) -- its error, if any, is CreateFile's -- and the entry read again and its
+// File made (0x3104); a name that is there is DuplicateFile (0x39d8). The new File's item (the
+// walk's use of it given back). Here the last name is walked apart: one with an alias in it, or a
+// directory of the disc, stops the run (not yet).
+static void f_createfile(ArmCpu& c) {
+    char path[256];
+    pf_cstring(c.r[0], path, sizeof path);
+    std::string p = path, dir, name;
+    size_t slash = p.find_last_of('/');
+    if (slash == std::string::npos) {
+        name = p;
+    } else {
+        dir = slash == 0 ? "/" : p.substr(0, slash);
+        name = p.substr(slash + 1);
+    }
+    std::string at = g_cwd;
+    int32_t err = dir.empty() ? 0 : walk(dir, at);
+    if (!err && (name.empty() || name[0] == '$')) pf_stop(c, "CreateFile: a path whose last name is an alias: not yet");
+    if (!err && !is_dir(at)) err = (int32_t)FERR_NOTADIRECTORY;
+    if (!err && name.size() >= 32) err = (int32_t)FERR_FS_BADNAME;
+    if (!err && !lm_of(at)) pf_stop(c, "CreateFile in a directory of the disc: not yet");
+    std::string made;
+    if (!err && !lm_child(at, name).empty()) err = (int32_t)FERR_DUPLICATE;
+    if (!err) err = (int32_t)lm_own_request(*lm_of(at), file_node(at), FILECMD_ADDENTRY, name);
+    if (!err) {
+        made = lm_child(at, name);
+        if (made.empty()) err = (int32_t)FERR_NOFILE;
+    }
+    c.r[0] = err ? (uint32_t)err : pf_r32(file_node(made) + 24);
+    if (g_pf_trace) pf_log("        CreateFile \"%s\" -> %08X\n", path, c.r[0]);
+}
+
+// swi 0x3000a: Err DeleteFile(char* path) -- 0x4190: the path walked (one use more of its File);
+// a File used by anyone else is BUSY, one whose directory is read-only (a CD's) READONLY -- each
+// with the walk's use given back; then FILECMD_DELETEENTRY of its name to its directory (0x4288):
+// its error leaves the walk's use; done, the File is deleted. 0 or the error.
+static void f_deletefile(ArmCpu& c) {
+    char path[256];
+    pf_cstring(c.r[0], path, sizeof path);
+    std::string at;
+    int32_t err = walk(path, at);
+    if (!err) {
+        uint32_t f = file_node(at);
+        pf_w32(f + FI_USECOUNT, pf_r32(f + FI_USECOUNT) + 1);
+        uint32_t parent = pf_r32(f + FI_PARENT);
+        if (pf_r32(f + FI_USECOUNT) > 1) err = (int32_t)FERR_BUSY;
+        else if (pf_r32(parent + FI_FLAGS) & FILE_IS_READONLY) err = (int32_t)FERR_READONLY;
+        if (err) {
+            pf_w32(f + FI_USECOUNT, pf_r32(f + FI_USECOUNT) - 1);
+        } else {
+            LmFs* d = lm_of(at);
+            if (!d) pf_stop(c, "DeleteFile of a file of the disc in a directory that is not read-only: not yet");
+            char name[33] = {};
+            for (uint32_t i = 0; i < 32; ++i) name[i] = (char)pf_r8(f + FI_NAME + i);
+            err = (int32_t)lm_own_request(*d, parent, FILECMD_DELETEENTRY, name);
+            if (!err) {
+                pf_w32(f + FI_USECOUNT, pf_r32(f + FI_USECOUNT) - 1);
+                lm_forget(f);
+            }
+        }
+    }
+    c.r[0] = (uint32_t)err;
+    if (g_pf_trace) pf_log("        DeleteFile \"%s\" -> %08X\n", path, c.r[0]);
 }
 
 // ---- the folio's SWIs ------------------------------------------------------------------------
@@ -1114,12 +2012,28 @@ static void shell_start() {
 // shells cut the line there and clear the flag); every program here is waited for, which is what
 // the console shows of those discs -- ; a name walked as the File folio walks it: an AIF
 // image is a program -- the OS's own (under /System: the daemons, the folios, the event broker)
-// are the runtime's and are not run; any other is run until it ends, then the next line --, any
-// other file a script, run there and then (as its last line, in its place: a disc's scripts can
-// name each other for ever, as Crash 'n Burn's runme1 and runme2 do). What is none of these is
-// reported and passed over.
-static int (*g_shell_run)(const std::string& host);
+// are the runtime's and are not run, but for the System directory's programs (System/Programs:
+// lmadm, which startopera runs, format, which lmadm runs), which run when this build has their
+// modules and are passed over when it has not; any other is run until it ends, then the next
+// line --, any other file a script, run there and then (as its last line, in its place: a disc's
+// scripts can name each other for ever, as Crash 'n Burn's runme1 and runme2 do). What is none of
+// these is reported and passed over. A program named with arguments is given its line, the words
+// with a space between each two, as the task the shell starts gets it; one named alone gets none
+// (and its argv[0] is its module's name).
+static int (*g_shell_run)(const std::string& host, const std::string& cmdline);
 static int g_shell_result;
+
+// Whether this build has the module recompiled from the program in `host` (the test arm_identify
+// makes: the crc32 of its read-only area as the file holds it).
+static bool has_module(const std::string& host) {
+    std::ifstream f(host, std::ios::binary);
+    std::vector<uint8_t> d((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
+    for (int i = 0; i < g_arm_nmodules; ++i) {
+        const ArmModule* m = g_arm_modules[i];
+        if (m->size <= d.size() && arm_crc32(d.data(), m->size) == m->crc) return true;
+    }
+    return false;
+}
 
 static bool is_aif_file(const std::string& host) {
     std::ifstream f(host, std::ios::binary);
@@ -1178,9 +2092,13 @@ static void shell_carry_out(std::string at, int depth) {
             }
             std::string host = host_of(to).string();
             if (is_aif_file(host)) {
-                if (lower(to).rfind("/system/", 0) == 0) continue;     // the OS's own: the runtime's
+                if (lower(to).rfind("/system/", 0) == 0 &&                  // the OS's own: the runtime's
+                    (lower(to).rfind("/system/programs/", 0) != 0 || !has_module(host)))
+                    continue;
+                std::string cmdline;
+                for (size_t i = 0; w.size() > 1 && i < w.size(); ++i) cmdline += (i ? " " : "") + w[i];
                 pf_log("the shell: %s (%s)\n", w[0].c_str(), to.c_str());
-                g_shell_result = g_shell_run(host);
+                g_shell_result = g_shell_run(host, cmdline);
                 pf_log("the shell: %s ended, %d\n", w[0].c_str(), g_shell_result);
                 continue;
             }
@@ -1192,7 +2110,7 @@ static void shell_carry_out(std::string at, int depth) {
     }
 }
 
-int pf_shell_boot(int (*run)(const std::string& host)) {
+int pf_shell_boot(int (*run)(const std::string& host, const std::string& cmdline)) {
     g_shell_run = run;
     g_cwd = "/";
     g_aliases.clear();
@@ -1203,7 +2121,7 @@ int pf_shell_boot(int (*run)(const std::string& host)) {
     g_cwd = "/";
     if (!walk("$boot/LaunchMe", at) && !is_dir(at)) {
         pf_log("the shell: $boot/LaunchMe\n");
-        g_shell_result = run(host_of(at).string());
+        g_shell_result = run(host_of(at).string(), "");
     }
     return g_shell_result;
 }
@@ -1257,6 +2175,8 @@ void pf_file_init() {
     g_open_files.clear();
     g_reads.clear();
     g_loaded_code.clear();
+    g_lm.clear();
+    g_next_id = 0xFFFFFFFFu;
     shell_start();
     if (g_pf_trace) {
         pf_log("shell aliases:");
@@ -1265,9 +2185,13 @@ void pf_file_init() {
     }
     pf_on_swi(0x30000, f_opendiskfile);
     pf_on_swi(0x30001, f_closediskfile);
+    pf_on_swi(0x30004, f_mountfilesystem);
     pf_on_swi(0x30007, f_changedirectory);
     pf_on_swi(0x30008, f_getdirectory);
+    pf_on_swi(0x30009, f_createfile);
+    pf_on_swi(0x3000a, f_deletefile);
     pf_on_swi(0x3000b, f_createalias);
+    pf_on_swi(0x3000d, f_dismountfilesystem);
     pf_on_slot(PF_FILE, -4, f_opendiskstream);
     pf_on_slot(PF_FILE, -8, f_readdiskstream);
     pf_on_slot(PF_FILE, -12, f_seekdiskstream);
@@ -1277,4 +2201,9 @@ void pf_file_init() {
     pf_on_slot(PF_FILE, -44, f_loadcode);
     pf_on_slot(PF_FILE, -48, f_unloadcode);
     pf_on_slot(PF_FILE, -52, f_executeassubroutine);
+    // The folio's daemon, at its start (0x48b8), asks every device's every unit for its status
+    // and mounts those that hold a filesystem (DS_USAGE_FILESYSTEM; offset 0x96 for a CD drive,
+    // 0 else): of the ram device's, units 0, 1, 3, 4 and 5. Here unit 3 alone, the NVRAM -- whose
+    // label, when it has one, names the filesystem ("nvram" as LMADM and FORMAT make it).
+    lm_mount(RAM_NVRAM_UNIT, 0);
 }

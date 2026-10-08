@@ -199,3 +199,16 @@ void k_getsyserr(ArmCpu& c) {
 void pf_err_init() {
     pf_on_slot(PF_KERNEL, -88, k_getsyserr);
 }
+
+// os_code's images' own versions, in the file's order -- the kernel, the Operator, the File folio --
+// 0 past the last; read once a disc.
+uint32_t pf_os_code_version(int index) {
+    static std::string s_root;
+    static std::vector<uint32_t> s_versions;
+    if (s_root != g_pf_disc_root) {
+        s_root = g_pf_disc_root;
+        s_versions.clear();
+        for (const Image& im : os_images()) s_versions.push_back(im.version);
+    }
+    return index >= 0 && index < (int)s_versions.size() ? s_versions[(size_t)index] : 0;
+}
