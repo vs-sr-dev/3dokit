@@ -243,6 +243,7 @@ int32_t  pf_wait_signal(uint32_t sigs);
 // and of a Message (the caller's tags and size; the item or an Err), and their deletion's own part.
 uint32_t pf_create_msgport(ArmCpu& c, uint32_t tags, uint32_t size);
 uint32_t pf_create_msg(ArmCpu& c, uint32_t tags, uint32_t size);
+uint32_t pf_create_semaphore(ArmCpu& c, uint32_t tags, uint32_t size);
 void     pf_delete_msgport(ArmCpu& c, uint32_t port);
 void     pf_delete_msg(uint32_t msg);
 // The OS's own ports and messages. A port made here has no task behind it: a message sent to it
@@ -282,6 +283,7 @@ std::string pf_host_path(const char* path);
 
 // The folios' handlers register themselves here.
 void     pf_kernel_init();
+uint32_t pf_clio_rand_sample();                     // CLIO's RandSample, 0x0340003C
 void     pf_msg_init();
 void     pf_event_init();
 void     pf_io_init();

@@ -117,6 +117,26 @@ uint32_t pf_create_msgport(ArmCpu& c, uint32_t tags, uint32_t size) {
     return (uint32_t)item;
 }
 
+// CreateSizedItem of a Semaphore (0x13960): the standard tags only (its own callback, 0x1394c,
+// is BADTAG for any other), the waiters' list (+0x30, "Semaphore WaitQ"), no owner (+0x28 -1),
+// as pf_semaphore_new makes the OS's own. A size is NOMEM, as for a port. The kernel also puts it
+// on KernelBase's list of semaphores, which the runtime does not keep.
+uint32_t pf_create_semaphore(ArmCpu& c, uint32_t tags, uint32_t size) {
+    (void)c;
+    if (size) return KERR_NOMEM;
+    int32_t item;
+    uint32_t s = new_node(7, 0x50, &item);
+    int32_t r = walk_tags(s, tags, [](uint32_t, uint32_t) -> int32_t { return (int32_t)KERR_BADTAG; });
+    if (r < 0) {
+        pf_item_free(item);
+        return (uint32_t)r;
+    }
+    pf_list_init(s + 0x30, "Semaphore WaitQ");
+    pf_w32(s + 0x28, 0xFFFFFFFFu);
+    pf_w32(s + 28, task_item());                            // n_Owner, as CreateSizedItem sets it
+    return (uint32_t)item;
+}
+
 // CreateSizedItem of a Message (0x1898c): the kernel's node table gives a message no size, so
 // CreateSizedItem hands its creation routine no node (-1), and a size given to CreateSizedItem is
 // BADSIZE. The node is 0x40 bytes, and CREATEMSG_TAG_DATA_SIZE's bytes more for a pass-by-value
@@ -283,6 +303,36 @@ static void k_getthismsg(ArmCpu& c) {
     if (flags(msg) & (MESSAGE_SENT | MESSAGE_REPLIED)) take(msg, me);
 }
 
+// Kernel -96: Item WaitPort(Item port, Item msg) -- 23.10's (0x87a0, user-mode code over the
+// SWIs; the 1993 kernel has none): a port (BADITEM), and when msg is above 0 a message (BADITEM).
+// While the port has messages: with no msg, GetMsg; with one held by the port, GetThisMsg -- else
+// the port's signal waited for, and back to the test; a wait that brings SIGF_ABORT (or an error
+// with that bit) is -1.
+static void k_waitport(ArmCpu& c) {
+    int32_t pi = (int32_t)c.r[0], mi = (int32_t)c.r[1];
+    uint32_t port = pf_check_item(pi, KERNELNODE, MSGPORTNODE);
+    if (!port) { c.r[0] = KERR_BADITEM; return; }
+    uint32_t msg = 0;
+    if (mi > 0 && !(msg = pf_check_item(mi, KERNELNODE, MESSAGENODE))) { c.r[0] = KERR_BADITEM; return; }
+    for (;;) {
+        if (pf_r32(port + MP_MSGS + PF_LIST_HEAD) != port + MP_MSGS + PF_LIST_TAIL) {
+            if (!msg) {
+                c.r[0] = (uint32_t)pf_get_msg(pi);
+                return;
+            }
+            if (pf_r32(msg + MSG_HOLDER) == (uint32_t)pi) {
+                c.r[0] = (uint32_t)mi;
+                k_getthismsg(c);
+                return;
+            }
+        }
+        if ((uint32_t)pf_wait_signal(pf_r32(port + MP_SIGNAL)) & 4u) {   // SIGF_ABORT
+            c.r[0] = 0xFFFFFFFFu;
+            return;
+        }
+    }
+}
+
 // ---- deleting them -----------------------------------------------------------------------------
 // A message (0x187f8): off its port if it is on one; its name given back.
 void pf_delete_msg(uint32_t msg) {
@@ -344,6 +394,7 @@ int32_t pf_send_msg(int32_t port, int32_t msg, uint32_t data, uint32_t size) {
 void pf_msg_init() {
     g_native.clear();
     pf_on_swi(0x1000f, k_getthismsg);
+    pf_on_slot(PF_KERNEL, -96, k_waitport);
     pf_on_swi(0x10010, k_sendmsg);
     pf_on_swi(0x10012, k_replymsg);
     pf_on_swi(0x10013, k_getmsg);

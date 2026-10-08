@@ -16,6 +16,8 @@ enum : uint32_t {
     // IOReq (io.h)
     IO_LINK = 0x24, IO_DEV = 0x2c, IO_CALLBACK = 0x30, IO_INFO = 0x34, IO_ACTUAL = 0x54,
     IO_FLAGS = 0x58, IO_ERROR = 0x5c, IO_MSGITEM = 0x68, IO_SIGITEM = 0x6c, IOREQ_SIZE = 0x70,
+    // Message (msgport.h)
+    MSG_DATAPTR = 0x2c,
     // IOInfo, from the IOReq
     IOI_COMMAND = IO_INFO, IOI_FLAGS = IO_INFO + 1, IOI_UNIT = IO_INFO + 2, IOI_FLAGS2 = IO_INFO + 3,
     IOI_CMDOPTIONS = IO_INFO + 4, IOI_OFFSET = IO_INFO + 12, IOI_SEND_BUF = IO_INFO + 16,
@@ -59,7 +61,10 @@ uint32_t pf_device_new(const char* name, int max_unit, PfDispatchIO dispatch, Pf
 // CREATEIOREQ_TAG_REPLYPORT (10), CREATEIOREQ_TAG_DEVICE (11, required). The device must be
 // open (by the task: one task here); the node is the device's IOReq size, on the device's list,
 // born done. Without a reply port both io_MsgItem and io_SigItem are the task, so completion
-// signals it.
+// signals it. With one (0x13e5c), a message is made for it as CreateSizedItem would make one --
+// TAG_ITEM_PRI the IOReq's, CREATEMSG_TAG_REPLYPORT the port (and the IOReq's name, which the
+// runtime does not take yet) --, held and owned by the task, msg_DataPtr the IOReq's node, and it
+// is io_MsgItem (io_SigItem the task): completion replies it. Its error is CreateIOReq's.
 static uint32_t make_ioreq(ArmCpu& c, bool have_dev, uint32_t dev_item, uint32_t port, uint32_t name,
                            uint32_t pri);
 
@@ -88,7 +93,6 @@ static uint32_t make_ioreq(ArmCpu& c, bool have_dev, uint32_t dev_item, uint32_t
     if (!dev) return KERR_BADITEM;
     if (!pf_r32(dev + DEV_OPENCNT)) return KERR_NOTFOUND;   // not opened (os_code's own code)
     if (name) pf_stop(c, "CreateIOReq: a name: not yet");
-    if (port) pf_stop(c, "CreateIOReq: a reply port: not yet");
     uint32_t size = pf_r32(dev + DEV_IOREQSIZE);
     uint32_t ior = pf_os_alloc(size);
     pf_w32(ior + 12, size);
@@ -98,6 +102,21 @@ static uint32_t make_ioreq(ArmCpu& c, bool have_dev, uint32_t dev_item, uint32_t
     pf_w8(ior + 10, pri);
     pf_w32(ior + IO_MSGITEM, task_item());
     pf_w32(ior + IO_SIGITEM, task_item());
+    if (port) {
+        uint32_t tags = pf_os_alloc(0x20);
+        const uint32_t t[6] = {2, pri, 10, port, 0, 0};
+        for (int i = 0; i < 6; ++i) pf_w32(tags + 4u * i, t[i]);
+        int32_t msg = (int32_t)pf_create_msg(c, tags, 0);
+        pf_os_free(tags);
+        if (msg < 0) {
+            pf_item_free(item);
+            return (uint32_t)msg;
+        }
+        uint32_t m = pf_item_node(msg);
+        pf_w32(m + 28, task_item());
+        pf_w32(m + MSG_DATAPTR, ior);
+        pf_w32(ior + IO_MSGITEM, (uint32_t)msg);
+    }
     pf_w32(ior + IO_FLAGS, pf_r32(ior + IO_FLAGS) | IO_DONE | IO_QUICK);
     pf_list_add_tail(dev + DEV_IOREQS, ior + IO_LINK);
     return (uint32_t)item;
@@ -119,6 +138,7 @@ static void k_createsizeditem(ArmCpu& c) {
     else if (c.r[0] == (1u << 8 | TASKNODE)) c.r[0] = pf_create_task(c, c.r[1]);
     else if (c.r[0] == (1u << 8 | MSGPORTNODE)) c.r[0] = pf_create_msgport(c, c.r[1], c.r[2]);
     else if (c.r[0] == (1u << 8 | MESSAGENODE)) c.r[0] = pf_create_msg(c, c.r[1], c.r[2]);
+    else if (c.r[0] == (1u << 8 | 7)) c.r[0] = pf_create_semaphore(c, c.r[1], c.r[2]);
     else if (it != g_creators.end()) c.r[0] = it->second(c, type, c.r[1]);
     else {
         char why[80];
@@ -137,9 +157,9 @@ void pf_complete_io(uint32_t ior) {
     }
     if (pf_r32(ior + IO_FLAGS) & IO_QUICK) return;
     uint32_t m = pf_item_node((int32_t)pf_r32(ior + IO_MSGITEM));
-    if (m && pf_r8(m + 9) == MESSAGENODE) {
-        std::fprintf(stderr, "CompleteIO: a reply message: not yet\n");
-        std::exit(3);
+    if (m && pf_r8(m + 9) == MESSAGENODE) {               // ReplyMsg(msg, 0, the IOReq, 0)
+        pf_reply_msg((int32_t)pf_r32(m + 24), 0, pf_r32(ior + 24), 0);
+        return;
     }
     uint32_t s = pf_item_node((int32_t)pf_r32(ior + IO_SIGITEM));
     if (s && pf_r8(s + 9) == TASKNODE) pf_signal(s, SIGF_IODONE);
@@ -209,6 +229,11 @@ static int32_t delete_as(ArmCpu& c, int32_t item, uint32_t task) {
     if (kind == (1u << 8 | IOREQNODE)) {
         if (!(pf_r32(n + IO_FLAGS) & IO_DONE)) pf_stop(c, "DeleteItem: an IOReq in progress: not yet");
         pf_list_rem_node(n + IO_LINK);
+        int32_t msg = (int32_t)pf_r32(n + IO_MSGITEM);      // its reply message goes too (0x14170)
+        if (uint32_t m = pf_check_item(msg, 1, MESSAGENODE)) {
+            pf_delete_msg(m);
+            pf_item_free(msg);
+        }
     } else if (kind == (1u << 8 | DEVICENODE)) {
         auto h = g_delete_hooks.find(n);
         int32_t r = h == g_delete_hooks.end() ? 0 : h->second(n);

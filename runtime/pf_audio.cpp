@@ -931,10 +931,28 @@ static int32_t audio_delete(ArmCpu& c, int type, int32_t item, uint32_t) {
 // the file parsed as IFF (iffParseFile, in the caller's task, so from its current directory) and
 // a template made of its FORM DSPP (CreateItem(MKNODEID(AUDIONODE, AUDIO_TEMPLATE_NODE),
 // {AF_TAG_TEMPLATE, the parsed form}).
+//
+// 23.10's folio (its own AUDIOFOLIO, on the disc) opens an IFF file (0xb530) the same way for a
+// name with a directory in it, and a bare name from the current directory first; failing that, from
+// its own directory (AudioFolio +0x344, a copy of its -d option: "$audio" by default, 0x4c4) and in
+// it the subdirectory the name's extension names (0xb070) -- "mixer2x2.dsp" from $audio/dsp, or
+// from $audio when there is no such subdirectory. The 1993 folio opens the name as given, so this
+// finds only what it would not. (LoadSample's stream still opens the name as given: not yet.)
+static std::string iff_host_path(const std::string& name) {
+    std::string host = pf_host_path(name.c_str());
+    if (!host.empty() || name.find('/') != std::string::npos) return host;
+    size_t dot = name.find_last_of('.');
+    if (dot != std::string::npos) {
+        host = pf_host_path(("$audio/" + name.substr(dot + 1) + "/" + name).c_str());
+        if (!host.empty()) return host;
+    }
+    return pf_host_path(("$audio/" + name).c_str());
+}
+
 static void a_loadinstemplate(ArmCpu& c) {
     if (!audio_open()) { c.r[0] = AF_ERR_AUDIOCLOSED; return; }
     if (c.r[1]) { c.r[0] = AF_ERR_BADITEM; return; }
-    std::string name = guest_string(c.r[0]), host = pf_host_path(name.c_str());
+    std::string name = guest_string(c.r[0]), host = iff_host_path(name);
     if (g_pf_trace) pf_log("        LoadInsTemplate \"%s\" -> %s\n", name.c_str(), host.empty() ? "(none)" : host.c_str());
     if (host.empty()) pf_stop(c, "LoadInsTemplate: no such file (the folio's error for it: not yet read)");
     std::ifstream f(host, std::ios::binary);

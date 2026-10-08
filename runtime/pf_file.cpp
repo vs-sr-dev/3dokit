@@ -763,6 +763,186 @@ void pf_stream_close(const ArmCpu& c, uint32_t below, uint32_t st) {
     stream_call(c, below, f_closediskstream, st, 0, 0);
 }
 
+// ---- code loaded and run ---------------------------------------------------------------------
+// 23.10's File folio (the third AIF in its os_code, at 0x10064; the ROM's 1993 folio has none of
+// these vectors) loads code with one routine, 0x6fac(path, priority, program, CodeHandle*):
+// LoadCode is it with no priority and not a program (0x7498). Step for step: the file opened, an
+// IOReq on it; a buffer of one block (MEMTYPE_DMA, the task's lists; of the blocks that make 128
+// bytes when a block is smaller) read with DoIO -- its error, else the IOReq's io_Error, stops
+// it; an AIF image or the folio's own error (0xD57B9118): at least 128 bytes read, `swi 0x11` at
+// 0x10, ro at least 128, rw and bss not negative. The image needs ro + rw + bss (rounded up to 16)
+// or the file's bytes, the larger: for code that many and 16 more from the task's lists (DMA),
+// the image 16 bytes in -- the allocator's first word, the block's length, is what UnloadCode
+// gives back. The first block is copied in; the rest read straight into place, but for a last
+// block that would run past the image, read into the buffer and its part copied. The image past
+// the file's bytes is filled with memset's 0x0d (the folio passes 0xdeadf00d); the buffer given
+// back, the IOReq deleted, the file closed, and the image (or 0) left in the CodeHandle; 0, or
+// the first error -- the image given back on one.
+//
+// The code is recompiled: the image just read, before it has relocated itself, is the module whose
+// read-only area it is (arm_identify), and is loaded there (arm_load) -- its code's every address
+// is then the image's own. Code no module matches stops the run.
+enum : uint32_t { LOADERR_NOTAIF = 0xD57B9118u, KERR_NOMEM = 0xD57B9006u, MEMSET_FILL = 0x0Du };
+
+static std::map<uint32_t, const ArmModule*> g_loaded_code;     // image -> its module
+
+static int32_t load_code(ArmCpu& c, const char* path, uint32_t& image) {
+    image = 0;
+    uint32_t lists = pf_r32(pf_current_task() + T_FREEMEMORYLISTS);
+    uint32_t info = c.r[13] - 0x6c;                     // the loader's frame: sp + 0x154
+    int32_t file = open_disk_file(path);
+    if (file < 0) return file;
+    int32_t ior = pf_create_ioreq(c, file);
+    int32_t err = 0;
+    uint32_t img = 0, need = 0;
+    if (ior < 0) {
+        err = ior;
+    } else {
+        uint32_t f = pf_r32(pf_item_node(file) + OFI_FILE);
+        uint32_t bs = pf_r32(f + FI_BLOCKSIZE), bytes = pf_r32(f + FI_BYTECOUNT);
+        uint32_t count = pf_r32(f + FI_BLOCKCOUNT), chunk = 1;
+        uint32_t ioreq = pf_item_node(ior);
+        if (bytes < 0x80) {
+            err = (int32_t)LOADERR_NOTAIF;
+        } else {
+            if (bs < 0x80) chunk = (bs + 0x7f) / bs;
+            uint32_t first = bs * chunk, offset = 0;
+            uint32_t buf = pf_alloc_mem(lists, (int32_t)first, MEMTYPE_DMA, true);
+            if (!buf) {
+                err = (int32_t)KERR_NOMEM;
+            } else {
+                auto read = [&](uint32_t to, uint32_t len) {
+                    set_info(info, CMD_READ, 0, offset, to, len);
+                    int32_t r = do_io(c, ior, info);
+                    return r < 0 ? r : (int32_t)pf_r32(ioreq + IO_ERROR);
+                };
+                err = read(buf, first);
+                offset += chunk;
+                if (!err) {
+                    uint32_t ro = pf_r32(buf + 0x14), rw = pf_r32(buf + 0x18), bss = pf_r32(buf + 0x20);
+                    if (pf_r32(ioreq + IO_ACTUAL) < 0x80 || pf_r32(buf + 0x10) != 0xEF000011u ||
+                        (int32_t)ro < 0x80 || (int32_t)rw < 0 || (int32_t)bss < 0)
+                        err = (int32_t)LOADERR_NOTAIF;
+                    else
+                        need = std::max(ro + rw + ((bss + 15) & ~15u), bytes);
+                }
+                if (!err) {
+                    img = pf_alloc_mem(lists, (int32_t)(need + 16), MEMTYPE_DMA, true);
+                    if (!img) err = (int32_t)KERR_NOMEM;
+                    else img += 16;
+                }
+                if (!err) {
+                    if (need <= first) {
+                        copy(img, buf, need);
+                    } else {
+                        copy(img, buf, first);
+                        bool last_apart = bs * count > need;
+                        int32_t direct = (int32_t)count - (int32_t)chunk - (last_apart ? 1 : 0);
+                        if (direct > 0) {
+                            err = read(img + first, bs * (uint32_t)direct);
+                            offset += (uint32_t)direct;
+                        }
+                        if (last_apart && !err) {
+                            err = read(buf, bs);
+                            copy(img + bs * (count - 1), buf, need % bs);
+                        }
+                    }
+                    if (!err && bytes < need)
+                        for (uint32_t i = bytes; i < need; ++i) pf_w8(img + i, MEMSET_FILL);
+                }
+                pf_free_mem(lists, buf, (int32_t)first);
+            }
+        }
+        pf_delete_item(c, ior);
+    }
+    if (err < 0 && img) {
+        pf_free_mem(lists, img - 16, (int32_t)(need + 16));
+        img = 0;
+    }
+    close_disk_file(c, file);
+    if (err >= 0 && img) {
+        const ArmModule* m = arm_identify(img);
+        if (!m) {
+            std::fprintf(stderr, "LoadCode \"%s\": no recompiled module matches this code\n", path);
+            std::exit(3);
+        }
+        if (!arm_load(m, img)) {
+            std::fprintf(stderr, "LoadCode \"%s\": module %s is loaded already: not yet\n", path, m->name);
+            std::exit(3);
+        }
+        g_loaded_code[img] = m;
+        if (g_pf_trace) pf_log("        LoadCode \"%s\": module %s at %08X, %u bytes\n", path, m->name, img, need);
+    }
+    image = img;
+    return err;
+}
+
+// File -44: Err LoadCode(char* name, CodeHandle* code)
+static void f_loadcode(ArmCpu& c) {
+    char path[256];
+    pf_cstring(c.r[0], path, sizeof path);
+    uint32_t handle = c.r[1], image;
+    int32_t err = load_code(c, path, image);
+    if (handle) pf_w32(handle, image);
+    c.r[0] = (uint32_t)err;
+}
+
+// File -48: void UnloadCode(CodeHandle code) -- 0x74a8: the block the image is 16 bytes into,
+// its length its first word, given back to the task's lists (nothing for 0).
+static void f_unloadcode(ArmCpu& c) {
+    uint32_t code = c.r[0];
+    if (code) {
+        uint32_t lists = pf_r32(pf_current_task() + T_FREEMEMORYLISTS);
+        pf_free_mem(lists, code - 16, (int32_t)pf_r32(code - 16));
+        auto it = g_loaded_code.find(code);
+        if (it != g_loaded_code.end()) {
+            arm_unload(it->second);
+            g_loaded_code.erase(it);
+        }
+    }
+    c.r[0] = 0;
+}
+
+// File -52: int32 ExecuteAsSubroutine(CodeHandle code, int32 argc, char** argv) -- 0x7504: no
+// code is the kernel's NOMEM. The image's word 0x10, its `swi 0x11`, becomes `ldmia sp!, {r1-r12,
+// lr, pc}`; then (0x174) r1-r12, lr and pc pushed, argc in r5, argv in r6, KernelBase in r7, and
+// the image entered at its start: its header's four words call, in turn, its decompression, its
+// self-relocation (which makes its own word 0x04 a no-op), its zero-init and its entry, and the
+// word at 0x10 returns to the caller with the entry's r0, r1-r12 and lr as they were. The header
+// is read here, word by word as it stands in memory (code that changes itself is not
+// recompiled); what each BL calls is the program's own recompiled code. The pc pushed is the
+// folio's own address, which the runtime does not have: 0.
+static void f_executeassubroutine(ArmCpu& c) {
+    uint32_t code = c.r[0];
+    if (!code) { c.r[0] = KERR_NOMEM; return; }
+    pf_w32(code + 0x10, 0xE8BDDFFEu);
+    uint32_t sp = c.r[13] - 56;
+    for (int i = 1; i <= 12; ++i) pf_w32(sp + 4u * (i - 1), c.r[i]);
+    pf_w32(sp + 48, c.r[14]);
+    pf_w32(sp + 52, 0);
+    ArmCpu s = c;
+    s.r[13] = sp;
+    s.r[5] = c.r[1];
+    s.r[6] = c.r[2];
+    s.r[7] = pf_folio_base(PF_KERNEL);
+    for (uint32_t off = 0; off < 0x10; off += 4) {
+        uint32_t w = pf_r32(code + off);
+        if (w == 0xE1A00000u) continue;                 // mov r0, r0
+        if (w >> 24 != 0xEB) pf_stop(c, "ExecuteAsSubroutine: a header word that is no BL or no-op: not yet");
+        uint32_t disp = w & 0xFFFFFF;
+        uint32_t t = code + off + 8 + 4 * (disp & 0x800000 ? disp - 0x1000000 : disp);
+        s.r[14] = code + off + 4;
+        arm_call(s, t);
+        if (s.pc != code + off + 4) arm_bad_return(s, code + off + 4);
+    }
+    if (pf_r32(code + 0x10) != 0xE8BDDFFEu) pf_stop(c, "ExecuteAsSubroutine: the header's return changed");
+    for (int i = 1; i <= 12; ++i) c.r[i] = pf_r32(sp + 4u * (i - 1));
+    c.r[14] = pf_r32(sp + 48);
+    c.r[0] = s.r[0];
+    c.n = s.n; c.z = s.z; c.c = s.c; c.v = s.v;
+    c.budget = s.budget;
+}
+
 // ---- the shell's start -----------------------------------------------------------------------
 // The program's aliases come from the shell that starts it: the disc's own (System/Tasks/shell,
 // 1993) makes `alias boot /` and the boot filesystem's name, goes to `$boot`, and runs the script
@@ -930,6 +1110,7 @@ void pf_file_init() {
     g_aliases.clear();
     g_open_files.clear();
     g_reads.clear();
+    g_loaded_code.clear();
     shell_start();
     if (g_pf_trace) {
         pf_log("shell aliases:");
@@ -945,4 +1126,7 @@ void pf_file_init() {
     pf_on_slot(PF_FILE, -8, f_readdiskstream);
     pf_on_slot(PF_FILE, -12, f_seekdiskstream);
     pf_on_slot(PF_FILE, -16, f_closediskstream);
+    pf_on_slot(PF_FILE, -44, f_loadcode);
+    pf_on_slot(PF_FILE, -48, f_unloadcode);
+    pf_on_slot(PF_FILE, -52, f_executeassubroutine);
 }

@@ -87,6 +87,7 @@ static void os_put(uint32_t a, uint32_t v, int size) {
 }
 
 uint32_t arm_io_read(uint32_t a, int size) {
+    if (a == 0x0340003Cu && size == 4) return pf_clio_rand_sample();
     if (in_os(a, size)) {
         uint32_t v = os_get(a, size);
         if (g_pf_trace >= 2 && !in_vectors(a)) pf_log("        os read%d  %08X -> %08X\n", size * 8, a, v);
@@ -166,7 +167,12 @@ static void os_call(ArmCpu& c, PfFn fn, const char* what, uint32_t site, const c
     t_site = 0;
 }
 
+// A SWI of folio 0 from 0x100 up is the kernel's SWI (number - 0x100) & 0xff, as 23.10's
+// dispatcher reads it (0x51c): the AIF zero-init's `swi 0x10a` is kernel SWI 10. (The 1993
+// dispatcher sends it elsewhere, 0x3d8, not read here: the runtime runs a program's zero-init
+// only for code loaded away from 0, which 1993's programs do not do.)
 void arm_swi(ArmCpu& c, uint32_t number, uint32_t site) {
+    if (number >= 0x100 && number < 0x10000) number = 0x10000u | ((number - 0x100) & 0xFF);
     char what[64], call[32];
     std::snprintf(what, sizeof what, "swi %#x %s", number, pf_swi_name(number));
     std::snprintf(call, sizeof call, "swi %#x", number);
@@ -269,6 +275,11 @@ static void build_folios() {
 
 static void pf_exit_swi(ArmCpu& c) { throw PfExit{(int)c.r[0]}; }
 
+// swi 0x10, the ARM's GetEnv: r1, the top of the memory a program may use, 0 -- both kernels say
+// nothing else (1993's 0x428, 23.10's 0x480). An AIF's self-relocation asks for it when its
+// header names a workspace (3DO programs carry 0x40000000 there), and with 0 does not move itself.
+static void pf_getenv_swi(ArmCpu& c) { c.r[1] = 0; }
+
 static const ArmModule* g_module;
 
 int pf_boot(const uint8_t* image, size_t size, uint32_t bss_end) {
@@ -286,6 +297,7 @@ int pf_boot(const uint8_t* image, size_t size, uint32_t bss_end) {
     arm_activate(m);
     build_folios();
     pf_on_swi(0x11, pf_exit_swi);
+    pf_on_swi(0x10, pf_getenv_swi);
     pf_time_init();
     pf_kernel_init();
     pf_msg_init();

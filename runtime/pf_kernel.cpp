@@ -413,8 +413,29 @@ void pf_task_release(int32_t task) {
 static void k_lockitem(ArmCpu& c) { c.r[0] = (uint32_t)pf_lock_item((int32_t)c.r[0], c.r[1]); }
 static void k_unlockitem(ArmCpu& c) { c.r[0] = (uint32_t)pf_unlock_item((int32_t)c.r[0]); }
 
+// CLIO's RandSample register (0x0340003C) is noise on the console (Opera's emulation answers a
+// PRNG); here it is a fixed xorshift32 (Marsaglia's, from his seed 2463534242), so that every run
+// of a program is the same run. A new OS starts it again.
+static uint32_t g_rand_sample;
+
+uint32_t pf_clio_rand_sample() {
+    uint32_t x = g_rand_sample;
+    x ^= x << 13;
+    x ^= x >> 17;
+    x ^= x << 5;
+    return g_rand_sample = x;
+}
+
+// swi 0x10011: uint32 ReadHardwareRandomNumber(void) -- the 1993 kernel's 0x1b754: RandSample
+// read, ten turns of a delay loop, read again; the first read's low half above the second.
+static void k_readhardwarerandomnumber(ArmCpu& c) {
+    uint32_t first = pf_clio_rand_sample();
+    c.r[0] = pf_clio_rand_sample() | first << 16;
+}
+
 void pf_kernel_init() {
     g_items.assign(1, 0);
+    g_rand_sample = 2463534242u;
     g_opened.clear();
     g_wait_nodes.clear();
     pf_on_swi(0x10006, k_unlockitem);
@@ -424,6 +445,7 @@ void pf_kernel_init() {
     pf_on_swi(0x10005, k_openitem);
     pf_on_swi(0x10008, k_closeitem);
     pf_on_swi(0x10017, k_setfunction);
+    pf_on_swi(0x10011, k_readhardwarerandomnumber);
     pf_on_slot(PF_KERNEL, -120, k_startup);
     pf_on_slot(PF_KERNEL, -48, k_lookupitem);
     pf_on_slot(PF_KERNEL, -52, k_memset);
