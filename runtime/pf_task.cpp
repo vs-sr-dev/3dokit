@@ -138,6 +138,19 @@ static void block() {
 // the thread is gone and the next ready task runs. 23.10's return (0x631c, through 0x410) first
 // gives a thread made with _ALLOCDTHREADSP its stack back: FreeMemToMemLists of t_StackBase and
 // t_StackSize to the task's lists, each of their semaphores locked before -- the runtime has none.
+static void give_back_stack(uint32_t node) {
+    if (pf_r32(node + T_THREADTASK) && (pf_r32(node + T_FLAGS) & TASK_ALLOCATED_SP))
+        pf_free_mem(pf_r32(node + T_FREEMEMORYLISTS), pf_r32(node + T_STACKBASE), (int32_t)pf_r32(node + T_STACKSIZE));
+}
+
+// Kernel -148: what the C library's exit() calls in 23.10 (its startup's 0x118) -- the same 0x631c
+// a thread returns to: a thread's stack given back as above, then the task deletes itself; the
+// status is not read. Here the task ends as a program's exit (SWI 0x11) ends it.
+static void k_exit(ArmCpu& c) {
+    give_back_stack(pf_current_task());
+    throw PfExit{(int)c.r[0]};
+}
+
 static void run_task(Task* t) {
     {
         std::unique_lock<std::mutex> l(*g_lock);
@@ -152,9 +165,7 @@ static void run_task(Task* t) {
         arm_call(c, pf_r32(t->node + T_PC));
         if (c.pc != kThreadExit) arm_fault(c, c.pc, "a thread returned somewhere other than the kernel");
         if (g_pf_trace) pf_log("        (thread \"%s\" returns: gone)\n", name(t));
-        if (pf_r32(t->node + T_THREADTASK) && (pf_r32(t->node + T_FLAGS) & TASK_ALLOCATED_SP))
-            pf_free_mem(pf_r32(t->node + T_FREEMEMORYLISTS), pf_r32(t->node + T_STACKBASE),
-                        (int32_t)pf_r32(t->node + T_STACKSIZE));
+        give_back_stack(t->node);
     } catch (const PfExit&) {
         if (g_pf_trace) pf_log("        (thread \"%s\" exits: gone)\n", name(t));
     }
@@ -400,6 +411,7 @@ void pf_task_init() {
     g_running = new Task{main, true, false};
     g_tasks.push_back(g_running);
     pf_on_swi(0x10001, k_waitsignal);
+    pf_on_slot(PF_KERNEL, -148, k_exit);
     pf_on_swi(0x10002, k_sendsignal);
     pf_on_swi(0x10009, k_yield);
     pf_on_swi(0x1000a, k_setitempri);

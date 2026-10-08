@@ -654,7 +654,30 @@ static void g_mapcel(ArmCpu& c) {
     c.r[0] = hddy;
 }
 
+// Graphics -192: Err QueryGraphics(int32 tag, void* value) -- 23.10's (graphix 0x60c4; the 1993
+// folio's slot is GRAFERR_NOTYET for anything): per tag a word into *value, then 0 -- 1 the field
+// rate (gf +0xc8), 2 a field's time in microseconds (+0xc4), 3 the fields so far (23.10 keeps its
+// own count, 0x91c8; here gf_VBLNumber), 4 and 5 the default display's width and height (+0x84,
+// +0x88), 6 the display type (+0x140, which 1993's GrafFolio lacks: 1, DI_TYPE_NTSC, the console
+// the runtime is -- 2 and 3 are PAL); tag 0 writes nothing, any other is GRAFERR_BADTAG.
+static void g_querygraphics(ArmCpu& c) {
+    uint32_t v;
+    switch (c.r[0]) {
+    case 0: c.r[0] = 0; return;
+    case 1: v = graf(GF_VBLFREQ); break;
+    case 2: v = graf(GF_VBLTIME); break;
+    case 3: v = graf(GF_VBLNUMBER); break;
+    case 4: v = graf(GF_DEFAULTDISPLAYWIDTH); break;
+    case 5: v = graf(GF_DEFAULTDISPLAYHEIGHT); break;
+    case 6: v = 1; break;
+    default: c.r[0] = GRAFERR_BADTAG; return;
+    }
+    pf_w32(c.r[1], v);
+    c.r[0] = 0;
+}
+
 static void graphics_slots() {
+    pf_on_slot(PF_GRAPHICS, -192, g_querygraphics);
     pf_on_slot(PF_GRAPHICS, -4, g_mapcel);
     pf_on_slot(PF_GRAPHICS, -48, g_createscreengroup);
     pf_on_slot(PF_GRAPHICS, -60, g_setcliporigin);

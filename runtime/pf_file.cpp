@@ -372,6 +372,9 @@ static int32_t file_dispatch(uint32_t ior) {
         std::exit(3);
     }
     pf_w32(ior + IO_FLAGS, pf_r32(ior + IO_FLAGS) & ~IO_QUICK);
+    if (g_pf_trace >= 2)
+        pf_log("        read %u blocks from block %u of \"%s\" into %08X\n", len / bs, pf_r32(ior + IOI_OFFSET),
+               g_places[file].c_str(), pf_r32(ior + IOI_RECV_BUF));
     if (g_reads.empty()) pf_at(pf_now(), reads_done);
     g_reads.push_back(ior);
     return 0;

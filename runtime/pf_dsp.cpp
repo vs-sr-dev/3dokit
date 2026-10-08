@@ -77,13 +77,14 @@ struct Fifo {
 };
 
 // ---- the instruments ----------------------------------------------------------------------------
-enum Kind { NONE, MIXER, SAMPLER, VARMONO8, DCSQXDHALFMONO };
+enum Kind { NONE, MIXER, SAMPLER, VARMONO8, DCSQXDHALFMONO, DCSQXDHALFSTEREO, ENVELOPE };
 
 struct Model {
     const char* file;
     uint32_t sum;                                       // FNV-1a of the code words
     Kind kind;
     int inputs;                                         // a mixer's
+    bool gated = false;                                 // the frame skipped while the FIFO is empty
 };
 // The code transliterated, from the 1993 library (System/Audio/dsp on Crash 'n Burn's disc).
 // sampler.dsp's subroutine, oscupdownfp.dsp, is the folio's to load and is not checked here.
@@ -93,6 +94,13 @@ const Model kModels[] = {
     {"sampler.dsp", 0x90af13d7u, SAMPLER, 0},
     {"varmono8.dsp", 0xcc3a4a27u, VARMONO8, 0},
     {"dcsqxdhalfmono.dsp", 0x136cf5d3u, DCSQXDHALFMONO, 0},
+    // from 23.10's library (System/Audio/dsp on Immercenary's disc): mixer2x2 is mixer4x2's code
+    // with two inputs
+    {"mixer2x2.dsp", 0xf897e91eu, MIXER, 2},
+    {"dcsqxdhalfstereo.dsp", 0x26daf914u, DCSQXDHALFSTEREO, 0},
+    {"envelope.dsp", 0x70c12c2cu, ENVELOPE, 0},
+    // 1993's code behind a test of its FIFO's status (SLEEP while it is empty)
+    {"dcsqxdhalfmono.dsp", 0x7c904d9au, DCSQXDHALFMONO, 0, true},
 };
 
 struct Input { int32_t src; uint32_t rsrc; };
@@ -100,6 +108,7 @@ struct Input { int32_t src; uint32_t rsrc; };
 struct Unit {
     Kind kind = NONE;
     int inputs = 0;
+    bool gated = false;
     uint8_t pri = 0;
     std::vector<std::string> names;
     std::vector<int16_t> mem;                           // per resource: its word in DSP memory
@@ -111,6 +120,10 @@ struct Unit {
     int out = -1, amp = -1, freq = -1, in_fifo = -1;
     int phase = -1, oldv = -1, newv = -1, hold = -1, toggle = -1;
     int prev = -1, square = -1, byte = -1, accum = -1, state = -1;
+    // dcsqxdhalfstereo.dsp's: per side its byte, sum, new value, last value and output
+    int sbyte[2] = {-1, -1}, saccum[2] = {-1, -1}, stemp[2] = {-1, -1}, sprev[2] = {-1, -1}, sout[2] = {-1, -1};
+    // envelope.dsp's
+    int ecur = -1, esrc = -1, etgt = -1, ephase = -1, eincr = -1, ereq = -1;
     std::vector<int> in, left, right;
 };
 
@@ -258,7 +271,10 @@ void run_varmono8(int32_t item, Unit& u) {
 // high one of a new word, or the low one kept) is squared with its sign; an odd byte adds the
 // square to the last value (with CLIP), an even one is the value; the frame plays the mean of the
 // last value and the new one, and the odd frame after it the new one.
+bool fifo_has(Unit& u, int r);
+
 void run_dcsqxd(int32_t item, Unit& u) {
+    if (u.gated && !fifo_has(u, u.in_fifo)) return;     // 23.10's: TRA InFIFO's status, BZ to SLEEP
     std::vector<int16_t>& m = u.mem;
     auto& cs = m[(size_t)u.state];
     auto& pv = m[(size_t)u.prev];
@@ -291,6 +307,77 @@ void run_dcsqxd(int32_t item, Unit& u) {
     m[(size_t)u.out] = wb(mul_acc(value(u, u.amp), y));
 }
 
+// A FIFO's status word, which a relocation of its own (mask 0x1020a00, bit 24 set) gives the
+// code: here only whether there is a word to read -- in the current chunk, or a next to reload
+// from -- as the FIFO's own buffering is not modelled.
+bool fifo_has(Unit& u, int r) {
+    Fifo& f = u.fifo[(uint32_t)r];
+    return f.on && (f.pos + 2 <= f.cur.bytes || f.has_next);
+}
+
+// dcsqxdhalfstereo.dsp (23.10): SDX2 stereo at half the rate. Toggle steps by 0x8000 a frame; on a
+// frame it goes negative, when the FIFO's status says it has a word (else nothing at all), the word
+// comes in: its high byte the left channel's, its low byte (shifted up) the right's; each byte is
+// squared with its sign, an odd byte adds the square to the side's sum (no CLIP, unlike the mono
+// decoder), an even one is the sum; the side plays the mean of its last value and the new one, and
+// the new one becomes its last value. On the other frames each side plays its last value.
+void run_dcsqxd_stereo(int32_t item, Unit& u) {
+    std::vector<int16_t>& m = u.mem;
+    auto& tg = m[(size_t)u.toggle];
+    uint32_t y = word(tg) + word((int16_t)0x8000);
+    tg = wb(y);
+    if (!(y >> 31)) {
+        for (int s = 0; s < 2; ++s) m[(size_t)u.sout[s]] = wb(mul(m[(size_t)u.sprev[s]], value(u, u.amp)));
+        return;
+    }
+    if (!fifo_has(u, u.in_fifo)) return;
+    auto& hd = m[(size_t)u.hold];
+    auto& sq = m[(size_t)u.square];
+    hd = (int16_t)fifo_read(item, u, u.in_fifo);
+    m[(size_t)u.sbyte[0]] = wb(word(hd) & 0xFF000000u);
+    m[(size_t)u.sbyte[1]] = wb(word(hd) << 8);
+    for (int s = 0; s < 2; ++s) {
+        int16_t by = m[(size_t)u.sbyte[s]];
+        auto& ac = m[(size_t)u.saccum[s]];
+        y = word(by);
+        if (y >> 31) y = 0u - y;
+        sq = wb(mul_acc(by, y));
+        y = ((uint16_t)by & 0x100) ? word(sq) + word(ac) : word(sq);
+        ac = wb(y);
+        m[(size_t)u.stemp[s]] = wb(y);
+        y = ((uint32_t)((int32_t)y >> 1)) & kAlu;
+        y = mul(m[(size_t)u.sprev[s]], 0x4000) + y;
+        m[(size_t)u.sout[s]] = wb(mul_acc(value(u, u.amp), y));
+        m[(size_t)u.sprev[s]] = m[(size_t)u.stemp[s]];
+    }
+}
+
+// envelope.dsp (23.10): when Env.request is not Env.target, a new segment -- the current value
+// its source, its phase 0, the request its target; else the phase steps by Env.incr (with CLIP)
+// and the current value is the target times the phase less the source times (phase less one):
+// from the source to the target, linearly, over 0x8000 / Env.incr frames. Output is the current
+// value.
+void run_envelope(Unit& u) {
+    std::vector<int16_t>& m = u.mem;
+    auto& cur = m[(size_t)u.ecur];
+    auto& src = m[(size_t)u.esrc];
+    auto& tgt = m[(size_t)u.etgt];
+    auto& ph = m[(size_t)u.ephase];
+    int16_t req = value(u, u.ereq);
+    if (word(req) - word(tgt)) {
+        src = cur;
+        ph = 0;
+        tgt = req;
+    } else {
+        uint32_t y = add_clip(word(ph), word(value(u, u.eincr)));
+        ph = wb(y);
+        y = mul_acc(src, y) - word(src);
+        y = mul(tgt, ph) - y;
+        cur = wb(y);
+    }
+    m[(size_t)u.out] = cur;
+}
+
 // One frame: head.dsp first (the bus to the DAC, and cleared), then the running instruments.
 void frame() {
     g_out.push_back(g_bus_l);
@@ -306,6 +393,8 @@ void frame() {
         case SAMPLER: run_sampler(item, u); break;
         case VARMONO8: run_varmono8(item, u); break;
         case DCSQXDHALFMONO: run_dcsqxd(item, u); break;
+        case DCSQXDHALFSTEREO: run_dcsqxd_stereo(item, u); break;
+        case ENVELOPE: run_envelope(u); break;
         case NONE: break;
         }
     }
@@ -364,6 +453,7 @@ void pf_dsp_new(int32_t ins, const std::string& file, const std::vector<std::str
         if (base == m.file && m.sum == sum) {
             u.kind = m.kind;
             u.inputs = m.inputs;
+            u.gated = m.gated;
         }
     if (u.kind == NONE && !g_told.count(base)) {
         g_told.insert(base);
@@ -378,12 +468,26 @@ void pf_dsp_new(int32_t ins, const std::string& file, const std::vector<std::str
     u.oldv = rsrc_named(u, "OldVal");
     u.newv = rsrc_named(u, "NewVal");
     u.toggle = rsrc_named(u, "Toggle");
-    u.hold = rsrc_named(u, u.kind == DCSQXDHALFMONO ? "dc_hold" : "SampleHold");
+    u.hold = rsrc_named(u, u.kind == DCSQXDHALFMONO || u.kind == DCSQXDHALFSTEREO ? "dc_hold" : "SampleHold");
+    for (int s = 0; s < 2; ++s) {
+        const std::string side = s ? "right" : "left", Side = s ? "Right" : "Left";
+        u.sbyte[s] = rsrc_named(u, "dc_" + side + "byte");
+        u.saccum[s] = rsrc_named(u, "dc_" + side + "accum");
+        u.stemp[s] = rsrc_named(u, "Temp" + Side);
+        u.sprev[s] = rsrc_named(u, "Prev" + Side);
+        u.sout[s] = rsrc_named(u, Side + "Output");
+    }
     u.prev = rsrc_named(u, "PrevValue");
     u.square = rsrc_named(u, "dc_square");
     u.byte = rsrc_named(u, "dc_byte");
     u.accum = rsrc_named(u, "dc_accum");
     u.state = rsrc_named(u, "CurState");
+    u.ecur = rsrc_named(u, "Env.current");
+    u.esrc = rsrc_named(u, "Env.source");
+    u.etgt = rsrc_named(u, "Env.target");
+    u.ephase = rsrc_named(u, "Env.phase");
+    u.eincr = rsrc_named(u, "Env.incr");
+    u.ereq = rsrc_named(u, "Env.request");
     for (int i = 0; i < u.inputs; ++i) {
         u.in.push_back(rsrc_named(u, "Input" + std::to_string(i)));
         u.left.push_back(rsrc_named(u, "LeftGain" + std::to_string(i)));

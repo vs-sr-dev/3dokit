@@ -210,7 +210,10 @@ struct Attachment {
     uint32_t flags, start_at;
     int state;                              // +0x26: 0 made, 1 stopped, 2 released, 3 playing
     int32_t next;                           // LinkAttachments (+0x4c): what plays after it, 0 none
+    int32_t cue = 0;                        // MonitorAttachment (+0x44): signalled at its end, 0 none
+    int32_t cue_index = 0;                  // +0x48: CUE_AT_END (-2), the only one taken
 };
+static void signal_cue(int32_t& cue);       // with the cues, below
 enum : uint32_t { AF_ATTF_NOAUTOSTART = 1, AF_ERR_NULLADDRESS = 0xD52BF119u };
 static std::map<int32_t, Attachment> g_attachments;
 
@@ -652,9 +655,9 @@ static int32_t linked(Attachment& at) {
 }
 
 // 0x6578: the FIFO's interrupt armed to signal the daemon when the chunk now playing runs out --
-// when the attachment has a cue (+0x44, not made here), AF_ATTF_FATLADYSINGS (2) or a link.
+// when the attachment has a cue (+0x44, MonitorAttachment), AF_ATTF_FATLADYSINGS (2) or a link.
 static void arm(const Attachment& at) {
-    if ((at.flags & 2) || at.next) pf_dsp_dma_arm(at.ins, (uint32_t)at.rsrc);
+    if (at.cue || (at.flags & 2) || at.next) pf_dsp_dma_arm(at.ins, (uint32_t)at.rsrc);
 }
 
 // 0x76b8: the FIFO's next chunk the folio's silence.
@@ -807,8 +810,8 @@ static uint32_t stop_instrument(int32_t item, uint32_t tags);
 // The folio's daemon on an armed FIFO's signal (0x5cc0): the attachment that was the FIFO's, while
 // it is still an attachment, is no longer, and ends (0x5c04): stopped; with AF_ATTF_FATLADYSINGS
 // its instrument stopped (StopInstrument), else what is linked after it takes over (0x7788), or
-// with no link the FIFO plays the silence (0x7674: the current chunk and the next); its cue
-// (+0x44) signalled -- no cue is made here.
+// with no link the FIFO plays the silence (0x7674: the current chunk and the next); then its cue
+// (+0x44) signalled, while it is still a cue (else forgotten).
 static void fifo_ended(int32_t ins, uint32_t rsrc) {
     auto i = g_instruments.find(ins);
     if (i == g_instruments.end()) return;
@@ -822,6 +825,7 @@ static void fifo_ended(int32_t ins, uint32_t rsrc) {
     if (at.flags & 2) stop_instrument(at.ins, 0);
     else if (int32_t n = linked(at)) take_over(n);
     else pf_dsp_dma(ins, rsrc, PF_DSP_SILENCE, 32, PF_DSP_SILENCE, 32);
+    if (at.cue) signal_cue(at.cue);
     if (g_pf_trace >= 2) pf_log("        attachment %d ends on instrument %d\n", a, ins);
 }
 
@@ -1044,6 +1048,14 @@ static uint32_t ext80_fix16(uint32_t a) {
     return pf_r8(a) & 0x80 ? 0u - v : v;
 }
 
+// The folio's AllocMem (1993's 0xb264, 23.10's 0xa048, the same code): n + 4 bytes from the task's
+// lists, n in the first word, the word after it back; 0 when there is no room.
+static uint32_t folio_alloc_mem(uint32_t n) {
+    uint32_t p = pf_alloc_mem(pf_r32(pf_current_task() + T_FREEMEMORYLISTS), (int32_t)n + 4, MEMTYPE_DMA, true);
+    if (p) { pf_w32(p, n); p += 4; }
+    return p;
+}
+
 struct AiffMarkers { uint32_t count = 0; uint32_t id[32] = {}, pos[32] = {}; };
 
 // AUDIOFOLIO's handler of a chunk of the AIFF form (0x2fe8). The chunk's bytes are read first,
@@ -1119,9 +1131,8 @@ static int32_t aiff_chunk(IffRead& r, Sample& s, AiffMarkers& mk, bool aifc, uin
         if (alloc_fn) {
             p = pf_guest_call(c, alloc_fn, (uint32_t)n + 4, 0x100000);
             if (p) { pf_w32(p, (uint32_t)n); p += 4; }
-        } else {                                                    // the folio's AllocMem (0xb264)
-            p = pf_alloc_mem(pf_r32(pf_current_task() + T_FREEMEMORYLISTS), n + 4, MEMTYPE_DMA, true);
-            if (p) { pf_w32(p, (uint32_t)n); p += 4; }
+        } else {
+            p = folio_alloc_mem((uint32_t)n);
         }
         if (!p) return (int32_t)AF_ERR_NOMEM;
         s.address = p;
@@ -1212,6 +1223,42 @@ static void a_unloadsample(ArmCpu& c) {
     c.r[0] = (uint32_t)err;
 }
 
+// audio -56: Item MakeSample(uint32 numBytes, TagArg* tags) -- 1993's 0x29e4, 23.10's 0x27d4: a
+// sample at the folio's defaults; with numBytes above 0, that many bytes of the folio's AllocMem
+// for its data (AF_TAG_ADDRESS, AF_TAG_NUMBYTES, flags bit 0: the folio's, which UnloadSample gives
+// back); the tags applied as SetAudioItemInfo applies them (sample_set; their error is MakeSample's,
+// the memory given back); then the item made of that info, as AF_TAG_SAMPLE makes one. The two
+// folios take the memory and the tags in opposite orders -- 1993 the tags first, then refusing
+// (AF_ERR_BADTAGVAL) a NUMBYTES other than numBytes; 23.10 the memory first, keeping it aside when a
+// tag then gives another ADDRESS -- so a tag that gives either with numBytes above 0 stops the
+// run: not yet.
+static void a_makesample(ArmCpu& c) {
+    uint32_t n = c.r[0], tag_ptr = c.r[1];
+    if (n && tag_ptr)
+        for (auto [tag, v] : read_tags(tag_ptr)) {
+            (void)v;
+            if (tag == AF_TAG_ADDRESS || tag == AF_TAG_NUMBYTES)
+                pf_stop(c, "MakeSample: numBytes and a tag that gives the address or the size: not yet");
+        }
+    Sample s;
+    if (n) {
+        if (!(s.address = folio_alloc_mem(n))) { c.r[0] = AF_ERR_NOMEM; return; }
+        s.flags |= 1;
+        s.numbytes = n;
+    }
+    if (tag_ptr)
+        if (uint32_t err = sample_set(c, s, tag_ptr)) {
+            if (s.address) pf_free_mem(pf_r32(pf_current_task() + T_FREEMEMORYLISTS), s.address - 4, (int32_t)n + 4);
+            c.r[0] = err;
+            return;
+        }
+    uint32_t tags = c.r[13] - 32 - 0xb0, info = tags + 0x18;
+    sample_info_write(info, s);
+    const uint32_t t[3] = {AF_TAG_SAMPLE, info, 0};
+    for (int k = 0; k < 3; ++k) pf_w32(tags + 4u * k, t[k]);
+    c.r[0] = audio_create(c, SAMPLE_NODE, tags);
+}
+
 // audio -16: Item GrabKnob(Item instrument, char* name) -- 0x2508:
 // CreateItem(MKNODEID(AUDIONODE, AUDIO_KNOB_NODE), {AF_TAG_NAME, AF_TAG_INSTRUMENT}).
 static void a_grabknob(ArmCpu& c) {
@@ -1249,6 +1296,32 @@ static void a_linkattachments(ArmCpu& c) {
     }
     if (g_pf_trace) pf_log("        attachment %d then %d\n", a1, a2);
     c.r[0] = 0;
+}
+
+// swi 0x40012: Err StartAttachment(Item attachment, TagArg* tags) -- 1993's 0x62c0, 23.10's 0x60d4:
+// an attachment (else AF_ERR_BADITEM), no tags (else AF_ERR_BADTAG), then started (0x74b8),
+// whatever its instrument is doing. (23.10's start, 0x7488, told it comes from here, also resets the
+// FIFO -- CLIO 0x03400300 and the FIFO's DSP word, 0x97dc -- before it sets the current and next
+// chunks; the runtime's DMA set plays the current chunk from its start anyway.) swi 0x40013
+// ReleaseAttachment (0x631c, 23.10's 0x611c) and swi 0x40014 StopAttachment (0x6378, 23.10's
+// 0x6160) check the same and release (0x79a0) or stop (0x7cf8, 0) it.
+static int32_t attachment_call(ArmCpu& c) {
+    pf_dsp_sync();
+    if (!pf_check_item((int32_t)c.r[0], NST_AUDIO, ATTACHMENT_NODE)) { c.r[0] = AF_ERR_BADITEM; return 0; }
+    if (c.r[1]) { c.r[0] = AF_ERR_BADTAG; return 0; }
+    return (int32_t)c.r[0];
+}
+static void a_startattachment(ArmCpu& c) {
+    if (int32_t a = attachment_call(c)) c.r[0] = attachment_start(a);
+}
+static void a_releaseattachment(ArmCpu& c) {
+    if (int32_t a = attachment_call(c)) c.r[0] = attachment_release(a);
+}
+static void a_stopattachment(ArmCpu& c) {
+    if (int32_t a = attachment_call(c)) {
+        attachment_stop(a);
+        c.r[0] = 0;
+    }
 }
 
 // swi 0x40000: Err TweakKnob(Item knob, int32 value) -- 0x27c8, and swi 0x40011 TweakRawKnob
@@ -1383,7 +1456,26 @@ static void a_setaudioiteminfo(ArmCpu& c) {
                    s.sustain_end, s.base_freq, c.r[0]);
         break;
     }
-    case 6: case 7: case 8: pf_stop(c, "SetAudioItemInfo of an envelope, attachment or tuning: not yet");
+    case ATTACHMENT_NODE: {
+        // 0x6088 (23.10's 0x5ea8, the same): AF_TAG_SET_FLAGS and _CLEAR_FLAGS (41), bits 0 and 1
+        // only (else AF_ERR_BADTAGVAL); AF_TAG_START_AT not below 0 and before the sample's last
+        // frame (else AF_ERR_BADTAGVAL); the item tags (up to 9) passed over, any other AF_ERR_BADTAG.
+        // A tag before the one that fails has taken.
+        Attachment& a = g_attachments[item];
+        c.r[0] = 0;
+        for (auto [tag, v] : read_tags(c.r[1])) {
+            if (tag == AF_TAG_SET_FLAGS || tag == 41) {
+                if (v & ~3u) { c.r[0] = AF_ERR_BADTAGVAL; break; }
+                a.flags = tag == AF_TAG_SET_FLAGS ? a.flags | v : a.flags & ~v;
+            } else if (tag == AF_TAG_START_AT) {
+                uint32_t frames = a.sample > 0 ? g_samples[a.sample].frames : 0;
+                if ((int32_t)v < 0 || v >= frames) { c.r[0] = AF_ERR_BADTAGVAL; break; }
+                a.start_at = v;
+            } else if (tag > 9) { c.r[0] = AF_ERR_BADTAG; break; }
+        }
+        break;
+    }
+    case 6: case 8: pf_stop(c, "SetAudioItemInfo of an envelope or tuning: not yet");
     default: c.r[0] = AF_ERR_BADITEM;
     }
 }
@@ -1490,6 +1582,30 @@ static void delete_cue(int32_t item) {
         pf_w32(n + TN_LIST, 0);
     }
     pf_w32(n + CUE_SIGNAL, 0);
+}
+
+// An attachment's cue at its end (0x5c88): while it is a cue, its task sent its signal; else the
+// attachment forgets it.
+static void signal_cue(int32_t& cue) {
+    if (uint32_t n = pf_check_item(cue, NST_AUDIO, CUE_NODE)) pf_signal(pf_r32(n + CUE_TASK), pf_r32(n + CUE_SIGNAL));
+    else cue = 0;
+}
+
+// swi 0x40016: Err MonitorAttachment(Item attachment, Item cue, int32 index) -- 1993's 0x64e4,
+// 23.10's 0x62ac: an attachment (else AF_ERR_BADITEM); no cue forgets the one it had; else a cue
+// (else AF_ERR_BADITEM) at CUE_AT_END (-2), the only index taken (else 0xD52BF118), kept with it.
+// It is signalled when the attachment ends; a FIFO armed before is not armed again here, as in
+// the folio.
+static void a_monitorattachment(ArmCpu& c) {
+    int32_t a = (int32_t)c.r[0], cue = (int32_t)c.r[1], index = (int32_t)c.r[2];
+    if (!pf_check_item(a, NST_AUDIO, ATTACHMENT_NODE)) { c.r[0] = AF_ERR_BADITEM; return; }
+    Attachment& at = g_attachments[a];
+    c.r[0] = 0;
+    if (!cue) { at.cue = 0; return; }
+    if (!pf_check_item(cue, NST_AUDIO, CUE_NODE)) { c.r[0] = AF_ERR_BADITEM; return; }
+    if (index != -2) { c.r[0] = 0xD52BF118u; return; }
+    at.cue = cue;
+    at.cue_index = index;
 }
 
 // swi 0x4000d: Err SignalAtTime(Item cue, AudioTime time) -- 0x41d8: the folio open; a cue (else
@@ -1614,6 +1730,7 @@ void pf_audio_init() {
     pf_on_slot(PF_AUDIO, -16, a_grabknob);
     pf_on_slot(PF_AUDIO, -40, a_loadinstrument);
     pf_on_slot(PF_AUDIO, -12, a_loadsample);
+    pf_on_slot(PF_AUDIO, -56, a_makesample);
     pf_on_slot(PF_AUDIO, -44, a_unloadsample);
     pf_on_slot(PF_AUDIO, -92, a_unloadinstemplate);
     pf_on_slot(PF_AUDIO, -144, a_attachsample);
@@ -1625,6 +1742,10 @@ void pf_audio_init() {
     pf_on_swi(0x40008, a_connectinstruments);
     pf_on_swi(0x4000c, a_disconnectinstruments);
     pf_on_swi(0x40011, a_tweakrawknob);
+    pf_on_swi(0x40012, a_startattachment);
+    pf_on_swi(0x40013, a_releaseattachment);
+    pf_on_swi(0x40014, a_stopattachment);
     pf_on_swi(0x40015, a_linkattachments);
+    pf_on_swi(0x40016, a_monitorattachment);
     pf_on_swi(0x4001b, a_setaudioiteminfo);
 }

@@ -214,6 +214,7 @@ static void k_sendio(ArmCpu& c) { c.r[0] = (uint32_t)pf_send_io(c, (int32_t)c.r[
 //   deleted as by its owner, and the device off the kernel's list (which the runtime does not
 //   keep).
 // * a message or a port (pf_msg.cpp, 0x187f8 and 0x1884c).
+// * a semaphore (pf_kernel.cpp, 0x13bf4): its waiters woken with SIGF_ABORT.
 // * a task (pf_task.cpp, 0x167cc).
 // * a folio's item: the folio's ir_Delete (pf_on_delete); anything but 0 is the result, and the
 //   item stays.
@@ -249,6 +250,8 @@ static int32_t delete_as(ArmCpu& c, int32_t item, uint32_t task) {
         pf_delete_msg(n);
     } else if (kind == (1u << 8 | MSGPORTNODE)) {
         pf_delete_msgport(c, n);
+    } else if (kind == (1u << 8 | 7)) {                    // a semaphore (0x13bf4)
+        pf_delete_semaphore(n);
     } else if (kind == (1u << 8 | TASKNODE)) {
         if (int32_t r = pf_delete_task(c, n)) return r;
     } else if (auto d = g_deleters.find((int)pf_r8(n + 8)); d != g_deleters.end()) {

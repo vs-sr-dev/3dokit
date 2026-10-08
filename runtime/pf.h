@@ -244,6 +244,7 @@ int32_t  pf_wait_signal(uint32_t sigs);
 uint32_t pf_create_msgport(ArmCpu& c, uint32_t tags, uint32_t size);
 uint32_t pf_create_msg(ArmCpu& c, uint32_t tags, uint32_t size);
 uint32_t pf_create_semaphore(ArmCpu& c, uint32_t tags, uint32_t size);
+int32_t  pf_delete_semaphore(uint32_t node);         // the kernel's ir_Delete for one (pf_kernel.cpp)
 void     pf_delete_msgport(ArmCpu& c, uint32_t port);
 void     pf_delete_msg(uint32_t msg);
 // The OS's own ports and messages. A port made here has no task behind it: a message sent to it

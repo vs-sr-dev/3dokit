@@ -333,6 +333,17 @@ int32_t pf_semaphore_new(const char* name) {
 
 static std::map<int32_t, uint32_t> g_wait_nodes;    // a task's SemaphoreWaitNode
 
+// A semaphore deleted (the kernel's ir_Delete for its type, 0x13bf4): each waiter taken off the
+// list, its task sent SIGF_ABORT (its LockItem is ABORTED); then off KernelBase's list of
+// semaphores, which the runtime does not keep. 0.
+int32_t pf_delete_semaphore(uint32_t s) {
+    for (uint32_t w; (w = pf_r32(s + SEM_WAITERS + PF_LIST_HEAD)) != s + SEM_WAITERS + PF_LIST_TAIL;) {
+        pf_list_rem_node(w);
+        if (uint32_t t = pf_item_node((int32_t)pf_r32(w + SWN_TASK))) pf_signal(t, 4);
+    }
+    return 0;
+}
+
 // swi 0x10007: int32 LockItem(Item s, uint32 flags) -- 0x13ad0 and 0x139c8: a semaphore, else
 // BADITEM; flags SEM_WAIT only, else BADTAGVAL. A free semaphore is taken (1); one the task holds
 // is taken again (1, its count up); one another task holds is 0 without SEM_WAIT, else the task
