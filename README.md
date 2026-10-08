@@ -4,8 +4,11 @@ A game-agnostic toolkit for Panasonic 3DO reverse engineering and native PC
 ports: disc images and the Opera filesystem, the executables and the ARM60
 code in them, the Portfolio OS surface a program touches, the CEL engine's
 pixel formats, the DataStream with its Cinepak films and SDX2 sound, AIFF
-samples, the DSP instrument library, and a C99 runtime that reads all of it
-for an engine.
+samples, the DSP instrument library -- and the way two games now run on PC:
+an ARM60 static recompiler that turns a 3DO program into C++, and a
+reimplementation of the Portfolio OS (`pfboot`) that answers every OS call
+the way the console's own OS code does, from the boot to the cel engine,
+the DSP and the drive.
 
 The same idea as [wiikit](https://github.com/vs-sr-dev/wiikit),
 [saturnkit](https://github.com/vs-sr-dev/saturnkit),
@@ -23,9 +26,14 @@ in the ports.
 
 | Port | Game | What it asked of 3dokit |
 |---|---|---|
-| [pc-immercenary](https://github.com/vs-sr-dev/pc-immercenary) | Immercenary (1995, 3DO) | everything so far: the disc, the AIF and binary headers, the ARM cross-referencer, the OS surface, library proofs and the pairing of its two executables, the cels, the DataStream and its Cinepak and SDX2, the AIFF samples, the DSP instruments, and the C runtime |
+| [pc-immercenary](https://github.com/vs-sr-dev/pc-immercenary) | Immercenary (1995, 3DO; Portfolio 23.10) | where the kit was born: the disc, the AIF and binary headers, the ARM cross-referencer, the OS surface, library proofs and the pairing of its two executables, the cels, the DataStream and its Cinepak and SDX2, the AIFF samples, the DSP instruments, the C runtime. Then, recompiled onto the kit: several programs in memory at once and tasks with their own image, 23.10's folios, the drive's reading time, 23.10's DSP instruments and the DSP's interpreter. **Playable** |
+| [pc-crashnburn](https://github.com/vs-sr-dev/pc-crashnburn) | Crash 'n Burn (1993, 3DO; the launch OS) | the route itself: the ARM60 decoder and interpreter, the static recompiler and its self-test, and the Portfolio runtime built call by call on the 1993 OS's own code -- the kernel, the File folio and the shell, the Graphics folio and the cel engine, the audio folio and the DSP, the event broker and the pad, `pfcheck` against the OS's own code. **Playable**, at par with the Phoenix emulator |
 
-Written from Immercenary's tools and checked on a second disc, the
+Both ports keep their game's knowledge to themselves and hold every kit
+change against each other: a commit to the kit is checked on both discs
+(traces, frames, sound, `pfcheck`) before it lands in either.
+
+The kit was first written from Immercenary's tools and checked on a second disc, the
 OMF2097 port's own ISO: a different mastering tool (3doiso), a later OS
 (Portfolio 24.225 against 23.10), a modern toolchain (the 3do-devkit), and
 cels written by a different converter (3it). Where the two disagreed, the
