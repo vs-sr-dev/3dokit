@@ -13,6 +13,7 @@
 // ItemNode is private to it -- no SDK header describes it -- and no program run so far reads it,
 // so it is kept on the host side instead.
 #include "pf.h"
+#include <cctype>
 #include <algorithm>
 #include <cstdio>
 #include <cstring>
@@ -163,6 +164,7 @@ struct Instrument {
     // FIFOs (+0x18 of an entry, by the FIFO's number), set when an attachment starts, cleared when
     // it stops.
     std::map<int, int32_t> playing;
+    uint32_t start_time = 0;                // the node's +0x60: the folio's time at the last start (23.10)
 };
 struct Knob {
     int32_t ins;
@@ -269,19 +271,33 @@ static uint32_t tweak(ArmCpu& c, Instrument& ins, const Template& t, const DspKn
     return 0;
 }
 
+// A resource's or knob's name against the one asked for. The 1993 folio compares them with strncmp,
+// 32 characters (0x8764); 23.10's without regard to case, to the end (0xa964, both letters made
+// upper case: its resources by 0x85d0, its knobs by 0x951c) -- Immercenary's GoodSpire.ins calls
+// its output "OutPut" and the game connects "Output". The runtime takes 23.10's: every name the
+// 1993 folio finds it finds too.
+static bool same_name(const std::string& have, const char* want) {
+    size_t i = 0;
+    for (;; ++i) {
+        unsigned char a = (unsigned char)(i < have.size() ? have[i] : 0), b = (unsigned char)want[i];
+        if (std::toupper(a) != std::toupper(b)) return false;
+        if (!a) return true;
+    }
+}
+
 static const DspKnob* find_knob(const Template& t, const char* name, int* index = nullptr) {
     for (size_t i = 0; i < t.knobs.size(); ++i)
-        if (!std::strncmp(t.knobs[i].name.c_str(), name, 32)) {
+        if (same_name(t.knobs[i].name, name)) {
             if (index) *index = (int)i;
             return &t.knobs[i];
         }
     return nullptr;
 }
 
-// A resource of the template by name and type (0x8764: names compared as strncmp, 32 characters).
+// A resource of the template by name and type (0x8764; the names as same_name compares them).
 static int find_rsrc(const Template& t, uint32_t type, const std::string& name) {
     for (size_t i = 0; i < t.rsrc.size(); ++i)
-        if (t.rsrc[i].type == type && !std::strncmp(t.rsrc[i].name.c_str(), name.c_str(), 32)) return (int)i;
+        if (t.rsrc[i].type == type && same_name(t.rsrc[i].name, name.c_str())) return (int)i;
     return -1;
 }
 
@@ -1412,6 +1428,7 @@ static void a_startinstrument(ArmCpu& c) {
     pf_dsp_run(item, true);
     ins.dsp_state = 3;
     ins.state = 3;
+    ins.start_time = pf_r32(pf_folio_base(PF_AUDIO) + 0x9c);    // 23.10's 0x1974: the folio's time (AF_TIME)
     c.r[0] = 0;
 }
 
@@ -1509,12 +1526,31 @@ static uint32_t sample_get(const Sample& s, uint32_t tags) {
     return 0;
 }
 
+// An instrument's (23.10's 0x1884; the 1993 folio's answer is 0xD52BF118): AF_TAG_PRIORITY (39)
+// the node's priority, AF_TAG_STATUS (60) its state (0 abandoned, 1 stopped, 2 released, 3
+// started), AF_TAG_START_TIME (62) the folio's time when it last started; an item tag (up to 9)
+// passed over; any other AF_ERR_BADTAG, the tags before it answered.
+static uint32_t instrument_get(uint32_t node, const Instrument& ins, uint32_t tags) {
+    for (uint32_t p = tags; p; p += 8) {
+        uint32_t tag = pf_r32(p), v;
+        if (!tag) break;
+        if (tag == AF_TAG_PRIORITY) v = pf_r8(node + 10);
+        else if (tag == 60) v = (uint32_t)ins.state;
+        else if (tag == 62) v = ins.start_time;
+        else if (tag > 9) return AF_ERR_BADTAG;
+        else continue;
+        pf_w32(p + 4, v);
+    }
+    return 0;
+}
+
 static void a_getaudioiteminfo(ArmCpu& c) {
     int32_t item = (int32_t)c.r[0];
     uint32_t n = pf_item_node(item);
     if (!n || pf_r8(n + 8) != NST_AUDIO) { c.r[0] = AF_ERR_BADITEM; return; }
     switch (pf_r8(n + 9)) {
     case SAMPLE_NODE: c.r[0] = sample_get(g_samples[item], c.r[1]); break;
+    case INSTRUMENT_NODE: c.r[0] = instrument_get(n, g_instruments[item], c.r[1]); break;
     case KNOB_NODE: case ATTACHMENT_NODE: pf_stop(c, "GetAudioItemInfo of a knob or an attachment: not yet");
     default: c.r[0] = 0xD52BF118u;
     }
