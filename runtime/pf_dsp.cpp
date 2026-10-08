@@ -77,7 +77,7 @@ struct Fifo {
 };
 
 // ---- the instruments ----------------------------------------------------------------------------
-enum Kind { NONE, MIXER, SAMPLER, VARMONO8, DCSQXDHALFMONO, DCSQXDHALFSTEREO, ENVELOPE };
+enum Kind { NONE, MIXER, SAMPLER, VARMONO8, DCSQXDHALFMONO, DCSQXDHALFSTEREO, ENVELOPE, FIXEDMONO, DIRECTOUT };
 
 struct Model {
     const char* file;
@@ -101,6 +101,8 @@ const Model kModels[] = {
     {"envelope.dsp", 0x70c12c2cu, ENVELOPE, 0},
     // 1993's code behind a test of its FIFO's status (SLEEP while it is empty)
     {"dcsqxdhalfmono.dsp", 0x7c904d9au, DCSQXDHALFMONO, 0, true},
+    {"fixedmonosample.dsp", 0x379b0cfau, FIXEDMONO, 0},
+    {"directout.dsp", 0x48203189u, DIRECTOUT, 0},
 };
 
 struct Input { int32_t src; uint32_t rsrc; };
@@ -124,6 +126,8 @@ struct Unit {
     int sbyte[2] = {-1, -1}, saccum[2] = {-1, -1}, stemp[2] = {-1, -1}, sprev[2] = {-1, -1}, sout[2] = {-1, -1};
     // envelope.dsp's
     int ecur = -1, esrc = -1, etgt = -1, ephase = -1, eincr = -1, ereq = -1;
+    // directout.dsp's
+    int ileft = -1, iright = -1;
     std::vector<int> in, left, right;
 };
 
@@ -378,6 +382,19 @@ void run_envelope(Unit& u) {
     m[(size_t)u.out] = cur;
 }
 
+// fixedmonosample.dsp (23.10): a word from the FIFO every frame, times Amplitude -- a sample at
+// the DSP's own rate, with no status test (an empty FIFO reads 0).
+void run_fixedmono(int32_t item, Unit& u) {
+    int16_t s = (int16_t)fifo_read(item, u, u.in_fifo);
+    u.mem[(size_t)u.out] = wb(mul(s, value(u, u.amp)));
+}
+
+// directout.dsp (23.10): InputLeft and InputRight added to the bus with CLIP, as a mixer's sums.
+void run_directout(Unit& u) {
+    g_bus_l = wb(add_clip(word(g_bus_l), word(value(u, u.ileft))));
+    g_bus_r = wb(add_clip(word(g_bus_r), word(value(u, u.iright))));
+}
+
 // One frame: head.dsp first (the bus to the DAC, and cleared), then the running instruments.
 void frame() {
     g_out.push_back(g_bus_l);
@@ -395,6 +412,8 @@ void frame() {
         case DCSQXDHALFMONO: run_dcsqxd(item, u); break;
         case DCSQXDHALFSTEREO: run_dcsqxd_stereo(item, u); break;
         case ENVELOPE: run_envelope(u); break;
+        case FIXEDMONO: run_fixedmono(item, u); break;
+        case DIRECTOUT: run_directout(u); break;
         case NONE: break;
         }
     }
@@ -488,6 +507,8 @@ void pf_dsp_new(int32_t ins, const std::string& file, const std::vector<std::str
     u.ephase = rsrc_named(u, "Env.phase");
     u.eincr = rsrc_named(u, "Env.incr");
     u.ereq = rsrc_named(u, "Env.request");
+    u.ileft = rsrc_named(u, "InputLeft");
+    u.iright = rsrc_named(u, "InputRight");
     for (int i = 0; i < u.inputs; ++i) {
         u.in.push_back(rsrc_named(u, "Input" + std::to_string(i)));
         u.left.push_back(rsrc_named(u, "LeftGain" + std::to_string(i)));

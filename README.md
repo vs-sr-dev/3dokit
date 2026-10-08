@@ -331,7 +331,9 @@ both discs:
   to the Immercenary title, 105 seconds -- with their sound (23.10's
   `dcsqxdhalfstereo`, `dcsqxdhalfmono`, `envelope` and `mixer2x2`
   transliterated), then shows its title and main menu ("New Jump") over its
-  credits, and on A unloads itself; `launchme` then asks for
+  credits, with the menu's music (`launchme`'s SoundSpooler streaming
+  `$Music/Intro.music` through 23.10's `fixedmonosample` and `directout`,
+  sample for sample the AIFF's), and on A unloads itself; `launchme` then asks for
   `LoadProgramPrio("$boot/p")`, 291,636 OS calls in. The
   emitter computes every flag it sets
   (no liveness pass yet), reads literal pools from memory rather than
