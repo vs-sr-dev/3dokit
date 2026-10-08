@@ -33,6 +33,28 @@ void write3(uint32_t a, const int32_t v[3]) {
     for (int i = 0; i < 3; ++i) pf_w32(a + 4 * i, (uint32_t)v[i]);
 }
 
+// swi 0x50000: void MulVec3Mat33_F16(vec3f16 dest, vec3f16 vec, mat33f16 mat) -- Doctor Hauzer's
+// OPERAMATH 20.53, which picks its tables as 20.27 does (0x534: Red 0x2cc8, Green 0x2d2c, else
+// 0x2c64): Green 0x1c50, the matrix's columns into the engine, the vector, one 3x3 product (and
+// MulManyVec3Mat33_F16 of one vector, 0x1ee4, goes there too).
+void m_mulvec3mat33(ArmCpu& c) {
+    int32_t m[9], v[3], out[3];
+    for (int i = 0; i < 9; ++i) m[i] = (int32_t)pf_r32(c.r[2] + 4 * i);
+    read3(c.r[1], v);
+    mul3(m, v, out);
+    write3(c.r[0], out);
+}
+
+// swi 0x5000c: frac16 Dot3_F16(vec3f16 v1, vec3f16 v2) -- 20.53's Green 0x18e0: v1 the engine's
+// first row, v2 its vector, a 3x3 product, and the first output: the 64-bit sum of the three
+// products shifted down 16.
+void m_dot3(ArmCpu& c) {
+    int32_t a[3], b[3];
+    read3(c.r[0], a);
+    read3(c.r[1], b);
+    c.r[0] = (uint32_t)(int32_t)(((int64_t)a[0] * b[0] + (int64_t)a[1] * b[1] + (int64_t)a[2] * b[2]) >> 16);
+}
+
 // swi 0x50002: void MulManyVec3Mat33_F16(vec3f16* dest, vec3f16* src, mat33f16 mat, int32 count)
 // -- Green 0x1ec4, Red 0x1dec: one vector (0x1c30) or a pipeline that reads vector k + 1 before it
 // writes result k, so dest may be src. A count below 1 runs the pipeline about 2^32 times on the
@@ -172,7 +194,9 @@ void m_mulsf16(ArmCpu& c) {
 } // namespace
 
 void pf_math_init() {
+    pf_on_swi(0x50000, m_mulvec3mat33);
     pf_on_swi(0x50002, m_mulmanyvec3mat33);
+    pf_on_swi(0x5000c, m_dot3);
     pf_on_swi(0x50007, m_mulvec4mat44);
     pf_on_swi(0x50008, m_mulmat44mat44);
     pf_on_swi(0x50009, m_mulmanyvec4mat44);

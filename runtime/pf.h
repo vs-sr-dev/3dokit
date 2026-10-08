@@ -268,7 +268,7 @@ int32_t  pf_delete_item_as_owner(ArmCpu& c, int32_t item);   // the kernel's vec
 int32_t  pf_signal(uint32_t task, uint32_t bits);   // the kernel's own SendSignal (pf_task.cpp)
 // The current task's AllocSignal, FreeSignal and WaitSignal (pf_task.cpp), for the OS's own use.
 uint32_t pf_alloc_signal(uint32_t sigs);
-int32_t  pf_free_signal(uint32_t sigs);
+int32_t  pf_free_signal(uint32_t sigs, uint32_t task = 0);   // 0: the current task
 int32_t  pf_wait_signal(uint32_t sigs);
 
 // Messages (pf_msg.cpp), as the 1993 kernel makes and passes them: CreateSizedItem of a MsgPort

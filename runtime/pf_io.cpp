@@ -396,8 +396,17 @@ static void sport_vbl(uint64_t) {
 // TIMERCMD_DELAYUNTIL (4, 0x217d4) first makes ioi_Offset the count less ioi_Offset -- the wrong
 // way round, so a time to come waits about 2^32 blanks -- and is then a DELAY. CMD_READ (1,
 // 0x21548) writes the count, high word first, to an aligned ioi_Recv of 8 bytes or more (else
-// BADIOARG); CMD_WRITE (0) is BADCOMMAND. Unit 1 and CMD_STATUS (2) stop the run: not yet.
-enum : uint32_t { TIMER_UNIT_VBLANK = 0, TIMERCMD_DELAY = 3, TIMERCMD_DELAYUNTIL = 4 };
+// BADIOARG); CMD_WRITE (0) is BADCOMMAND.
+//
+// CMD_READ on unit 1 (Doctor Hauzer's Operator 20.18, 0x21974: the same checks) asks the kernel
+// (its user function -42 by the Operator's numbering, 20.21's 0x1432c; 1993's 0x14ed4 and 23.10's
+// 0x46ac the same) for a timeval: CLIO's counters read with interrupts off (0x108a8), three in a
+// cascade that the kernel's start loads (0x14388) -- the lowest from 62499 down at 62,500 a second,
+// the two above it from 0xffff down at each of its turns -- the seconds the two above's turns
+// (their 32 bits inverted), the microseconds the lowest's steps into its turn shifted up by 4: in
+// steps of 16. Here the counters run from the guest clock's 0. Unit 1's other commands and
+// CMD_STATUS (2) stop the run: not yet.
+enum : uint32_t { TIMER_UNIT_VBLANK = 0, TIMER_UNIT_USEC = 1, TIMERCMD_DELAY = 3, TIMERCMD_DELAYUNTIL = 4 };
 
 static uint64_t g_vbl_count;                    // the blanks since the boot
 
@@ -407,7 +416,7 @@ static int32_t timer_dispatch(uint32_t ior) {
         pf_w32(ior + IO_ERROR, KERR_BADCOMMAND);
         return 1;
     }
-    if (unit != TIMER_UNIT_VBLANK || cmd == 2 || cmd > 4) {
+    if ((unit != TIMER_UNIT_VBLANK && !(unit == TIMER_UNIT_USEC && cmd == 1)) || cmd == 2 || cmd > 4) {
         std::fprintf(stderr, "timer: command %u on unit %u: not yet\n", cmd, unit);
         std::exit(3);
     }
@@ -417,8 +426,14 @@ static int32_t timer_dispatch(uint32_t ior) {
             pf_w32(ior + IO_ERROR, KERR_BADIOARG);
             return 1;
         }
-        pf_w32(buf, (uint32_t)(g_vbl_count >> 32));
-        pf_w32(buf + 4, (uint32_t)g_vbl_count);
+        if (unit == TIMER_UNIT_USEC) {
+            uint64_t steps = pf_now() / 16000;              // the lowest counter's, 16 us each
+            pf_w32(buf, (uint32_t)(steps / 62500));
+            pf_w32(buf + 4, (uint32_t)(steps % 62500) << 4);
+        } else {
+            pf_w32(buf, (uint32_t)(g_vbl_count >> 32));
+            pf_w32(buf + 4, (uint32_t)g_vbl_count);
+        }
         pf_w32(ior + IO_ACTUAL, 8);
         return 1;
     }

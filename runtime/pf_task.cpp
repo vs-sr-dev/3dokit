@@ -286,9 +286,11 @@ uint32_t pf_alloc_signal(uint32_t want) {
 }
 static void k_allocsignal(ArmCpu& c) { c.r[0] = pf_alloc_signal(c.r[0]); }
 
-// swi 0x10016: Err FreeSignal(int32 sigs) -- allocated bits only, not the system's.
-int32_t pf_free_signal(uint32_t sigs) {
-    uint32_t task = pf_current_task(), have = pf_r32(task + T_ALLOCATEDSIGS);
+// swi 0x10016: Err FreeSignal(int32 sigs) -- allocated bits only, not the system's. The kernel's
+// own, of any task's bits (20.21's 0x1910c; the SWI is it on the current task, 0x19140).
+int32_t pf_free_signal(uint32_t sigs, uint32_t task) {
+    if (!task) task = pf_current_task();
+    uint32_t have = pf_r32(task + T_ALLOCATEDSIGS);
     if ((sigs & 0x800000FFu) || (sigs & ~have)) return (int32_t)KERR_ILLEGALSIGNAL;
     pf_w32(task + T_ALLOCATEDSIGS, have & ~sigs);
     return 0;

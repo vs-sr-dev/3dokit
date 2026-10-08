@@ -546,7 +546,29 @@ void pf_kernel_init() {
     pf_on_slot(PF_KERNEL, -84, k_vfprintf);
     pf_err_init();
     pf_on_slot(PF_KERNEL, -128, k_itemopened);
-    // the folios a program finds by name: MKNODEID(KERNELNODE, FOLIONODE)
-    for (int f = PF_GRAPHICS; f < PF_NFOLIOS; ++f)
-        pf_item_new(pf_folio_base((PfFolio)f), 1, 4, g_pf_folio_names[f]);
+    // KernelBase's n_Version and n_Revision: the kernel's own image's 3DO header's, which its start
+    // copies there (20.21's 0x17818, from the header at 0x10080; 1993's 0x1818c and 23.10's 0x7cb0
+    // the same): 20.21 on Doctor Hauzer's disc, 0.0 on the 1993 one.
+    uint32_t kv = pf_os_code_version(0), kb = pf_folio_base(PF_KERNEL);
+    pf_w8(kb + 0x14, kv >> 8);
+    pf_w8(kb + 0x15, kv & 0xff);
+    // the folios a program finds by name: MKNODEID(KERNELNODE, FOLIONODE). Their n_Version and
+    // n_Revision: from the 20.21 kernel on, CreateItem of a folio (and of a driver or a device)
+    // gives a node that has none its creator's (20.21's 0x12254, after the folio's 0x171cc; 23.10's
+    // 0x244c the same), and no folio of the three discs names its own in its tags -- so each is its
+    // own task's, which is its image's 3DO header's (20.21's CreateTask, 0x168ac): Doctor Hauzer's
+    // File folio 20.30, GRAPHIX 20.45, AUDIOFOLIO 20.27, OPERAMATH 20.53. The 1993 kernel (0.0)
+    // does not (its CreateItem goes straight to the folio's, 0x12c3c), and its folios stay 0.0.
+    // (A program reads them: lib3DO's DataStream "kabongs" the drive only on a File folio 0.0.)
+    for (int f = PF_GRAPHICS; f < PF_NFOLIOS; ++f) {
+        uint32_t n = pf_folio_base((PfFolio)f);
+        pf_item_new(n, 1, 4, g_pf_folio_names[f]);
+        if (pf_os_code_version(0) < PF_VERSION(20, 21)) continue;
+        uint32_t v = f == PF_FILE       ? pf_os_code_version(2)
+                     : f == PF_GRAPHICS ? pf_system_version("/System/Folios/GRAPHIX")
+                     : f == PF_AUDIO    ? pf_system_version("/System/Folios/AUDIOFOLIO")
+                                        : pf_system_version("/System/Folios/OPERAMATH");
+        pf_w8(n + 0x14, v >> 8);
+        pf_w8(n + 0x15, v & 0xff);
+    }
 }

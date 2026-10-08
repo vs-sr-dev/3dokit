@@ -1748,10 +1748,18 @@ static uint32_t create_cue(ArmCpu& c, const Tags& tags) {
 
 // A cue deleted (0x4798): with a kernel of version 0x13 or below -- the 1993 one is version 0 --
 // its signal freed when the task deleting it owns it (FreeSignal, the deleter's own bits; its
-// result unread), else left; off the list when on it; its signal word 0.
+// result unread), else left; off the list when on it; its signal word 0. With a later kernel
+// (KernelBase's n_Version; Doctor Hauzer's AUDIOFOLIO 20.27, 0x4818) it is freed in its owner's
+// task whoever deletes it -- LookupItem of the owner, and when there is one the kernel's FreeSignal
+// of that task's bits (its result unread) -- as when a task is deleted with the cues it owns.
 static void delete_cue(int32_t item) {
     uint32_t n = pf_item_node(item);
-    if (pf_r32(n + 28) == task_item()) pf_free_signal(pf_r32(n + CUE_SIGNAL));
+    if (pf_r8(pf_folio_base(PF_KERNEL) + 0x14) > 0x13) {
+        if (uint32_t owner = pf_item_node((int32_t)pf_r32(n + 28)))
+            pf_free_signal(pf_r32(n + CUE_SIGNAL), owner);
+    } else if (pf_r32(n + 28) == task_item()) {
+        pf_free_signal(pf_r32(n + CUE_SIGNAL));
+    }
     if (pf_r32(n + TN_LIST)) {
         pf_list_rem_node(n);
         pf_w32(n + TN_LIST, 0);
@@ -1809,6 +1817,22 @@ static void a_sleepuntiltime(ArmCpu& c) {
     if ((int32_t)err < 0) { c.r[0] = err; return; }
     pf_wait_signal(cue_signal(cue));
     c.r[0] = 0;
+}
+
+// audio -20: Err SleepAudioTicks(int32 ticks) -- Doctor Hauzer's AUDIOFOLIO 20.27, 0x4408, in the
+// caller's task: CreateItem of a cue (MKNODEID(AUDIONODE, AUDIO_CUE_NODE), no tags), whose error
+// is the call's; SleepUntilTime of it at the folio's time (+0x9c) plus ticks (0x43d0, as -68
+// below); DeleteItem of the cue; SleepUntilTime's result.
+static void a_sleepaudioticks(ArmCpu& c) {
+    uint32_t ticks = c.r[0];
+    int32_t cue = (int32_t)audio_create(c, CUE_NODE, 0);
+    if (cue < 0) { c.r[0] = (uint32_t)cue; return; }
+    c.r[0] = (uint32_t)cue;
+    c.r[1] = pf_r32(folio() + AF_TIME) + ticks;
+    a_sleepuntiltime(c);
+    uint32_t err = c.r[0];
+    pf_delete_item(c, cue);
+    c.r[0] = err;
 }
 
 // The folio's FIRQ (0x3e90): the time up by 1; when a wake-up is wanted and has come (a signed
@@ -1890,6 +1914,7 @@ void pf_audio_init() {
     clock_init();
     pf_on_slot(PF_AUDIO, -60, a_getaudiorate);
     pf_on_slot(PF_AUDIO, -64, a_getaudioduration);
+    pf_on_slot(PF_AUDIO, -20, a_sleepaudioticks);
     pf_on_slot(PF_AUDIO, -68, a_sleepuntiltime);
     pf_on_slot(PF_AUDIO, -72, a_getcuesignal);
     pf_on_swi(0x4000d, a_signalattime);
