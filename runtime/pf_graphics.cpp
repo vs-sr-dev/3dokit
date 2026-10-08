@@ -77,7 +77,10 @@ static void graphics_vbl(uint64_t when) {
 // one bits 29-30 name) into the CLUT, which stays from entry to entry. A line with video DMA reads
 // 320 pixels from the buffer in the 3DO's line pairs (two lines in a word, the even one in the
 // high half; the pair after the next 1,280 bytes on) and gives each 5-bit channel its CLUT entry's
-// colour. Lines without video DMA are left out, so the VIRS line comes first. Not modelled: the
+// colour. The picture starts at the pre-display entry: the lines before it are the system's in the
+// vertical blank -- among them the VIRS line (the full entry over the VIRS page: the TV's
+// vertical-interval reference, black, pen 1's yellow, pen 2's grey), which no TV shows -- and
+// lines without video DMA are left out, so a screen of 240 lines gives 240. Not modelled: the
 // display control words (interpolation, the background and transparency, bit 15 of a pixel),
 // other widths, a relative link.
 const char* g_pf_frames_dir;
@@ -85,15 +88,16 @@ uint32_t g_pf_frames_first = 0, g_pf_frames_last = 0xFFFFFFFFu, g_pf_frames_ever
 static std::vector<uint8_t> g_last_frame;
 
 static bool display_field(std::vector<uint8_t>& rgb, int& lines) {
-    uint32_t first = graf(GF_VDLFORCEDFIRST), e = first;
+    uint32_t first = graf(GF_VDLFORCEDFIRST), pre = graf(GF_VDLPREDISPLAY), e = first;
     uint8_t clut[32][3] = {};
     uint32_t cur = 0;
-    bool odd = false;
+    bool odd = false, picture = false;
     rgb.clear();
     lines = 0;
     for (int entries = 0; entries < 256; ++entries) {
         uint32_t w0 = pf_r32(e), n = w0 & 0x1ff, len = (w0 >> 9) & 0x3f;
         if (w0 & 0x00040000u) return false;                 // VDL_RELSEL
+        if (e == pre) picture = true;
         if (w0 & 0x00010000u) { cur = pf_r32(e + 4); odd = false; }
         for (uint32_t i = 0; i < len; ++i) {
             uint32_t v = pf_r32(e + 16 + 4 * i);
@@ -103,7 +107,7 @@ static bool display_field(std::vector<uint8_t>& rgb, int& lines) {
             for (int k = 0; k < 3; ++k)
                 if (sel == 0 || sel == 3 - (uint32_t)k) clut[pen][k] = ch[k];
         }
-        for (uint32_t l = 0; l < n && (w0 & 0x00200000u); ++l) {
+        for (uint32_t l = 0; l < n && (w0 & 0x00200000u) && picture; ++l) {
             if (++lines > 512) return false;
             for (uint32_t x = 0; x < 320; ++x) {
                 uint32_t w = pf_r32(cur + 4 * x), p = odd ? w & 0xffff : w >> 16;
@@ -605,7 +609,48 @@ static void set_clip_size(ArmCpu& c, bool height) {
 static void g_setclipwidth(ArmCpu& c) { set_clip_size(c, false); }
 static void g_setclipheight(ArmCpu& c) { set_clip_size(c, true); }
 
+// GRAPHIX's division (0x424, Norcroft's __rt_sdiv unrolled): n / d truncated toward zero, the
+// quotient's bits 30 to 0 found by restoring subtraction on the magnitudes -- so d = 0 gives
+// 0x7FFFFFFF with the sign of n, and nothing stops.
+static uint32_t graphix_sdiv(uint32_t d, uint32_t n) {
+    bool neg_n = n >= 0x80000000u, neg_q = ((d ^ n) >> 31) != 0;
+    uint32_t r = neg_n ? 0u - n : n, dd = d >= 0x80000000u ? 0u - d : d, q = 0;
+    for (int k = 30; k >= 0; --k) {
+        bool take = (r >> k) >= dd;
+        if (take) r -= dd << k;
+        q = q << 1 | (take ? 1u : 0u);
+    }
+    return neg_q ? 0u - q : q;
+}
+
+// Graphics -4: void MapCel(CCB* ccb, Point quad[4]) -- GRAPHIX 0x14f4: the cel's corner at the
+// quad's first point (x and y the low 16 bits of each, as 16.16 with 0x8000 added), its first row
+// along quad[1] - quad[0] by ccb_Width (HDX, HDY: 12.20), its first column along quad[3] -
+// quad[0] by ccb_Height (VDX, VDY: 16.16), and the rows' change along quad[2] - quad[3] -
+// quad[1] + quad[0] by width times height (HDDX, HDDY: 12.20). r0 is left as the last quotient.
+enum : uint32_t {
+    CCB_XPOS = 0x10, CCB_YPOS = 0x14, CCB_HDX = 0x18, CCB_HDY = 0x1c, CCB_VDX = 0x20, CCB_VDY = 0x24,
+    CCB_HDDX = 0x28, CCB_HDDY = 0x2c, CCB_WIDTH = 0x3c, CCB_HEIGHT = 0x40,
+};
+static void g_mapcel(ArmCpu& c) {
+    uint32_t ccb = c.r[0], q = c.r[1];
+    auto x = [q](int i) { return pf_r32(q + 8u * i); };
+    auto y = [q](int i) { return pf_r32(q + 8u * i + 4); };
+    uint32_t w = pf_r32(ccb + CCB_WIDTH), h = pf_r32(ccb + CCB_HEIGHT);
+    pf_w32(ccb + CCB_XPOS, (x(0) & 0xFFFFu) << 16 | 0x8000u);
+    pf_w32(ccb + CCB_YPOS, (y(0) & 0xFFFFu) << 16 | 0x8000u);
+    pf_w32(ccb + CCB_HDX, graphix_sdiv(w, (x(1) - x(0)) << 20));
+    pf_w32(ccb + CCB_HDY, graphix_sdiv(w, (y(1) - y(0)) << 20));
+    pf_w32(ccb + CCB_VDX, graphix_sdiv(h, (x(3) - x(0)) << 16));
+    pf_w32(ccb + CCB_VDY, graphix_sdiv(h, (y(3) - y(0)) << 16));
+    pf_w32(ccb + CCB_HDDX, graphix_sdiv(w * h, (x(2) - x(3) - x(1) + x(0)) << 20));
+    uint32_t hddy = graphix_sdiv(w * h, (y(2) - y(3) - y(1) + y(0)) << 20);
+    pf_w32(ccb + CCB_HDDY, hddy);
+    c.r[0] = hddy;
+}
+
 static void graphics_slots() {
+    pf_on_slot(PF_GRAPHICS, -4, g_mapcel);
     pf_on_slot(PF_GRAPHICS, -48, g_createscreengroup);
     pf_on_slot(PF_GRAPHICS, -60, g_setcliporigin);
     pf_on_slot(PF_GRAPHICS, -112, g_setclipwidth);
