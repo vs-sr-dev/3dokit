@@ -18,6 +18,8 @@
 // after it; a SWI simply goes on.
 #pragma once
 #include "arm60.h"
+#include <array>
+#include <map>
 #include <string>
 #include <vector>
 
@@ -326,8 +328,24 @@ void     pf_math_init();
 // folio's side of it is pf_audio.cpp's; the folio's addresses in the comments are its own.
 enum : uint32_t { PF_DSP_SILENCE = 0xFFFFFFFFu };   // the folio's 32 bytes of silence, as a chunk's address
 void     pf_dsp_init();
-void     pf_dsp_new(int32_t ins, const std::string& file, const std::vector<std::string>& rsrc_names,
-                    const std::vector<uint8_t>& code, uint8_t priority);
+// A .dsp file's code as the folio places it: DCOD's words (big-endian) and DRLC's relocations,
+// each {mask, 0, resource, code word}.
+struct PfDspCode {
+    std::vector<uint8_t> words;
+    std::vector<std::array<uint32_t, 4>> relocs;
+};
+struct PfDspTemplate {
+    std::string file;                   // as the program named it
+    std::vector<std::string> names;     // DRSC's resources, named by DNMS
+    std::vector<uint32_t> types, counts;
+    PfDspCode code;
+    // By an importing resource (type 0x8000): the code of the file that exports it, and where in
+    // that code the subroutine starts.
+    std::map<uint32_t, std::pair<PfDspCode, uint32_t>> imports;
+};
+void     pf_dsp_new(int32_t ins, const PfDspTemplate& t, uint8_t priority);
+extern bool g_pf_dsp_code;              // pfboot --dsp-code: every instrument through the interpreter
+extern bool g_pf_dsp_check;             // pfboot --dsp-check: every model against its code, each frame
 void     pf_dsp_write(int32_t ins, uint32_t rsrc, int32_t value);    // a knob's value into DSP memory
 void     pf_dsp_connect(int32_t src, uint32_t src_rsrc, int32_t dst, uint32_t dst_rsrc);
 void     pf_dsp_disconnect(int32_t dst, uint32_t dst_rsrc);

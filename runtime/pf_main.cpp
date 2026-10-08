@@ -3,7 +3,7 @@
 //
 //     pfboot PROGRAM [--trace N] [--lenient] [--max-calls N] [--snap N DIR] [--disc DIR]
 //                    [--frames DIR [--frames-at FIRST[-LAST][/EVERY]]] [--pad BUTTONS@FIELD[xN][/E][+H]]...
-//                    [--window [--record FILE]] [--wav FILE]
+//                    [--window [--record FILE]] [--wav FILE] [--dsp-code] [--dsp-check]
 //
 // PROGRAM is the AIF file the build was recompiled from (its module must be
 // in this build). --trace 0 is quiet, 1 (the default) every OS call, 2 also
@@ -27,6 +27,11 @@
 // writes the presses made there as --pad options that replay them. The
 // window plays the sound too; --wav FILE writes it (44,100 Hz, 16-bit
 // stereo), in the guest's time: the same for every run of the same pad.
+// The DSP's instruments play by their native models where one was written,
+// else from their own code through the DSP's interpreter (pf_dsp.cpp);
+// --dsp-code plays every one from its code, and --dsp-check runs each
+// model's frame from its code as well and says, at the end, how many frames
+// the two did not agree on.
 //
 //     pfboot PROGRAM --memtest DIR [--ops N] [--seed S]
 //
@@ -163,6 +168,8 @@ int main(int argc, char** argv) {
             }
         }
         else if (!std::strcmp(argv[i], "--window")) window = true;
+        else if (!std::strcmp(argv[i], "--dsp-code")) g_pf_dsp_code = true;
+        else if (!std::strcmp(argv[i], "--dsp-check")) g_pf_dsp_check = true;
         else if (!std::strcmp(argv[i], "--boot")) boot = true;
         else if (!std::strcmp(argv[i], "--record") && i + 1 < argc) record = argv[++i];
         else if (!std::strcmp(argv[i], "--wav") && i + 1 < argc) {

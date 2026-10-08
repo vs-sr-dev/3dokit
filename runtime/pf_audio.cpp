@@ -88,7 +88,8 @@ struct Template {
     std::string path;                       // as the program named it
     std::vector<DspRsrc> rsrc;
     std::vector<DspKnob> knobs;
-    std::vector<uint8_t> code;              // DCOD's words, past its 3-word header
+    PfDspCode code;                         // DCOD's words, past its 3-word header, and DRLC
+    std::map<uint32_t, std::pair<PfDspCode, uint32_t>> imports;     // as PfDspTemplate's
 };
 
 static uint32_t be32(const std::vector<uint8_t>& d, size_t o) {
@@ -113,7 +114,12 @@ static bool parse_dsp(const std::vector<uint8_t>& d, Template& t) {
     if (!ch.count("DRSC") || !ch.count("DNMS")) return false;
     if (ch.count("DCOD")) {
         auto [ca, cb] = ch["DCOD"];
-        if (ca + 12 <= cb) t.code.assign(d.begin() + (long)ca + 12, d.begin() + (long)cb);
+        if (ca + 12 <= cb) t.code.words.assign(d.begin() + (long)ca + 12, d.begin() + (long)cb);
+    }
+    if (ch.count("DRLC")) {
+        auto [la, lb] = ch["DRLC"];
+        for (size_t o = la; o + 16 <= lb; o += 16)
+            t.code.relocs.push_back({be32(d, o), be32(d, o + 4), be32(d, o + 8), be32(d, o + 12)});
     }
     auto [ra, rb] = ch["DRSC"];
     auto [na, nb] = ch["DNMS"];
@@ -246,7 +252,10 @@ static std::string guest_string(uint32_t a) {
 // The knob's value, as the folio's tweak (0x9780) computes and writes it: per target, the value
 // through its calculation (cooked only; 0 or raw: as it is; 1: v * a + b; 2: v * a / b;
 // 3: v / the sample rate), the first target's result clamped to the knob's [min, max] and then
-// the value the later targets start from; each target's resource must be a knob's.
+// the value the later targets start from; each target's resource must be a knob's. 23.10's
+// (0x95f4) has a fifth: 4, v * 2^a / the sample rate -- a frequency to a phase step a bits up
+// (Immercenary's BadSpire.ins, 8) -- shifted before the division when v * 2^a fits, else after it.
+// Both folios divide with the compiler's signed division, which truncates.
 static uint32_t tweak(ArmCpu& c, Instrument& ins, const Template& t, const DspKnob& k, int32_t v, bool cooked) {
     for (size_t i = 0; i < k.to.size(); ++i) {
         const auto& e = k.to[i];
@@ -257,6 +266,9 @@ static uint32_t tweak(ArmCpu& c, Instrument& ins, const Template& t, const DspKn
                 int32_t num = e.calc == 2 ? v * e.a : v, den = e.calc == 2 ? e.b : kSampleRate;
                 if (!den) pf_stop(c, "a knob's calculation divides by zero");
                 w = num / den;
+            } else if (e.calc == 4 && e.a >= 0 && e.a < 31) {
+                bool fits = v <= (int32_t)(0xFFFFFFFFu >> (e.a + 1));
+                w = fits ? (int32_t)((uint32_t)v << e.a) / kSampleRate : (int32_t)((uint32_t)(v / kSampleRate) << e.a);
             } else return AF_ERR_BADCALCTYPE;
         }
         if (i == 0) {
@@ -345,9 +357,13 @@ static uint32_t create_instrument(ArmCpu& c, const Tags& tags) {
         if (uint32_t err = tweak(c, ins, t, k, k.dflt, false)) return err;
     int32_t item = audio_item(INSTRUMENT_NODE, (uint8_t)pri);
     ins.self = item;
-    std::vector<std::string> names;
-    for (const auto& r : t.rsrc) names.push_back(r.name);
-    pf_dsp_new(item, t.path, names, t.code, (uint8_t)pri);
+    PfDspTemplate dt{t.path, {}, {}, {}, t.code, t.imports};
+    for (const auto& r : t.rsrc) {
+        dt.names.push_back(r.name);
+        dt.types.push_back(r.type);
+        dt.counts.push_back(r.count);
+    }
+    pf_dsp_new(item, dt, (uint8_t)pri);
     for (auto [r, v] : ins.value) pf_dsp_write(item, r, v);
     g_instruments[item] = std::move(ins);
     return (uint32_t)item;
@@ -969,6 +985,28 @@ static std::string iff_host_path(const std::string& name) {
     return pf_host_path(("$audio/" + name).c_str());
 }
 
+// The subroutines an instrument imports (a resource of type 0x8000: sampler.dsp's OscUpDownFP),
+// for the DSP's interpreter: each from the file named after it in lower case, "oscupdownfp.dsp",
+// found as above, which exports it (type 0x4000, the resource's count its offset in the code).
+// That is where the library keeps them; how the folio finds them is not read. One not found is
+// left out, and the interpreter will not run the instrument.
+static void load_imports(Template& t) {
+    for (size_t i = 0; i < t.rsrc.size(); ++i) {
+        if (t.rsrc[i].type != 0x8000) continue;
+        std::string file = t.rsrc[i].name;
+        for (char& ch : file) ch = (char)std::tolower((unsigned char)ch);
+        std::string host = iff_host_path(file + ".dsp");
+        if (host.empty()) continue;
+        std::ifstream f(host, std::ios::binary);
+        std::vector<uint8_t> d((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
+        Template sub;
+        if (!parse_dsp(d, sub)) continue;
+        for (const auto& r : sub.rsrc)
+            if (r.type == 0x4000 && same_name(r.name, t.rsrc[i].name.c_str()))
+                t.imports[(uint32_t)i] = {sub.code, r.count};
+    }
+}
+
 static void a_loadinstemplate(ArmCpu& c) {
     if (!audio_open()) { c.r[0] = AF_ERR_AUDIOCLOSED; return; }
     if (c.r[1]) { c.r[0] = AF_ERR_BADITEM; return; }
@@ -980,6 +1018,7 @@ static void a_loadinstemplate(ArmCpu& c) {
     Template t;
     t.path = name;
     if (!parse_dsp(d, t)) pf_stop(c, "LoadInsTemplate: not a DSP instrument this runtime can read");
+    load_imports(t);
     c.r[0] = (uint32_t)make_template(std::move(t));
 }
 

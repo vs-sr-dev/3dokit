@@ -67,6 +67,9 @@ target's result to [min, max], and writes it; `TweakRawKnob` skips the
 calculation, and a new instrument's knobs start at their defaults that
 way. Type 3 is the oscillators' `Frequency`; the 24.225 library's type 4
 (`square_lfo`, `triangle_lfo`, `pulse_lfo`) is one the 1993 folio refuses.
+23.10's folio (0x95f4) computes it as `v * 2**a / 44100` -- a frequency to a
+phase step `a` bits up (Immercenary's own `BadSpire.ins`, 8), shifted before
+the division when `v * 2**a` fits, else after it.
 
 The relocations come in two kinds, told apart by the mask word: with bit
 17 (0x20a00, a resource's address) the code word's low ten bits are the
