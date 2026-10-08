@@ -544,6 +544,7 @@ void pf_kernel_init() {
     pf_on_slot(PF_KERNEL, -56, k_memcpy);
     pf_on_slot(PF_KERNEL, -64, k_checkitem);
     pf_on_slot(PF_KERNEL, -84, k_vfprintf);
+    pf_err_init();
     pf_on_slot(PF_KERNEL, -128, k_itemopened);
     // the folios a program finds by name: MKNODEID(KERNELNODE, FOLIONODE)
     for (int f = PF_GRAPHICS; f < PF_NFOLIOS; ++f)

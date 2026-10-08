@@ -314,6 +314,7 @@ std::string pf_aif_unpack(const std::vector<uint8_t>& file, std::vector<uint8_t>
 
 // The folios' handlers register themselves here.
 void     pf_kernel_init();
+void     pf_err_init();                     // GetSysErr and the folios' error texts (pf_err.cpp)
 uint32_t pf_clio_rand_sample();                     // CLIO's RandSample, 0x0340003C
 void     pf_msg_init();
 void     pf_event_init();
