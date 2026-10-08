@@ -295,9 +295,16 @@ const char* pf_pad_button_name(uint32_t bit);
 // matched without case. The host path, or "" when there is no such file.
 extern std::string g_pf_disc_root;
 std::string pf_host_path(const char* path);
-// The disc's OS release (its os_code's 3DO header version: 23 for 23.10, 0 for 1993's), for where
-// a later folio differs from the 1993 one the runtime follows.
+// The disc's OS release (its os_code's 3DO header version: 23 for 23.10, 20 for 20.21, 0 for
+// 1993's, which has no header), for where a later folio differs from the 1993 one the runtime
+// follows.
 uint32_t pf_os_release();
+// One System image's own version, from its 3DO header (+0x80 + 0x14, version and revision):
+// PF_VERSION(20, 45) for Doctor Hauzer's GRAPHIX; 0 when the disc has no such file. Each folio
+// carries its own (1993's GRAPHIX is 20.31, 1994's 20.45, 23.10's 23.10), and where a folio
+// changed between them its own version is what says which way the runtime goes.
+#define PF_VERSION(v, r) (((uint32_t)(v) << 8) | (uint32_t)(r))
+uint32_t pf_system_version(const char* path);
 
 // The folios' handlers register themselves here.
 void     pf_kernel_init();

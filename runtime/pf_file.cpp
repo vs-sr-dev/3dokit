@@ -1209,9 +1209,9 @@ int pf_shell_boot(int (*run)(const std::string& host)) {
 }
 
 // The disc's OS release: the version byte of its System/Kernel/os_code's 3DO header (the AIF after
-// the 16-byte boot header, +0x80 + 0x14) -- 23 on Immercenary's disc (23.10), 0 on Crash 'n Burn's
-// (1993); 0 when the disc has none. Where a later folio differs from the 1993 one the runtime
-// follows, the release says which.
+// the 16-byte boot header, +0x80 + 0x14) -- 23 on Immercenary's disc (23.10), 20 on Doctor
+// Hauzer's (20.21), 0 on Crash 'n Burn's (1993, whose kernel has no header); 0 when the disc has
+// none. Where a later folio differs from the 1993 one the runtime follows, the release says which.
 uint32_t pf_os_release() {
     static std::string s_root;
     static uint32_t s_release;
@@ -1227,6 +1227,26 @@ uint32_t pf_os_release() {
         }
     }
     return s_release;
+}
+
+uint32_t pf_system_version(const char* path) {
+    static std::string s_root;
+    static std::map<std::string, uint32_t> s_versions;
+    if (s_root != g_pf_disc_root) {
+        s_root = g_pf_disc_root;
+        s_versions.clear();
+    }
+    auto it = s_versions.find(path);
+    if (it != s_versions.end()) return it->second;
+    uint32_t version = 0;
+    std::string host = pf_host_path(path);
+    if (!host.empty()) {
+        std::ifstream f(host, std::ios::binary);
+        f.seekg(0x94);
+        unsigned char v[2] = {0, 0};
+        if (f.read((char*)v, 2)) version = PF_VERSION(v[0], v[1]);
+    }
+    return s_versions[path] = version;
 }
 
 void pf_file_init() {

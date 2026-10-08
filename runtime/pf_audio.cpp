@@ -43,7 +43,17 @@ enum : uint32_t {
 };
 // The folio's node database (CREATEFOLIO_TAG_NODEDATABASE): a size and n_Flags per node type,
 // 0x90 being NODE_ITEMVALID | NODE_NAMEVALID.
+// Each version's own: 1993's AUDIOFOLIO 20.19 (0xc04c), 20.27 (0xbf94: an instrument 0x64, type 6
+// 0x78) and 23.10 (0xb9e8: a template 0x70, an instrument 0x64, a sample 0x9c, type 6 0x78); the
+// versions between are unread. A node is made that size and cleared; the runtime fills the fields
+// it reads in the 1993 folio.
 static const uint32_t kNodeSize[] = {0, 0x54, 0x58, 0x34, 0x98, 0x38, 0x74, 0x54, 0x34};
+static const uint32_t kNodeSize2027[] = {0, 0x54, 0x64, 0x34, 0x98, 0x38, 0x78, 0x54, 0x34};
+static const uint32_t kNodeSize2310[] = {0, 0x70, 0x64, 0x34, 0x9c, 0x38, 0x78, 0x54, 0x34};
+static uint32_t node_size(uint32_t type) {
+    uint32_t v = pf_system_version("/System/Folios/AUDIOFOLIO");
+    return (v >= PF_VERSION(23, 10) ? kNodeSize2310 : v >= PF_VERSION(20, 27) ? kNodeSize2027 : kNodeSize)[type];
+}
 static const uint32_t kNodeFlags = 0x90;
 
 // The folio's errors (audio.h's MAKEAERR: AF_ERR_*).
@@ -234,8 +244,8 @@ static bool audio_open() { return pf_item_opened((int32_t)task_item(), audio_fol
 
 // A node of the folio's for the caller (the kernel's CreateItem with the node database's entry).
 static int32_t audio_item(uint32_t type, uint8_t pri = 0) {
-    uint32_t n = pf_os_alloc(kNodeSize[type]);
-    pf_w32(n + 12, kNodeSize[type]);
+    uint32_t n = pf_os_alloc(node_size(type));
+    pf_w32(n + 12, node_size(type));
     int32_t item = pf_item_new(n, NST_AUDIO, (int)type, nullptr);
     pf_w8(n + 10, pri);
     pf_w8(n + 11, kNodeFlags);

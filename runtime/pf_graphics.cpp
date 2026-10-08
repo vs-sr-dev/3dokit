@@ -23,6 +23,13 @@ enum : uint32_t {
     VDL_SCREENPTR = 0x24, VDL_DATAPTR = 0x28, VDL_TYPE = 0x2c, VDL_DATASIZE = 0x30,
 };
 static const uint32_t kNodeSize[] = {0, 0x54, 0x7c, 0x84, 0x34};
+// GRAPHIX 20.45 (0x6698) and 23.10 (0x762c) make a ScreenGroup of 0x74 bytes and a VDL of 0x44, the
+// fields the later headers add; the runtime makes them that size, cleared, and fills only the 1993
+// fields. (Their fifth type, 0x1c bytes, is not made here.)
+static const uint32_t kNodeSizeLater[] = {0, 0x74, 0x7c, 0x84, 0x44};
+static uint32_t node_size(uint32_t type) {
+    return pf_system_version("/System/Folios/GRAPHIX") >= PF_VERSION(20, 45) ? kNodeSizeLater[type] : kNodeSize[type];
+}
 
 // The folio's errors (graphics.h's GRAFERR_*, the values GRAPHIX builds).
 enum : uint32_t {
@@ -233,8 +240,8 @@ static void system_vdls() {
 // A node of the folio's, made for the current task (CreateSizedItem in the folio's SWIs): the
 // kernel's own memory, cleared, n_Size from the node database, the task its owner.
 static int32_t graf_item(uint32_t type) {
-    uint32_t n = pf_os_alloc(kNodeSize[type]);
-    pf_w32(n + 12, kNodeSize[type]);
+    uint32_t n = pf_os_alloc(node_size(type));
+    pf_w32(n + 12, node_size(type));
     int32_t item = pf_item_new(n, NST_GRAPHICS, (int)type, nullptr);
     pf_w32(n + 28, task_item());                            // n_Owner
     return item;
@@ -408,8 +415,10 @@ static void g_createscreengroup(ArmCpu& c) {
     // No buffers given: the user half allocates them, and a table of them. 23.10's (graphix 0x4320)
     // then has the folio mark each bitmap's buffer as its own (bm_SysMalloc, 0x3684), which
     // DeleteScreenGroup gives back, and gives the table back once the group is made (0x46e0) --
-    // even when it was not; the 1993 folio does neither.
-    bool later = pf_os_release() >= 23;
+    // even when it was not; the 1993 folio (GRAPHIX 20.31) does neither. 1994's 20.45 does both,
+    // as 23.10 (0x4104, the table at 0x44c4, bm_SysMalloc at 0x351c); the versions between are
+    // unread.
+    bool later = pf_system_version("/System/Folios/GRAPHIX") >= PF_VERSION(20, 45);
     uint32_t lists = pf_r32(pf_current_task() + T_FREEMEMORYLISTS), table = 0;
     int32_t table_size = (int32_t)((uint32_t)(bitmaps * screens) << 2);
     auto give_table_back = [&] { if (table && later) pf_free_mem(lists, table, table_size); };
