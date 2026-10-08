@@ -1,5 +1,5 @@
-// 3dokit runtime -- pfboot's window (SDL3): what the display shows, the host's keyboard and a
-// gamepad as the first Control Pad, and the guest's clock held to the host's.
+// 3dokit runtime -- pfboot's window (SDL3): what the display shows, the sound the DSP makes, the
+// host's keyboard and a gamepad as the first Control Pad, and the guest's clock held to the host's.
 //
 // The program runs on a thread of its own (its tasks on theirs, pf_task.cpp) and the window on the
 // host's main thread, as SDL wants. At each vertical blank the program's thread hands the window
@@ -40,6 +40,22 @@ int g_lines;
 uint64_t g_seq;
 std::atomic<bool> g_done{false};
 int g_result;
+SDL_AudioStream* g_audio;
+
+// The sound (pf_dsp.cpp), from the program's thread, as it is made: the guest's clock is held to
+// the host's, so it comes at the rate it plays, a field's worth at a time -- the first time behind
+// 60 ms of silence, which the stream keeps as its margin; past half a second queued (the host
+// having held the guest back less than it plays) the queue starts again.
+void window_audio(const int16_t* lr, size_t frames) {
+    static bool primed;
+    if (!primed) {
+        primed = true;
+        static const int16_t quiet[2 * 2646] = {};
+        SDL_PutAudioStreamData(g_audio, quiet, sizeof quiet);
+    }
+    if (SDL_GetAudioStreamQueued(g_audio) > 44100 * 4 / 2) SDL_ClearAudioStream(g_audio);
+    SDL_PutAudioStreamData(g_audio, lr, (int)(frames * 4));
+}
 
 using Clock = std::chrono::steady_clock;
 Clock::time_point g_host0;
@@ -117,6 +133,17 @@ int pf_window_run(const char* title, const char* record, const std::function<int
         std::fprintf(stderr, "--window: %s\n", SDL_GetError());
         return 2;
     }
+    // The sound: 44,100 Hz, 16-bit stereo, as the DSP makes it. Without an audio device the run goes
+    // on silent.
+    if (SDL_InitSubSystem(SDL_INIT_AUDIO)) {
+        const SDL_AudioSpec spec = {SDL_AUDIO_S16, 2, 44100};
+        g_audio = SDL_OpenAudioDeviceStream(SDL_AUDIO_DEVICE_DEFAULT_PLAYBACK, &spec, nullptr, nullptr);
+        if (g_audio) {
+            SDL_ResumeAudioStreamDevice(g_audio);
+            g_pf_audio_out = window_audio;
+        }
+    }
+    if (!g_audio) std::fprintf(stderr, "--window: no sound (%s)\n", SDL_GetError());
     SDL_Window* win = nullptr;
     SDL_Renderer* ren = nullptr;
     if (!SDL_CreateWindowAndRenderer(title, 960, 720, SDL_WINDOW_RESIZABLE, &win, &ren)) {
@@ -184,6 +211,10 @@ int pf_window_run(const char* title, const char* record, const std::function<int
     program.join();
     if (pad) SDL_CloseGamepad(pad);
     if (tex) SDL_DestroyTexture(tex);
+    if (g_audio) {
+        g_pf_audio_out = nullptr;
+        SDL_DestroyAudioStream(g_audio);
+    }
     SDL_DestroyRenderer(ren);
     SDL_DestroyWindow(win);
     SDL_Quit();

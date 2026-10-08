@@ -303,6 +303,31 @@ void     pf_graphics_init();
 void     pf_audio_init();
 void     pf_math_init();
 
+// The DSP (pf_dsp.cpp): the audio folio's instruments as native code, run a sample frame at a
+// time in the guest's time, the DMA channels that feed their FIFOs, and the sound they make. The
+// folio's side of it is pf_audio.cpp's; the folio's addresses in the comments are its own.
+enum : uint32_t { PF_DSP_SILENCE = 0xFFFFFFFFu };   // the folio's 32 bytes of silence, as a chunk's address
+void     pf_dsp_init();
+void     pf_dsp_new(int32_t ins, const std::string& file, const std::vector<std::string>& rsrc_names,
+                    const std::vector<uint8_t>& code, uint8_t priority);
+void     pf_dsp_write(int32_t ins, uint32_t rsrc, int32_t value);    // a knob's value into DSP memory
+void     pf_dsp_connect(int32_t src, uint32_t src_rsrc, int32_t dst, uint32_t dst_rsrc);
+void     pf_dsp_disconnect(int32_t dst, uint32_t dst_rsrc);
+void     pf_dsp_run(int32_t ins, bool on);                           // into the DSP's program, or out
+void     pf_dsp_delete(int32_t ins);
+void     pf_dsp_dma(int32_t ins, uint32_t rsrc, uint32_t addr, uint32_t bytes, uint32_t next, uint32_t next_bytes);
+void     pf_dsp_dma_next(int32_t ins, uint32_t rsrc, uint32_t next, uint32_t next_bytes);
+void     pf_dsp_dma_stop(int32_t ins, uint32_t rsrc);
+void     pf_dsp_dma_waiting(int32_t ins, uint32_t rsrc, uint32_t addr, uint32_t bytes);
+void     pf_dsp_dma_arm(int32_t ins, uint32_t rsrc);
+void     pf_dsp_dma_quiet(int32_t ins, uint32_t rsrc);
+void     pf_dsp_sync();                     // every frame up to the guest's present
+bool     pf_dsp_wav(const char* path);      // pfboot --wav
+// The folio's daemon, when an armed FIFO's chunk has run out (AUDIOFOLIO 0x5cc0).
+extern void (*g_pf_dsp_ended)(int32_t ins, uint32_t rsrc);
+// Where the sound goes besides a WAV (pfboot's window): frames of left and right, 44,100 a second.
+extern void (*g_pf_audio_out)(const int16_t* lr, size_t frames);
+
 // What the display shows (pf_graphics.cpp): with g_pf_frames_dir set, at each vertical blank
 // the field the VDLs describe, as a PPM in that directory whenever it differs from the last one
 // written (vblNNNNNN.ppm, by gf_VBLNumber). A diagnostic, not the display. Only the fields from

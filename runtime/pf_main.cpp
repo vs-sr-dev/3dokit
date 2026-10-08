@@ -3,7 +3,7 @@
 //
 //     pfboot PROGRAM [--trace N] [--lenient] [--max-calls N] [--snap N DIR] [--disc DIR]
 //                    [--frames DIR [--frames-at FIRST[-LAST][/EVERY]]] [--pad BUTTONS@FIELD[xN][/E][+H]]...
-//                    [--window [--record FILE]]
+//                    [--window [--record FILE]] [--wav FILE]
 //
 // PROGRAM is the AIF file the build was recompiled from (its module must be
 // in this build). --trace 0 is quiet, 1 (the default) every OS call, 2 also
@@ -24,7 +24,9 @@
 // 7600 to 8199). --pad may be given more than once (pf_event.cpp). --window
 // (a pfboot built with SDL3) shows the display in a window, in real time, with
 // the keyboard and a gamepad as the pad as well (pf_window.cpp); --record FILE
-// writes the presses made there as --pad options that replay them.
+// writes the presses made there as --pad options that replay them. The
+// window plays the sound too; --wav FILE writes it (44,100 Hz, 16-bit
+// stereo), in the guest's time: the same for every run of the same pad.
 //
 //     pfboot PROGRAM --memtest DIR [--ops N] [--seed S]
 //
@@ -127,7 +129,7 @@ int main(int argc, char** argv) {
     if (argc < 2) {
         std::fprintf(stderr, "usage: pfboot PROGRAM [--trace N] [--lenient] [--max-calls N] [--snap N DIR] [--disc DIR]\n"
                              "                      [--frames DIR [--frames-at FIRST[-LAST][/EVERY]]]\n"
-                             "                      [--pad BUTTONS@FIELD[xN][/E][+H]]... [--window [--record FILE]]\n"
+                             "                      [--pad BUTTONS@FIELD[xN][/E][+H]]... [--window [--record FILE]] [--wav FILE]\n"
                              "       pfboot PROGRAM --memtest DIR [--ops N] [--seed S]\n"
                              "       pfboot DISC --boot [the options above]\n");
         return 2;
@@ -163,6 +165,12 @@ int main(int argc, char** argv) {
         else if (!std::strcmp(argv[i], "--window")) window = true;
         else if (!std::strcmp(argv[i], "--boot")) boot = true;
         else if (!std::strcmp(argv[i], "--record") && i + 1 < argc) record = argv[++i];
+        else if (!std::strcmp(argv[i], "--wav") && i + 1 < argc) {
+            if (!pf_dsp_wav(argv[++i])) {
+                std::fprintf(stderr, "--wav %s: cannot write it\n", argv[i]);
+                return 2;
+            }
+        }
         else if (!std::strcmp(argv[i], "--memtest") && i + 1 < argc) memtest = argv[++i];
         else if (!std::strcmp(argv[i], "--ops") && i + 1 < argc) ops = std::atoi(argv[++i]);
         else if (!std::strcmp(argv[i], "--seed") && i + 1 < argc) seed = (uint32_t)std::strtoul(argv[++i], nullptr, 0);

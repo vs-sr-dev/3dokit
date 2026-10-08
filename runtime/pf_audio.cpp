@@ -2,10 +2,11 @@
 // samples) and the SWIs and vector slots on them, as far as the programs run so far reach them.
 // What a call checks, makes and returns is what the 1993 folio does (System/Folios/AUDIOFOLIO,
 // V20.19, built 5 September 1993, decompressed by its own code in 3dokit.armemu; the addresses
-// are its own). What it does not do is the DSP: the folio loads each instrument's code into the
-// DSP, connects instruments by patching that code and writes knobs into the DSP's memory; here an
-// instrument is what its .dsp file says (3dokit.dsp reads the same files), and every value the
-// folio would write to the DSP is kept by resource, for a native mixer to read.
+// are its own). The DSP is pf_dsp.cpp's: the folio loads each instrument's code into the DSP,
+// connects instruments by patching that code, writes knobs into the DSP's memory and programs the
+// DMA that feeds the FIFOs; here an instrument is what its .dsp file says (3dokit.dsp reads the
+// same files), every value the folio would write to the DSP is kept by resource and handed to the
+// native instrument, and the DMA is programmed as the folio programs it.
 //
 // The items' nodes are the folio's: their sizes and n_Flags come from its node database (0xc04c),
 // and the kernel's CreateItem makes them the caller's. What the folio keeps in a node after the
@@ -86,6 +87,7 @@ struct Template {
     std::string path;                       // as the program named it
     std::vector<DspRsrc> rsrc;
     std::vector<DspKnob> knobs;
+    std::vector<uint8_t> code;              // DCOD's words, past its 3-word header
 };
 
 static uint32_t be32(const std::vector<uint8_t>& d, size_t o) {
@@ -108,6 +110,10 @@ static bool parse_dsp(const std::vector<uint8_t>& d, Template& t) {
     std::map<std::string, std::pair<size_t, size_t>> ch;
     iff_walk(d, 0, d.size(), ch);
     if (!ch.count("DRSC") || !ch.count("DNMS")) return false;
+    if (ch.count("DCOD")) {
+        auto [ca, cb] = ch["DCOD"];
+        if (ca + 12 <= cb) t.code.assign(d.begin() + (long)ca + 12, d.begin() + (long)cb);
+    }
     auto [ra, rb] = ch["DRSC"];
     auto [na, nb] = ch["DNMS"];
     for (size_t o = ra, n = na; o + 16 <= rb; o += 16) {
@@ -146,6 +152,7 @@ struct Connection {
     uint32_t from_rsrc, to_rsrc;            // its resource, and the one of this instrument it feeds
 };
 struct Instrument {
+    int32_t self;                           // its item (0 until made), the DSP's instrument
     int32_t tmpl;
     uint32_t flags;
     int state;                              // the node's +0x30: 0 allocated or abandoned, 1 stopped, 2 released, 3 started
@@ -254,6 +261,7 @@ static uint32_t tweak(ArmCpu& c, Instrument& ins, const Template& t, const DspKn
         }
         if (e.rsrc >= t.rsrc.size() || t.rsrc[e.rsrc].type != RSRC_KNOB) return AF_ERR_BADKNOBRSRC;
         ins.value[e.rsrc] = w;
+        if (ins.self) pf_dsp_write(ins.self, e.rsrc, w);
     }
     return 0;
 }
@@ -313,10 +321,15 @@ static uint32_t create_instrument(ArmCpu& c, const Tags& tags) {
     }
     if (!pf_check_item(tmpl, NST_AUDIO, TEMPLATE_NODE)) return AF_ERR_BADITEM;
     const Template& t = g_templates[tmpl];
-    Instrument ins{tmpl, flags, 0, 0, {}, {}, {}};
+    Instrument ins{0, tmpl, flags, 0, 0, {}, {}, {}};
     for (const auto& k : t.knobs)
         if (uint32_t err = tweak(c, ins, t, k, k.dflt, false)) return err;
     int32_t item = audio_item(INSTRUMENT_NODE, (uint8_t)pri);
+    ins.self = item;
+    std::vector<std::string> names;
+    for (const auto& r : t.rsrc) names.push_back(r.name);
+    pf_dsp_new(item, t.path, names, t.code, (uint8_t)pri);
+    for (auto [r, v] : ins.value) pf_dsp_write(item, r, v);
     g_instruments[item] = std::move(ins);
     return (uint32_t)item;
 }
@@ -616,37 +629,110 @@ static uint32_t create(ArmCpu& c, int type, const Tags& tags, uint32_t tag_ptr =
 static uint32_t audio_create(ArmCpu& c, int type, uint32_t tags) { return create(c, type, read_tags(tags), tags); }
 
 // ---- starting and stopping ------------------------------------------------------------------
-// What the folio does to the DSP on each is not done here; the states it keeps are.
+// The states the folio keeps, and what it does to the DSP: its instruments in or out of the DSP's
+// program, and the DMA of their FIFOs (pf_dsp.cpp). A chunk is given as the folio gives CLIO an
+// address and a count (the count register holds the bytes less 4; here the bytes).
+
+// A sample's bytes from its frames, as 0x9898 (frames_to_bytes) -- a ratio of 0, which the
+// folio's division would not survive and no program sets, as 1.
+static uint32_t bytes_of(const Sample& s, uint32_t frames) {
+    uint32_t b = frames * s.channels * s.width;
+    return s.compression_ratio <= 1 ? b : s.compression_ratio == 2 ? b >> 1 : b / s.compression_ratio;
+}
+// Where an attachment starts in its sample's data (0x7450): AF_TAG_START_AT's frames in.
+static uint32_t start_addr(const Attachment& at, const Sample& s) {
+    return at.start_at ? s.address + bytes_of(s, at.start_at) : s.address;
+}
+static bool is_attachment(int32_t a) { return a && pf_check_item(a, NST_AUDIO, ATTACHMENT_NODE); }
+
+// What is linked after an attachment, forgetting a link to what is no longer one (0x795c).
+static int32_t linked(Attachment& at) {
+    if (at.next && !is_attachment(at.next)) at.next = 0;
+    return at.next;
+}
+
+// 0x6578: the FIFO's interrupt armed to signal the daemon when the chunk now playing runs out --
+// when the attachment has a cue (+0x44, not made here), AF_ATTF_FATLADYSINGS (2) or a link.
+static void arm(const Attachment& at) {
+    if ((at.flags & 2) || at.next) pf_dsp_dma_arm(at.ins, (uint32_t)at.rsrc);
+}
+
+// 0x76b8: the FIFO's next chunk the folio's silence.
+static void next_silence(int32_t ins, int rsrc) { pf_dsp_dma_next(ins, (uint32_t)rsrc, PF_DSP_SILENCE, 32); }
+
+// 0x76d0: after a release, the FIFO's next chunk -- the sample's release loop, or else what
+// follows its sustain loop to its end (the silence when that is under 8 bytes); with neither loop,
+// nothing.
+static void next_after_release(int32_t ins, int rsrc, const Sample& s) {
+    uint32_t addr, bytes;
+    if (s.release_begin >= 0) {
+        addr = s.address + bytes_of(s, (uint32_t)s.release_begin);
+        bytes = bytes_of(s, (uint32_t)(s.release_end - s.release_begin));
+    } else if (s.sustain_begin >= 0) {
+        addr = s.address + bytes_of(s, (uint32_t)s.sustain_end);
+        bytes = bytes_of(s, s.frames - (uint32_t)s.sustain_end);
+    } else return;
+    if (bytes < 8) next_silence(ins, rsrc);
+    else pf_dsp_dma_next(ins, (uint32_t)rsrc, addr, bytes);
+}
+
+// 0x7860: an attachment queued as its FIFO's next chunk -- from where it starts to the end of its
+// sustain loop, the loop waiting behind it (or the same with its release loop), or to its end.
+static void queue_next(const Attachment& at) {
+    const Sample& s = g_samples[at.sample];
+    uint32_t from = start_addr(at, s);
+    if (s.sustain_begin >= 0 || s.release_begin >= 0) {
+        int32_t b = s.sustain_begin >= 0 ? s.sustain_begin : s.release_begin;
+        int32_t e = s.sustain_begin >= 0 ? s.sustain_end : s.release_end;
+        pf_dsp_dma_waiting(at.ins, (uint32_t)at.rsrc, s.address + bytes_of(s, (uint32_t)b), bytes_of(s, (uint32_t)(e - b)));
+        pf_dsp_dma_next(at.ins, (uint32_t)at.rsrc, from, bytes_of(s, (uint32_t)e - at.start_at));
+    } else pf_dsp_dma_next(at.ins, (uint32_t)at.rsrc, from, bytes_of(s, s.frames - at.start_at));
+}
 
 // An attachment started (0x74b8): its sample must have an address (else AF_ERR_NULLADDRESS) and 4
-// bytes or more (else AF_ERR_OUTOFRANGE); then the FIFO plays it, and it is playing. A sample
-// without a sustain or release loop plays once: the folio looks at what is linked after it (0x795c,
-// forgetting a link to what is no longer an attachment) to queue it in the DSP.
+// bytes or more (else AF_ERR_OUTOFRANGE); it is its FIFO's (the folio's table, +0x18), and the
+// FIFO's DMA set (0x9d24): with a sustain loop (or else a release loop) the sample to the loop's
+// end and then the loop, over and over; with neither the sample to its end and then the silence --
+// or what is linked after it (0x795c, 0x7860) -- and the interrupt armed. It is playing.
 static uint32_t attachment_start(int32_t a) {
     Attachment& at = g_attachments[a];
     const Sample& s = g_samples[at.sample];
     if (!s.address) return AF_ERR_NULLADDRESS;
     if (s.numbytes < 4) return AF_ERR_OUTOFRANGE;
     g_instruments[at.ins].playing[at.rsrc] = a;
-    if (s.sustain_begin < 0 && s.release_begin < 0 && at.next && !pf_check_item(at.next, NST_AUDIO, ATTACHMENT_NODE))
-        at.next = 0;
+    uint32_t from = start_addr(at, s), r = (uint32_t)at.rsrc;
+    bool loops = s.sustain_begin >= 0 || s.release_begin >= 0;
+    if (loops) {
+        int32_t b = s.sustain_begin >= 0 ? s.sustain_begin : s.release_begin;
+        int32_t e = s.sustain_begin >= 0 ? s.sustain_end : s.release_end;
+        pf_dsp_dma(at.ins, r, from, bytes_of(s, (uint32_t)e - at.start_at), s.address + bytes_of(s, (uint32_t)b),
+                   bytes_of(s, (uint32_t)(e - b)));
+    } else {
+        pf_dsp_dma(at.ins, r, from, bytes_of(s, s.frames - at.start_at), PF_DSP_SILENCE, 32);
+        if (int32_t n = linked(at)) queue_next(g_attachments[n]);
+        arm(at);
+    }
     at.state = 3;
     return 0;
 }
 
-// An attachment stopped (0x7cf8): when it is playing, its FIFO plays nothing and it is stopped.
+// An attachment stopped (0x7cf8): when it is playing, the FIFO's waiting chunk and interrupt
+// dropped (0x6648), its DMA off (0x9e34), the FIFO no one's, and it is stopped.
 static void attachment_stop(int32_t a) {
     Attachment& at = g_attachments[a];
     if (at.state <= 1) return;
+    pf_dsp_dma_quiet(at.ins, (uint32_t)at.rsrc);
+    pf_dsp_dma_stop(at.ins, (uint32_t)at.rsrc);
     g_instruments[at.ins].playing.erase(at.rsrc);
     at.state = 1;
 }
 
-// An instrument's DSP side stopped (0x7be8), when it runs: every FIFO's playing attachment
-// stopped, while it is still an attachment (the envelopes' attachments, a list of their own, are
-// not made here).
+// An instrument's DSP side stopped (0x7be8), when it runs: out of the DSP's program, and every
+// FIFO's playing attachment stopped, while it is still an attachment (the envelopes' attachments,
+// a list of their own, are not made here).
 static void dsp_stop(Instrument& ins) {
     if (ins.dsp_state <= 1) return;
+    pf_dsp_run(ins.self, false);
     ins.dsp_state = 1;
     std::map<int, int32_t> was = ins.playing;
     for (auto [rsrc, a] : was)
@@ -666,19 +752,77 @@ static uint32_t stop_instrument(int32_t item, uint32_t tags) {
     if (ins.flags & AF_INSF_AUTOABANDON) ins.state = 0;
     return 0;
 }
-static void a_stopinstrument(ArmCpu& c) { c.r[0] = stop_instrument((int32_t)c.r[0], c.r[1]); }
+static void a_stopinstrument(ArmCpu& c) {
+    pf_dsp_sync();
+    c.r[0] = stop_instrument((int32_t)c.r[0], c.r[1]);
+}
 
 // An attachment released (0x79a0): its sample must have an address (else AF_ERR_NULLADDRESS); a
-// link to what is no longer an attachment is forgotten (0x795c); the folio then moves the FIFO to
-// the sample's release loop, to what is linked after it, or to the sample's end (0x76d0, 0x7810,
-// 0x7860, 0x65e8, 0x76b8) and arms the FIFO's interrupt (0x6578) -- the DSP's side, not done
-// here --, and the attachment is released.
+// link to what is no longer an attachment is forgotten (0x795c). With a release loop, that is the
+// FIFO's next chunk (0x76d0). Else, when something is linked after it: a sustain loop beginning
+// past frame 0 and ending before the sample does leaves the rest of the sample next and the link
+// waiting behind it (0x76d0, 0x7810); otherwise the link is next (0x7860). With no link: the
+// rest of the sample next and the silence waiting (0x65e8), or the silence next (0x76b8). Then the
+// interrupt armed (0x6578), and the attachment released.
 static uint32_t attachment_release(int32_t a) {
     Attachment& at = g_attachments[a];
-    if (!g_samples[at.sample].address) return AF_ERR_NULLADDRESS;
-    if (at.next && !pf_check_item(at.next, NST_AUDIO, ATTACHMENT_NODE)) at.next = 0;
+    const Sample& s = g_samples[at.sample];
+    if (!s.address) return AF_ERR_NULLADDRESS;
+    bool rest = s.sustain_end != (int32_t)s.frames;
+    int32_t n = linked(at);
+    if (s.release_begin >= 0) next_after_release(at.ins, at.rsrc, s);
+    else if (n) {
+        if (s.sustain_begin > 0 && rest) {
+            next_after_release(at.ins, at.rsrc, s);
+            const Attachment& l = g_attachments[n];
+            const Sample& ls = g_samples[l.sample];
+            pf_dsp_dma_waiting(l.ins, (uint32_t)l.rsrc, start_addr(l, ls), bytes_of(ls, ls.frames - l.start_at));
+        } else queue_next(g_attachments[n]);
+    } else if (s.sustain_begin > 0 && rest) {
+        next_after_release(at.ins, at.rsrc, s);
+        pf_dsp_dma_waiting(at.ins, (uint32_t)at.rsrc, PF_DSP_SILENCE, 32);
+    } else next_silence(at.ins, at.rsrc);
+    arm(at);
     at.state = 2;
     return 0;
+}
+
+// 0x7788: a linked attachment taking over its FIFO (the table's +0x18) as the one before it ends:
+// with no loop in its sample, what is linked after it queued (0x795c, 0x7860) or the silence
+// (0x76b8), and the interrupt armed; it is playing.
+static void take_over(int32_t a) {
+    Attachment& at = g_attachments[a];
+    const Sample& s = g_samples[at.sample];
+    g_instruments[at.ins].playing[at.rsrc] = a;
+    if (s.sustain_begin < 0 && s.release_begin < 0) {
+        if (int32_t n = linked(at)) queue_next(g_attachments[n]);
+        else next_silence(at.ins, at.rsrc);
+        arm(at);
+    }
+    at.state = 3;
+}
+
+static uint32_t stop_instrument(int32_t item, uint32_t tags);
+
+// The folio's daemon on an armed FIFO's signal (0x5cc0): the attachment that was the FIFO's, while
+// it is still an attachment, is no longer, and ends (0x5c04): stopped; with AF_ATTF_FATLADYSINGS
+// its instrument stopped (StopInstrument), else what is linked after it takes over (0x7788), or
+// with no link the FIFO plays the silence (0x7674: the current chunk and the next); its cue
+// (+0x44) signalled -- no cue is made here.
+static void fifo_ended(int32_t ins, uint32_t rsrc) {
+    auto i = g_instruments.find(ins);
+    if (i == g_instruments.end()) return;
+    auto p = i->second.playing.find((int)rsrc);
+    if (p == i->second.playing.end()) return;
+    int32_t a = p->second;
+    i->second.playing.erase(p);
+    if (!is_attachment(a)) return;
+    Attachment& at = g_attachments[a];
+    at.state = 1;
+    if (at.flags & 2) stop_instrument(at.ins, 0);
+    else if (int32_t n = linked(at)) take_over(n);
+    else pf_dsp_dma(ins, rsrc, PF_DSP_SILENCE, 32, PF_DSP_SILENCE, 32);
+    if (g_pf_trace >= 2) pf_log("        attachment %d ends on instrument %d\n", a, ins);
 }
 
 // swi 0x40002: Err ReleaseInstrument(Item instrument, TagArg* tags) -- 0x1d54: an instrument
@@ -700,7 +844,10 @@ static uint32_t release_instrument(int32_t item, uint32_t tags) {
     ins.dsp_state = 2;
     return err;
 }
-static void a_releaseinstrument(ArmCpu& c) { c.r[0] = release_instrument((int32_t)c.r[0], c.r[1]); }
+static void a_releaseinstrument(ArmCpu& c) {
+    pf_dsp_sync();
+    c.r[0] = release_instrument((int32_t)c.r[0], c.r[1]);
+}
 
 // ---- deleting items (the folio's ir_Delete, 0x1170, by node type) -----------------------------
 // A knob (0x27a8): off its instrument's list of grabbed knobs (RemNode), and 0. An instrument
@@ -718,6 +865,7 @@ static void a_releaseinstrument(ArmCpu& c) { c.r[0] = release_instrument((int32_
 // one in the instruments it fed, as in the folio, whose patched code goes on reading the freed
 // DSP memory.
 static int32_t audio_delete(ArmCpu& c, int type, int32_t item, uint32_t) {
+    pf_dsp_sync();
     switch (type) {
     case TEMPLATE_NODE: {
         // 0x24b0: unless its word at +0x24 is above 0 (0 from its creation, 0x230c, and nothing
@@ -744,6 +892,7 @@ static int32_t audio_delete(ArmCpu& c, int type, int32_t item, uint32_t) {
         for (const auto& [a, v] : g_attachments)
             if (v.ins == item) doomed.push_back(a);
         for (int32_t a : doomed) pf_delete_item_as_owner(c, a);
+        pf_dsp_delete(item);
         g_instruments.erase(item);
         return 0;
     }
@@ -1064,9 +1213,10 @@ static void a_detachsample(ArmCpu& c) { c.r[0] = (uint32_t)pf_delete_item(c, (in
 
 // swi 0x40015: Err LinkAttachments(Item at1, Item at2) -- 0x63d4: at1 an attachment (else
 // AF_ERR_BADITEM), at2 0 or an attachment (else the same); at2 is what plays after at1. Neither
-// the folio's open nor the owner is asked. When at1 is playing the folio also links (or unlinks)
-// the two in the DSP (0x7860, 0x76b8), which is not done here.
+// the folio's open nor the owner is asked. When at1 is playing, at2 is queued as its FIFO's next
+// chunk (0x7860), or with no at2 the silence (0x76b8), and at1's interrupt armed (0x6578).
 static void a_linkattachments(ArmCpu& c) {
+    pf_dsp_sync();
     int32_t a1 = (int32_t)c.r[0], a2 = (int32_t)c.r[1];
     if (!pf_check_item(a1, NST_AUDIO, ATTACHMENT_NODE) || (a2 && !pf_check_item(a2, NST_AUDIO, ATTACHMENT_NODE))) {
         c.r[0] = AF_ERR_BADITEM;
@@ -1074,6 +1224,11 @@ static void a_linkattachments(ArmCpu& c) {
     }
     Attachment& at = g_attachments[a1];
     at.next = a2;
+    if (at.state > 1) {
+        if (a2) queue_next(g_attachments[a2]);
+        else next_silence(at.ins, at.rsrc);
+        arm(at);
+    }
     if (g_pf_trace) pf_log("        attachment %d then %d\n", a1, a2);
     c.r[0] = 0;
 }
@@ -1081,6 +1236,7 @@ static void a_linkattachments(ArmCpu& c) {
 // swi 0x40000: Err TweakKnob(Item knob, int32 value) -- 0x27c8, and swi 0x40011 TweakRawKnob
 // (0x281c), the same without the knob's calculation. Neither asks whether the folio is open.
 static void tweak_knob(ArmCpu& c, bool cooked) {
+    pf_dsp_sync();
     if (!pf_check_item((int32_t)c.r[0], NST_AUDIO, KNOB_NODE)) { c.r[0] = AF_ERR_BADITEM; return; }
     const Knob& k = g_knobs[(int32_t)c.r[0]];
     Instrument& ins = g_instruments[k.ins];
@@ -1098,6 +1254,7 @@ static void a_tweakrawknob(ArmCpu& c) { tweak_knob(c, false); }
 // made) not marked AF_ATTF_NOAUTOSTART starts -- whether it can is not the call's result -- and
 // its DSP side runs; its node's state becomes 3.
 static void a_startinstrument(ArmCpu& c) {
+    pf_dsp_sync();
     if (!audio_open()) { c.r[0] = AF_ERR_AUDIOCLOSED; return; }
     int32_t item = (int32_t)c.r[0];
     if (!pf_check_item(item, NST_AUDIO, INSTRUMENT_NODE)) { c.r[0] = AF_ERR_BADITEM; return; }
@@ -1128,6 +1285,7 @@ static void a_startinstrument(ArmCpu& c) {
                 break;
             }
     }
+    pf_dsp_run(item, true);
     ins.dsp_state = 3;
     ins.state = 3;
     c.r[0] = 0;
@@ -1138,6 +1296,7 @@ static void a_startinstrument(ArmCpu& c) {
 // or else knob of that name, or AF_ERR_BADNAME. The folio patches the destination's code to read
 // the source's variable; here the connection is written down.
 static void a_connectinstruments(ArmCpu& c) {
+    pf_dsp_sync();
     int32_t src = (int32_t)c.r[0], dst = (int32_t)c.r[2];
     if (!pf_check_item(src, NST_AUDIO, INSTRUMENT_NODE) || !pf_check_item(dst, NST_AUDIO, INSTRUMENT_NODE)) {
         c.r[0] = AF_ERR_BADITEM;
@@ -1152,6 +1311,7 @@ static void a_connectinstruments(ArmCpu& c) {
     if (g_pf_trace) pf_log("        connect %d \"%s\" -> %d \"%s\"\n", src, from.c_str(), dst, to.c_str());
     if (a < 0 || b < 0) { c.r[0] = AF_ERR_BADNAME; return; }
     d.inputs.push_back({src, (uint32_t)a, (uint32_t)b});
+    pf_dsp_connect(src, (uint32_t)a, dst, (uint32_t)b);
     c.r[0] = 0;
 }
 
@@ -1160,6 +1320,7 @@ static void a_connectinstruments(ArmCpu& c) {
 // finds them (else AF_ERR_BADNAME); then every place in the destination's code that reads that
 // resource is put back as it was loaded (0xc000) -- whatever fed it, and whether anything did.
 static void a_disconnectinstruments(ArmCpu& c) {
+    pf_dsp_sync();
     int32_t src = (int32_t)c.r[0], dst = (int32_t)c.r[2];
     if (!pf_check_item(src, NST_AUDIO, INSTRUMENT_NODE) || !pf_check_item(dst, NST_AUDIO, INSTRUMENT_NODE)) {
         c.r[0] = AF_ERR_BADITEM;
@@ -1176,6 +1337,7 @@ static void a_disconnectinstruments(ArmCpu& c) {
     d.inputs.erase(std::remove_if(d.inputs.begin(), d.inputs.end(),
                                   [&](const Connection& k) { return k.to_rsrc == (uint32_t)b; }),
                    d.inputs.end());
+    pf_dsp_disconnect(dst, (uint32_t)b);
     c.r[0] = 0;
 }
 
@@ -1344,6 +1506,7 @@ static void a_sleepuntiltime(ArmCpu& c) {
 // difference), it signals the daemon (+0xa8, the bits at +0xa4) and wants none. The daemon, at the
 // folio's high priority, then runs the list; here the list is run at once.
 static void tick(uint64_t) {
+    pf_dsp_sync();
     pf_w32(folio() + AF_TIME, pf_r32(folio() + AF_TIME) + 1);
     uint32_t f = folio();
     if (pf_r32(f + AF_WAKEWANTED) && (int32_t)(pf_r32(f + AF_WAKE) - pf_r32(f + AF_TIME)) <= 0) {
@@ -1413,6 +1576,8 @@ void pf_audio_init() {
     g_knobs.clear();
     g_samples.clear();
     g_attachments.clear();
+    pf_dsp_init();
+    g_pf_dsp_ended = fifo_ended;
     clock_init();
     pf_on_slot(PF_AUDIO, -60, a_getaudiorate);
     pf_on_slot(PF_AUDIO, -64, a_getaudioduration);

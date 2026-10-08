@@ -68,11 +68,54 @@ calculation, and a new instrument's knobs start at their defaults that
 way. Type 3 is the oscillators' `Frequency`; the 24.225 library's type 4
 (`square_lfo`, `triangle_lfo`, `pulse_lfo`) is one the 1993 folio refuses.
 
+The relocations come in two kinds, told apart by the mask word: with bit
+17 (0x20a00, a resource's address) the code word's low ten bits are the
+next word of a chain to patch, 0 ending it, so one record serves every use
+of the resource; with bit 16 (0x10a00, the code's own addresses -- branch
+targets) the word's low ten bits are an offset into the instrument, to
+which its place in the DSP's memory is added. `0x600` patches an RBASE
+instruction with a ring's base (sampler.dsp's MYRB).
+
+The code
+--------
+
+The DSP's instruction set is not in the SDK; it is read here as the FreeDO
+emulator reads it (the Opera emulator carries that code; read, not
+copied), and the instruments on the disc bear it out (`--dis`). A word
+with bit 15 clear is an arithmetic instruction:
+
+    bits 13-14  operand words that follow     bit 12  the multiplier's second
+    bits 10-11  the ALU's A input             operand an operand (else the
+    bits 8-9    its B input                   accumulator's top 17 bits)
+    bits 4-7    the operation                 bits 0-3  the barrel shifter
+    inputs: 0 the accumulator, 1 and 2 the two ALU operands, 3 the multiplier
+    operations: TRA NEG ADD ADDC SUB SUBB INC DEC, then (logical) TRL NOT
+                AND NAND OR NOR XOR XNOR
+    shifter: none, <<1 <<2 <<3 <<4 <<5 <<8, CLIP, by an operand, >>16 >>8
+             >>5 >>4 >>3 >>2 >>1 (arithmetic, or logical for TRL and after)
+
+The operands fill, in order, the multiplier's (one or two), then the ALU's,
+then the shifter's; one more than those is where the result is written
+(its top 16 bits), as is an address operand marked write-back. An operand
+word is an address (0x8000 | addr, bit 10 indirect, bit 11 write-back), an
+immediate (0xc000 | 13 bits, signed; bit 13 shifts it up 3), or one, two
+or three registers (relative to RBASE). A word with bit 15 set is a
+control instruction: NOP 0x8000, BAC 0x8080, RBASE 0x8100, RMAP 0x8180,
+RTS 0x8200, OP_MASK 0x8280, SLEEP 0x8380 (the frame's end), JUMP 0x8400,
+JSR 0x8800, BFM 0x8c00, MOVEREG 0x9000 (a register from an operand), MOVE
+0x9800 (an address from an operand, bit 10 indirect), and from 0xa000 a
+conditional branch on the flags (bits 10-14: two masks, a select, a mode).
+The memory the instruments use: their variables and knobs at the
+addresses relocated in, I memory 0x100-0x2ff (0x106 and 0x107 the left
+and right sums the mixers add to; head.dsp moves them to the DAC at 0x3fe
+and 0x3ff and clears them), the FIFOs read at 0x0f0 + n.
+
 Usage
 -----
 
     python -m 3dokit.dsp System/Audio/dsp               # the catalogue
     python -m 3dokit.dsp System/Audio/dsp/sampler.dsp -v
+    python -m 3dokit.dsp System/Audio/dsp/sampler.dsp --dis   # its code
     python -m 3dokit.dsp System/Audio/dsp --verify
     python -m 3dokit.dsp System/Audio/dsp --used GAME   # which ones a program names
 """
@@ -211,6 +254,132 @@ class Instrument:
         return '\n'.join(out)
 
 
+ALU_OPS = ['TRA', 'NEG', 'ADD', 'ADDC', 'SUB', 'SUBB', 'INC', 'DEC',
+           'TRL', 'NOT', 'AND', 'NAND', 'OR', 'NOR', 'XOR', 'XNOR']
+ALU_IN = ['ACC', 'OP1', 'OP2', 'MUL']
+SHIFTS = ['', '<<1', '<<2', '<<3', '<<4', '<<5', '<<8', 'CLIP', '<<op',
+          '>>16', '>>8', '>>5', '>>4', '>>3', '>>2', '>>1']
+
+
+def resolved(ins):
+    """The code's words with every relocation's chain cleared, and per word
+    the resource it names: a resource's address (a chain through the low
+    ten bits), or the instrument's own offset."""
+    words = list(struct.unpack('>%dH' % ins.words, ins.code))
+    names = {}
+    for mask, _, idx, off in ins.relocs:
+        if mask & 0x20000:
+            w, seen = off, set()
+            while w < len(words) and w not in seen:
+                seen.add(w)
+                names[w] = ins.resources[idx].name
+                nxt = words[w] & 0x3ff
+                words[w] &= ~0x3ff
+                if not nxt:
+                    break
+                w = nxt
+        else:
+            names.setdefault(off, ins.resources[idx].name if mask != 0x10a00 else None)
+    return words, names
+
+
+def _condition(b):
+    """A conditional branch's bits 10-14 (two masks, a select, a mode) as a
+    condition: modes 1 and 2 ask that the masked flags (N and V, or with the
+    select C and Z) all be set, or all clear; mode 3 compares (LT LE GE GT
+    on N, V and Z; HI LS on C and Z; then the exact tests)."""
+    m0, m1, sel, mode = b & 1, (b >> 1) & 1, (b >> 2) & 1, b >> 3
+    flags = [f for f, m in ((('C' if sel else 'N'), m1), (('Z' if sel else 'V'), m0)) if m]
+    if mode in (1, 2) and flags:
+        return ('' if mode == 1 else 'N') + ''.join(flags)
+    if mode == 3:
+        if not sel:
+            return ['LT', 'LE', 'GE', 'GT'][m0 + 2 * m1]
+        return ['HI', 'LS', 'XE', 'XNE'][m0 + 2 * m1]
+    return '?%02x' % b
+
+
+def _operand(w, name):
+    """One operand word: its text and how many operands it gives."""
+    if not w & 0x8000:
+        regs = []
+        for sh in (10, 5, 0):
+            r = 'R%d' % ((w >> sh) & 0xf)
+            regs.append('[%s]' % r if (w >> (sh + 4)) & 1 else r)
+        return ','.join(regs), 3
+    kind = w >> 13
+    if kind == 4:
+        s = name or '0x%03x' % (w & 0x3ff)
+        if name and w & 0x3ff:
+            s += '+%d' % (w & 0x3ff)
+        if w & 0x400:
+            s = '[%s]' % s
+        return s + ('!' if w & 0x800 else ''), 1
+    if kind == 5:
+        r1 = ('[R%d]' if w & 0x10 else 'R%d') % (w & 0xf) + ('!' if w & 0x800 else '')
+        if w & 0x400:
+            r2 = ('[R%d]' if w & 0x200 else 'R%d') % ((w >> 5) & 0xf) + ('!' if w & 0x1000 else '')
+            return r2 + ',' + r1, 2
+        return r1, 1
+    v = w & 0x1fff
+    if v & 0x1000:
+        v -= 0x2000
+    if w & 0x2000:
+        v <<= 3
+    s = '#0x%04x' % (v & 0xffff)
+    return (s + ' <%s>' % name) if name else s, 1
+
+
+def disassemble(ins):
+    """The instrument's code, a line an instruction: an operand that names
+    a resource shows its name ('!' marks a write-back)."""
+    words, names = resolved(ins)
+    out, pc = [], 0
+    while pc < len(words):
+        w, start = words[pc], pc
+        pc += 1
+        if w & 0x8000:
+            op, a = (w >> 7) & 0xff, w & 0x3ff
+            tgt = '%d' % a
+            if op == 0: s = 'NOP'
+            elif op == 1: s = 'BAC'
+            elif op == 2: s = 'RBASE %s' % (names.get(start) or (a & 0x3f) << 2)
+            elif op == 3: s = 'RMAP %d' % (a & 7)
+            elif op == 4: s = 'RTS'
+            elif op == 5: s = 'OP_MASK 0x%x' % (a & 0x1f)
+            elif op == 7: s = 'SLEEP'
+            elif op < 16: s = 'JUMP %s' % tgt
+            elif op < 24: s = 'JSR %s' % (names.get(start) or tgt)
+            elif op < 32: s = 'BFM %s' % tgt
+            elif op < 64:
+                o, _ = _operand(words[pc], names.get(pc))
+                pc += 1
+                if op < 48:
+                    r = 'R%d' % (w & 0xf)
+                    s = 'MOVEREG %s, %s' % ('[%s]' % r if w & 0x10 else r, o)
+                else:
+                    d = names.get(start) or '0x%03x' % a
+                    s = 'MOVE %s, %s' % ('[%s]' % d if w & 0x400 else d, o)
+            else:
+                s = 'B%s %s' % (_condition((w >> 10) & 0x1f), tgt)
+        else:
+            n = (w >> 13) & 3
+            s = '%-4s %s, %s%s' % (ALU_OPS[(w >> 4) & 0xf], ALU_IN[(w >> 10) & 3],
+                                   ALU_IN[(w >> 8) & 3], ' ' + SHIFTS[w & 0xf] if w & 0xf else '')
+            if (w >> 12) & 1:
+                s += ' (MUL op*op)'
+            ops, got = [], 0
+            while got < n and pc < len(words):
+                o, k = _operand(words[pc], names.get(pc))
+                pc += 1
+                ops.append(o)
+                got += k
+            if ops:
+                s += '  ' + ', '.join(ops)
+        out.append('%4d  %-19s %s' % (start, ' '.join('%04x' % x for x in words[start:pc]), s))
+    return out
+
+
 def load_all(where):
     if os.path.isdir(where):
         paths = sorted(glob.glob(os.path.join(where, '*.dsp')))
@@ -311,12 +480,19 @@ def main():
                     help='check every structural claim about the format')
     ap.add_argument('--used', metavar='IMAGE',
                     help='which instruments this ARM image names')
+    ap.add_argument('--dis', action='store_true',
+                    help='the code, disassembled')
     a = ap.parse_args()
     if a.verify:
         raise SystemExit(verify(a.path))
     if a.used:
         raise SystemExit(used(a.path, a.used))
     ins = load_all(a.path)
+    if a.dis:
+        for i in ins:
+            print('%s  (%d words)' % (i.file, i.words))
+            print('\n'.join(disassemble(i)))
+        return
     if a.verbose or len(ins) == 1:
         print('\n\n'.join(i.detail() for i in ins))
     else:
