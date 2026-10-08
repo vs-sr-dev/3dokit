@@ -32,7 +32,8 @@ typedef void (*ArmFunc)(ArmCpu&);
 struct ArmFuncEntry { uint32_t addr; ArmFunc fn; };
 struct ArmModule {
     const char* name;
-    uint32_t base, size, crc;           // crc32 of the image as loaded at base
+    uint32_t* base;                     // where it is loaded: its code's `mb`
+    uint32_t size, crc;                 // crc32 of the read-only area as the file holds it
     const ArmFuncEntry* funcs;
     uint32_t nfuncs;
 };
@@ -130,13 +131,16 @@ static inline uint32_t arm_ror(uint32_t v, uint32_t n, uint32_t cin, uint32_t& c
 }
 
 // ---- the runtime's view of the modules (core.cpp) -------------------------------------
-// The generated modules.cpp lists every module of the build; one is active
-// at a time (every 3DO program is linked at 0).
+// The generated modules.cpp lists every module of the build. Every 3DO program is linked
+// at 0; the one the runtime starts is loaded there (arm_activate), and the code it loads
+// and the programs it starts wherever the OS puts them (arm_load), each at most once.
 extern const ArmModule* const g_arm_modules[];
 extern const int g_arm_nmodules;
 const ArmModule* arm_module(const char* name);
-const ArmModule* arm_identify();                // the module whose image is in memory at 0
-void    arm_activate(const ArmModule* m);
-ArmFunc arm_lookup(uint32_t addr);              // nullptr if not an entry of the active module
+const ArmModule* arm_identify(uint32_t at = 0); // the module whose image is in memory at `at`
+void    arm_activate(const ArmModule* m);       // the program at 0, and no other loaded
+bool    arm_load(const ArmModule* m, uint32_t base);  // false if it is loaded already
+void    arm_unload(const ArmModule* m);
+ArmFunc arm_lookup(uint32_t addr);              // nullptr if not an entry of a loaded module
 void    arm_call_unknown(ArmCpu& c, uint32_t addr);   // services: not an entry (the OS...)
 uint32_t arm_crc32(const uint8_t* p, size_t n, uint32_t crc = 0);

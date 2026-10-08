@@ -4,9 +4,13 @@
                             [--per-file 6000] [--no-comments]
 
 Each program is discovered (`recomp.discover`) and emitted (`recomp.emit`)
-into its own namespace, p_<name>. Every 3DO program is linked at 0, so one
-module is active at a time; the runtime recognises a program in memory by
-the crc32 of its read-only area. Writes, into --out:
+into its own namespace, p_<name>. Every 3DO program is linked at 0 and runs
+wherever it is loaded (its AIF relocates itself), and several can be in
+memory at once -- a program, the code it loads (LoadCode), the programs it
+starts: every address the code derives from pc is its namespace's `mb`, the
+base the runtime loaded it at, plus the address linked at 0. The runtime
+recognises a program by the crc32 of its read-only area as the file holds
+it. Writes, into --out:
 
     p_<name>_funcs.h        prototypes and the module descriptor
     p_<name>_NNN.cpp        the functions, split by instruction count
@@ -113,6 +117,7 @@ class Module:
 
         with Out(os.path.join(out, self.ns + '_funcs.h')) as f:
             f.write('#pragma once\n#include "arm60.h"\n\nnamespace %s {\n' % self.ns)
+            f.write('extern uint32_t mb;                     // where the program is loaded\n')
             for e in self.entries:
                 f.write('void %s(ArmCpu& c);\n' % E.fname(e))
             f.write('extern const ArmModule module;\n}  // namespace %s\n' % self.ns)
@@ -122,7 +127,8 @@ class Module:
             for e in self.entries:
                 f.write('    {0x%08Xu, %s},\n' % (e, E.fname(e)))
             f.write('};\n\n')
-            f.write('extern const ArmModule module = {"%s", 0u, %du, 0x%08Xu, funcs, %d};\n'
+            f.write('uint32_t mb = 0;\n')
+            f.write('extern const ArmModule module = {"%s", &mb, %du, 0x%08Xu, funcs, %d};\n'
                     % (self.name, self.size, self.crc, len(self.entries)))
             f.write('\n}  // namespace %s\n' % self.ns)
         self.files.append(self.ns + '_table.cpp')

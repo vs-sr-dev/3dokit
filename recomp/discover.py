@@ -96,14 +96,35 @@ class Program:
         todo = []
 
         self.names = im.embedded_names()
+        # The AIF header's own routines: what its BLs at 0x00 (decompression), 0x04
+        # (self-relocation) and 0x08 (zero-init) call -- code below 0x100, or past the
+        # image (the relocation stub follows RW, its list follows it), each searched in
+        # its own extent. A program needs them when it is loaded elsewhere than 0: code
+        # loaded with LoadCode, a program a task is made from.
+        self.extents, self.aif_routines = [], []
+        for off in (0x00, 0x04, 0x08):
+            w = self._word(off)
+            if w >> 24 != 0xEB:
+                continue
+            disp = w & 0xFFFFFF
+            t = off + 8 + 4 * (disp - 0x1000000 if disp & 0x800000 else disp)
+            if 0 <= t < self.start:
+                self.extents.append((t, self.start))
+            elif self.end <= t < len(self.d):
+                self.extents.append((t, len(self.d) & ~3))
+            else:
+                continue
+            self.aif_routines.append(t)
 
         def seed(a, origin):
-            if self.start <= a < self.end and a not in self.funcs:
+            if self._inside(a) and a not in self.funcs:
                 self.funcs[a] = Function(a, origin)
                 self.funcs[a].name = self.names.get(a)
                 todo.append(a)
 
         seed(self.aif.entry, 'entry')
+        for a in self.aif_routines:
+            seed(a, 'aif')
         for a in sorted(self.names):
             seed(a, 'name')
         for a in sorted(self.prologues):
@@ -147,6 +168,10 @@ class Program:
         for f in self.funcs.values():
             self.code |= f.code
 
+    def _inside(self, a):
+        """In the code searched: the image's, or an AIF routine's extent."""
+        return self.start <= a < self.end or any(lo <= a < hi for lo, hi in self.extents)
+
     # -- decoding ---------------------------------------------------------
     def _word(self, a):
         return struct.unpack_from('>I', self.d, a)[0]
@@ -173,7 +198,7 @@ class Program:
             while True:
                 if a in f.code:
                     break
-                if not (self.start <= a < self.end):
+                if not self._inside(a):
                     f.problems.append((a, 'runs out of the code'))
                     break
                 i = self.at(a)
@@ -195,7 +220,7 @@ class Program:
                 if i.kind == 'b':
                     if i.link:
                         taken.clear()
-                        if self.start <= i.target < self.end:
+                        if self._inside(i.target):
                             f.calls.add(i.target)
                         else:
                             f.problems.append((a, 'calls %#x, outside the code' % i.target))
@@ -359,8 +384,12 @@ class Program:
             self.path, len(self.funcs),
             ', '.join('%s %d' % kv for kv in sorted(by.items()))))
         span = (self.end - self.start) // 4
+        inside = sum(1 for a in self.code if self.start <= a < self.end)
         out.append('code %d words, data %d words, between %#x and %#x' % (
-            len(self.code), span - len(self.code), self.start, self.end))
+            inside, span - inside, self.start, self.end))
+        if self.extents:
+            out.append('AIF routines: %s, %d words of code' % (
+                ', '.join('%#x' % a for a in self.aif_routines), len(self.code) - inside))
         named = set(self.names)
         out.append('embedded names: %d, all found as functions: %s' % (
             len(named), named <= set(self.funcs)))
@@ -368,7 +397,7 @@ class Program:
         called = set()
         for f in fs:
             called |= f.calls | f.tails
-        uncalled = [f for f in fs if f.entry not in called and f.origin != 'entry'
+        uncalled = [f for f in fs if f.entry not in called and f.origin not in ('entry', 'aif')
                     and f.entry not in self.pointed]
         out.append('functions nothing calls, tail-calls or points at: %d' % len(uncalled))
         sw = sum(len(f.switches) for f in fs)

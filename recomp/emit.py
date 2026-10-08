@@ -52,6 +52,13 @@ def R(n):
     return 'c.r[%d]' % n
 
 
+def _abs(v):
+    """An address of the program's own, as it is where the program is
+    loaded: the module's base (`mb`, set by the runtime) plus the address
+    linked at 0."""
+    return '(mb + %s)' % _h(v)
+
+
 COND = {0: 'c.z', 1: '!c.z', 2: 'c.c', 3: '!c.c', 4: 'c.n', 5: '!c.n',
         6: 'c.v', 7: '!c.v', 8: 'c.c && !c.z', 9: '!c.c || c.z',
         10: 'c.n == c.v', 11: 'c.n != c.v', 12: '!c.z && c.n == c.v',
@@ -61,7 +68,7 @@ COND = {0: 'c.z', 1: '!c.z', 2: 'c.c', 3: '!c.c', 4: 'c.n', 5: '!c.n',
 def _reg(n, a, plus=8):
     """A register as an operand: pc is the instruction's address + 8 (+ 12
     under a register shift)."""
-    return _h(a + plus) if n == PC else R(n)
+    return _abs(a + plus) if n == PC else R(n)
 
 
 def _shift_imm(m, kind, amount, carry):
@@ -153,7 +160,7 @@ def sdt_address(i, a):
         off, _ = _shift_imm('m', kind, amount, None)
     if i.rn == PC and i.offset[0] == 'imm':
         moved = (a + 8 + i.offset[1]) if i.u else (a + 8 - i.offset[1])
-        return [], _h(moved if i.p else a + 8), None
+        return [], _abs(moved if i.p else a + 8), None
     base = _reg(i.rn, a)
     moved = '%s %s %s' % (base, '+' if i.u else '-', off)
     if i.p:
@@ -244,7 +251,7 @@ def stmt(i, a):
                 body.append('%s = %s;' % (R(i.rn), wb))
             body.append('%s = v;' % R(i.rd))
         else:
-            v = _h(a + 12) if i.rd == PC else R(i.rd)
+            v = _abs(a + 12) if i.rd == PC else R(i.rd)
             body = pre + ['const uint32_t v = %s;' % v,
                           ('st8(%s, v);' if i.b else 'st32(%s, v);') % ad]
             if wb is not None:
@@ -266,7 +273,7 @@ def stmt(i, a):
         else:
             for j, r in enumerate(regs):
                 if r == PC:
-                    v = _h(a + 12)
+                    v = _abs(a + 12)
                 elif r == i.rn and i.w and j > 0:
                     v = 'fin'
                 else:
@@ -325,15 +332,15 @@ class Body:
         if t in self.entries:
             return '%s(c); return;' % fname(t)
         self.unknown.append(t)
-        return 'arm_call(c, %s); return;' % _h(t)
+        return 'arm_call(c, %s); return;' % _abs(t)
 
     def _call(self, t, ret):
         if t in self.entries:
             call = '%s(c);' % fname(t)
         else:
             self.unknown.append(t)
-            call = 'arm_call(c, %s);' % _h(t)
-        return '%s = %s; ARM_POLL(c); %s ARM_RET(c, %s);' % (R(LR), _h(ret), call, _h(ret))
+            call = 'arm_call(c, %s);' % _abs(t)
+        return '%s = %s; ARM_POLL(c); %s ARM_RET(c, %s);' % (R(LR), _abs(ret), call, _abs(ret))
 
     def _pc_write(self, i, a, value):
         """Leave through pc = `value` (an expression of locals), as
@@ -344,11 +351,12 @@ class Body:
             local = sorted(t for t in getattr(self.f, 'local_returns', ()) if t in self.f.code)
             if local:                                   # back from a local subroutine, or out
                 cases = ' '.join('case 0x%08Xu: goto L_%08X;' % (t, t) for t in local)
-                return '{ const uint32_t t = %s & ~3u; switch (t) { %s } c.pc = t; return; }' % (value, cases)
+                return '{ const uint32_t t = %s & ~3u; switch (t - mb) { %s } c.pc = t; return; }' % (
+                    value, cases)
             return 'c.pc = %s & ~3u; return;' % value
         if kind == 'call':
             self._count('indirect call')
-            return 'ARM_POLL(c); arm_call(c, %s & ~3u); ARM_RET(c, %s);' % (value, _h(a + 4))
+            return 'ARM_POLL(c); arm_call(c, %s & ~3u); ARM_RET(c, %s);' % (value, _abs(a + 4))
         self._count('indirect jump')
         return 'arm_call(c, %s & ~3u); return;' % value
 
@@ -380,7 +388,7 @@ class Body:
                 text = self._goto(i.target, a)
                 on = cond is not None
         elif k == 'swi':
-            text = 'arm_swi(c, %s, %s);' % (_h(i.imm), _h(a))
+            text = 'arm_swi(c, %s, %s);' % (_h(i.imm), _abs(a))
             self._count('swi')
             if i.imm == 0x11 and cond is None:
                 on = False
@@ -390,7 +398,7 @@ class Body:
                 raise Unsupported('%08X: a switch under a condition other than ls' % a)
             cases = ' '.join('case %d: goto L_%08X;' % (n, t) for n, t in enumerate(targets[1:]))
             text = 'switch (%s) { %s default: arm_fault(c, %s, "switch index"); }' % (
-                R(i.op2[1]), cases, _h(a))
+                R(i.op2[1]), cases, _abs(a))
             self._count('switch')
         elif i.writes_pc():
             on = cond is not None
@@ -450,7 +458,7 @@ class Body:
                 else:
                     # discovery stopped here: an exit under a condition and
                     # its inverse (`bne x; beq y`) leaves nothing to run on
-                    after = 'arm_fault(c, %s, "past a two-way exit");' % _h(a + 4)
+                    after = 'arm_fault(c, %s, "past a two-way exit");' % _abs(a + 4)
                     self._count('dead end')
             body.append((a, text, after))
         lines = ['void %s(ArmCpu& c) {' % fname(self.f.entry)]
