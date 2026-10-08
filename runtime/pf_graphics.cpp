@@ -284,7 +284,7 @@ static uint32_t regctl0(uint32_t width) {
 // Only the VDL type the programs run so far use (VDLTYPE_SIMPLE, the default) is done; the
 // caller's own VDLs and VDLTYPE_FULL are read but not yet written. On an error the folio deletes
 // the group, which nothing here does yet: its items stay.
-static uint32_t csg_supervisor(ArmCpu& c, uint32_t items, uint32_t* arg) {
+static uint32_t csg_supervisor(ArmCpu& c, uint32_t items, uint32_t* arg, bool sys_malloc) {
     int32_t group = graf_item(TYPE_SCREENGROUP);
     uint32_t sg = pf_item_node(group);
     pf_w32(sg + SG_DISPLAYHEIGHT, arg[CSG_DISPLAYHEIGHT]);
@@ -345,7 +345,7 @@ static uint32_t csg_supervisor(ArmCpu& c, uint32_t items, uint32_t* arg) {
             uint32_t height = heights ? pf_r32(heights) : arg[CSG_SCREENHEIGHT];
             if (heights) heights += 4;
             if (!buffers) return GRAFERR_INTERNALERROR;
-            pf_w32(bm + BM_SYSMALLOC, 0);
+            pf_w32(bm + BM_SYSMALLOC, sys_malloc ? 1 : 0);   // 23.10's 0x3684: the user half's buffers
             uint32_t buf = pf_r32(buffers);
             buffers += 4;
             pf_w32(bm + BM_BUFFER, buf);
@@ -405,13 +405,21 @@ static void g_createscreengroup(ArmCpu& c) {
         c.r[0] = err;
         return;
     }
+    // No buffers given: the user half allocates them, and a table of them. 23.10's (graphix 0x4320)
+    // then has the folio mark each bitmap's buffer as its own (bm_SysMalloc, 0x3684), which
+    // DeleteScreenGroup gives back, and gives the table back once the group is made (0x46e0) --
+    // even when it was not; the 1993 folio does neither.
+    bool later = pf_os_release() >= 23;
+    uint32_t lists = pf_r32(pf_current_task() + T_FREEMEMORYLISTS), table = 0;
+    int32_t table_size = (int32_t)((uint32_t)(bitmaps * screens) << 2);
+    auto give_table_back = [&] { if (table && later) pf_free_mem(lists, table, table_size); };
     if (!arg[CSG_BUFFERS]) {
-        uint32_t lists = pf_r32(pf_current_task() + T_FREEMEMORYLISTS);
-        uint32_t p = pf_alloc_mem(lists, (int32_t)((uint32_t)(bitmaps * screens) << 2), 0, true);
+        uint32_t p = pf_alloc_mem(lists, table_size, 0, true);
         if (!p) {
             c.r[0] = GRAFERR_NOMEM;
             return;
         }
+        table = p;
         arg[CSG_BUFFERS] = p;
         for (int32_t s = 0; s < screens; ++s) {
             uint32_t widths = arg[CSG_WIDTHS], heights = arg[CSG_HEIGHTS];
@@ -429,12 +437,14 @@ static void g_createscreengroup(ArmCpu& c) {
                 pf_w32(p, buf);
                 if (!buf) {
                     c.r[0] = GRAFERR_NOMEM;
+                    give_table_back();
                     return;
                 }
             }
         }
     }
-    c.r[0] = csg_supervisor(c, c.r[0], arg);
+    c.r[0] = csg_supervisor(c, c.r[0], arg, table && later);
+    give_table_back();
 }
 
 // Graphics -104: Err AddScreenGroup(Item group, TagArg* tags) -- SWI 17 (0x31dc): marks the

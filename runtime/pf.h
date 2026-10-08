@@ -293,6 +293,9 @@ const char* pf_pad_button_name(uint32_t bit);
 // matched without case. The host path, or "" when there is no such file.
 extern std::string g_pf_disc_root;
 std::string pf_host_path(const char* path);
+// The disc's OS release (its os_code's 3DO header version: 23 for 23.10, 0 for 1993's), for where
+// a later folio differs from the 1993 one the runtime follows.
+uint32_t pf_os_release();
 
 // The folios' handlers register themselves here.
 void     pf_kernel_init();

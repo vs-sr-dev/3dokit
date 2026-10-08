@@ -227,8 +227,8 @@ static void k_sendio(ArmCpu& c) { c.r[0] = (uint32_t)pf_send_io(c, (int32_t)c.r[
 // swi 0x10003: Err DeleteItem(Item) -- 0x138c8 and 0x1379c: the node, else BADITEM; the task must
 // own it or be it, or be privileged (0x12f7c), else NOTPRIV; then the kind's own deletion, and
 // the item is gone. The kinds made so far:
-// * an IOReq (0x14114): one in progress is aborted and waited for first (not yet: the run
-//   stops); off its device's list.
+// * an IOReq (0x14114): one in progress is aborted and waited for first (abort_in_progress);
+//   off its device's list.
 // * a device (0x14a60): its delete hook, and when that says 0 every IOReq on the device, each
 //   deleted as by its owner, and the device off the kernel's list (which the runtime does not
 //   keep).
@@ -239,6 +239,31 @@ static void k_sendio(ArmCpu& c) { c.r[0] = (uint32_t)pf_send_io(c, (int32_t)c.r[
 //   item stays.
 // The kernel also gives the node's memory and its name back to the OS, and so does the runtime
 // (pf_item_free). Any other kind stops the run: not yet.
+static std::vector<uint32_t> g_sport_waiting;   // copies and clones, for the next blank
+static std::vector<uint32_t> g_timer_waiting;   // by ioi_Offset, as the Operator's list
+
+// An IOReq in progress, about to be deleted: the kernel aborts it (its driver's drv_AbortIO) and
+// waits for it. A driver with an abort of its own (an open file's) ends it so. The SPORT and timer
+// drivers are the ROM Operator's: their aborts are not read yet, and the request is simply taken
+// off their queue and done -- its error is not set, which only matters to a task still waiting on
+// it, and the requests deleted so far are a task's that has ended.
+static void abort_in_progress(ArmCpu& c, uint32_t ior) {
+    auto a = g_abort_hooks.find(pf_r32(ior + IO_DEV));
+    if (a != g_abort_hooks.end()) {
+        a->second(ior);
+        return;
+    }
+    bool found = false;
+    for (auto* q : {&g_sport_waiting, &g_timer_waiting})
+        for (size_t i = 0; i < q->size() && !found; ++i)
+            if ((*q)[i] == ior) {
+                q->erase(q->begin() + (long)i);
+                found = true;
+            }
+    if (!found) pf_stop(c, "DeleteItem: an IOReq in progress on a device without an abort: not yet");
+    pf_w32(ior + IO_FLAGS, pf_r32(ior + IO_FLAGS) | IO_DONE);
+}
+
 static int32_t delete_as(ArmCpu& c, int32_t item, uint32_t task) {
     uint32_t n = pf_item_node(item);
     if (!n) return (int32_t)KERR_BADITEM;
@@ -247,7 +272,7 @@ static int32_t delete_as(ArmCpu& c, int32_t item, uint32_t task) {
         return (int32_t)KERR_NOTPRIV;
     uint32_t kind = pf_r8(n + 8) << 8 | pf_r8(n + 9);
     if (kind == (1u << 8 | IOREQNODE)) {
-        if (!(pf_r32(n + IO_FLAGS) & IO_DONE)) pf_stop(c, "DeleteItem: an IOReq in progress: not yet");
+        if (!(pf_r32(n + IO_FLAGS) & IO_DONE)) abort_in_progress(c, n);
         pf_list_rem_node(n + IO_LINK);
         int32_t msg = (int32_t)pf_r32(n + IO_MSGITEM);      // its reply message goes too (0x14170)
         if (uint32_t m = pf_check_item(msg, 1, MESSAGENODE)) {
@@ -318,7 +343,6 @@ static void defer(uint32_t ior) { pf_w32(ior + IO_FLAGS, pf_r32(ior + IO_FLAGS) 
 // What the hardware does with the words the driver hands it is the SDK's documentation ("The
 // SPORT Device"). The driver's own range checks (BADIOARG) are not made: a request outside whole
 // VRAM pages stops the run.
-static std::vector<uint32_t> g_sport_waiting;   // copies and clones, for the next blank
 
 static void sport_do(uint32_t ior) {
     uint32_t cmd = pf_r8(ior + IOI_COMMAND), page = pf_page_size(MEMTYPE_VRAM);
@@ -376,7 +400,6 @@ static void sport_vbl(uint64_t) {
 enum : uint32_t { TIMER_UNIT_VBLANK = 0, TIMERCMD_DELAY = 3, TIMERCMD_DELAYUNTIL = 4 };
 
 static uint64_t g_vbl_count;                    // the blanks since the boot
-static std::vector<uint32_t> g_timer_waiting;   // by ioi_Offset, as the Operator's list
 
 static int32_t timer_dispatch(uint32_t ior) {
     uint32_t cmd = pf_r8(ior + IOI_COMMAND), unit = pf_r8(ior + IOI_UNIT);

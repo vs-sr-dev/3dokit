@@ -1208,6 +1208,27 @@ int pf_shell_boot(int (*run)(const std::string& host)) {
     return g_shell_result;
 }
 
+// The disc's OS release: the version byte of its System/Kernel/os_code's 3DO header (the AIF after
+// the 16-byte boot header, +0x80 + 0x14) -- 23 on Immercenary's disc (23.10), 0 on Crash 'n Burn's
+// (1993); 0 when the disc has none. Where a later folio differs from the 1993 one the runtime
+// follows, the release says which.
+uint32_t pf_os_release() {
+    static std::string s_root;
+    static uint32_t s_release;
+    if (s_root != g_pf_disc_root) {
+        s_root = g_pf_disc_root;
+        s_release = 0;
+        std::string host = pf_host_path("/System/Kernel/os_code");
+        if (!host.empty()) {
+            std::ifstream f(host, std::ios::binary);
+            f.seekg(0xa4);
+            char v = 0;
+            if (f.read(&v, 1)) s_release = (uint8_t)v;
+        }
+    }
+    return s_release;
+}
+
 void pf_file_init() {
     g_cwd = "/";
     g_files.clear();
