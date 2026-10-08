@@ -398,6 +398,41 @@ static void f_changedirectory(ArmCpu& c) {
     if (g_pf_trace) pf_log("        ChangeDirectory \"%s\" -> %s\n", path, err ? "error" : g_cwd.c_str());
 }
 
+// swi 0x30008: Item GetDirectory(char* pathBuf, int pathBufLen) -- 0x3598: with a buffer, the
+// buffer checked (ValidateMem for the current task, its error returned) and the current
+// directory's path written into it (0x32c0); the directory's item. The path is the names from
+// the folio's root down, each after a '/', and "" for the root itself: their lengths, a '/' each
+// and the NUL are counted first, and a path that does not fit is -1 with nothing written. The
+// folio's root is "/" here (above), so a path never names the mounted filesystem -- the console
+// would say "/cd-rom/..." -- and ChangeDirectory takes it back to the same place.
+static int32_t get_directory(uint32_t buf, int32_t len) {
+    uint32_t dir = file_node(g_cwd), root = file_node("/");
+    if (!buf) return (int32_t)pf_r32(dir + 24);
+    int32_t err = pf_task_can_write(pf_current_task(), buf, len);
+    if (err) return err;
+    auto name_len = [](uint32_t f) {
+        uint32_t n = 0;
+        while (pf_r8(f + FI_NAME + n)) ++n;
+        return (int32_t)n;
+    };
+    int32_t need = 1;
+    for (uint32_t f = dir; f && f != root; f = pf_r32(f + FI_PARENT)) need += name_len(f) + 1;
+    if (need > len) return -1;
+    pf_w8(buf + (uint32_t)--need, 0);
+    for (uint32_t f = dir; f && f != root; f = pf_r32(f + FI_PARENT)) {
+        int32_t n = name_len(f);
+        need -= n;
+        for (int32_t i = 0; i < n; ++i) pf_w8(buf + (uint32_t)(need + i), pf_r8(f + FI_NAME + (uint32_t)i));
+        pf_w8(buf + (uint32_t)--need, '/');
+    }
+    return (int32_t)pf_r32(dir + 24);
+}
+
+static void f_getdirectory(ArmCpu& c) {
+    c.r[0] = (uint32_t)get_directory(c.r[0], (int32_t)c.r[1]);
+    if (g_pf_trace) pf_log("        GetDirectory -> %s %08X\n", g_cwd.c_str(), c.r[0]);
+}
+
 // swi 0x3000b: Item CreateAlias(char* name, char* value) -- 0x3684: a name of at most 31
 // characters and a value of at most 255, else BADNAME; an alias node (FILEALIASNODE: its ItemNode,
 // a_Value, the value) for the caller, replacing one of the same name.
@@ -890,6 +925,7 @@ void pf_file_init() {
     pf_on_swi(0x30000, f_opendiskfile);
     pf_on_swi(0x30001, f_closediskfile);
     pf_on_swi(0x30007, f_changedirectory);
+    pf_on_swi(0x30008, f_getdirectory);
     pf_on_swi(0x3000b, f_createalias);
     pf_on_slot(PF_FILE, -4, f_opendiskstream);
     pf_on_slot(PF_FILE, -8, f_readdiskstream);

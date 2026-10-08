@@ -231,7 +231,7 @@ both discs:
   AIF startup's slot -120 (the kernel's command-line parser), items
   (`FindItem` by type and name, `OpenItem`, `CloseItem`, `LookupItem`, the
   folios registered as items), `memset` and `memcpy` (a memmove, as the
-  1993 kernel's is), the File folio's `ChangeDirectory`, and
+  1993 kernel's is), the File folio's `ChangeDirectory` and `GetDirectory`, and
   memory: the MemHdrs, the OS's and the task's MemLists in `mem.h`'s
   layout, `AllocMemFromMemLists`, `FreeMemToMemLists`, `ScavengeMem`,
   `GetPageSize`, `FindMH` and `AllocMemBlocks` as the 1993 kernel does them
@@ -320,8 +320,8 @@ both discs:
   dialog on the cel engine, and with `--pad a@1300x1` plays its intro
   movie and reaches its Select Game menu, a second A its Select Character
   screen, five more the circuit, its champion's movie, the pre-race screen
-  and the race, whose 3D cels the projector draws; Immercenary's `p` configures itself with the event broker and
-  stops at the File folio's `GetDirectory`. The
+  and the race, whose 3D cels the projector draws; Immercenary's `p` configures itself with the event broker, finds its
+  directory and stops at `CreateThread`'s tag 24, 23.10's. The
   emitter computes every flag it sets
   (no liveness pass yet), reads literal pools from memory rather than
   folding them, and a return to anywhere but its call's next word stops
