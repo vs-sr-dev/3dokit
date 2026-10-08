@@ -771,6 +771,17 @@ void pf_stream_close(const ArmCpu& c, uint32_t below, uint32_t st) {
 // their aliases: a line `alias NAME VALUE` makes one, a line naming a script (a file on the disc
 // that is not an AIF image) runs it, once; every other line -- a program, a folio, the shell's
 // other commands -- is the runtime's own business or none.
+//
+// A line ends at the first '&', '@' or '%' in it, as the shell cuts it (each with strchr): '&' a
+// program sent to the background, and in the 1994 shell (23.10's System/Tasks/shell, 0x544) '@' a
+// program loaded once and kept (0x370) and '%' a script (0x704) -- its own start runs
+// "^/system/scripts/startopera%", and Immercenary's startopera names "$tasks/eventbroker@" and
+// "$boot/AppStartup%". The 1993 shell knows '&' and '#' only.
+static void shell_cut(std::string& line) {
+    size_t cut = line.find_first_of("&@%");
+    if (cut != std::string::npos) line.erase(cut);
+}
+
 static void shell_script(const std::string& at, std::set<std::string>& ran) {
     if (!ran.insert(at).second) return;
     std::ifstream f(host_of(at), std::ios::binary);
@@ -782,6 +793,7 @@ static void shell_script(const std::string& at, std::set<std::string>& ran) {
         if (j == std::string::npos) j = text.size();
         std::string line = text.substr(i, j - i);
         i = j + 1;
+        shell_cut(line);
         std::vector<std::string> words;
         for (size_t k = 0; k < line.size();) {
             size_t s = line.find_first_not_of(" \t", k);
@@ -810,11 +822,12 @@ static void shell_start() {
 
 // ---- the shell, running the disc (pfboot --boot) ---------------------------------------------
 // The same scripts carried out line by line, as the console's shell does: the words of a line up
-// to one beginning with '#'; `alias NAME VALUE`; the shell's own commands that touch nothing here
-// (bg, bgkill, killkprintf, minmem) passed over -- `bg` most likely sends the programs after it,
-// the OS's own, to the background, and a trailing `#` (Crash 'n Burn's "^/ex #") may ask for a
-// program to be waited for; every program here is waited for, which is what the console shows
-// of that disc -- ; a name walked as the File folio walks it: an AIF
+// to one beginning with '#' (and to its first '&', '@' or '%', above); `alias NAME VALUE`; the
+// shell's own commands that touch nothing here (bg, fg, bgkill, killkprintf, minmem) passed over
+// -- `bg` and `fg` set whether the programs after them are sent to the background, a '&' sends
+// one, and a '#' anywhere in a line asks for it to be waited for (Crash 'n Burn's "^/ex #": both
+// shells cut the line there and clear the flag); every program here is waited for, which is what
+// the console shows of those discs -- ; a name walked as the File folio walks it: an AIF
 // image is a program -- the OS's own (under /System: the daemons, the folios, the event broker)
 // are the runtime's and are not run; any other is run until it ends, then the next line --, any
 // other file a script, run there and then (as its last line, in its place: a disc's scripts can
@@ -840,6 +853,7 @@ static std::vector<std::vector<std::string>> script_lines(const std::string& at)
         if (j == std::string::npos) j = text.size();
         std::string line = text.substr(i, j - i);
         i = j + 1;
+        shell_cut(line);
         std::vector<std::string> words;
         for (size_t k = 0; k < line.size();) {
             size_t s = line.find_first_not_of(" \t", k);
@@ -870,7 +884,7 @@ static void shell_carry_out(std::string at, int depth) {
                 if (w.size() >= 3) g_aliases[0][lower(w[1])] = w[2];
                 continue;
             }
-            if (cmd == "bg" || cmd == "bgkill" || cmd == "killkprintf" || cmd == "minmem") continue;
+            if (cmd == "bg" || cmd == "fg" || cmd == "bgkill" || cmd == "killkprintf" || cmd == "minmem") continue;
             std::string to;
             g_cwd = "/";                                // the shell's own directory, $boot
             if (walk(w[0], to) || is_dir(to)) {

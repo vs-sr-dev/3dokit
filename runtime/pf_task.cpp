@@ -23,12 +23,13 @@ enum : uint32_t {
     KERNELNODE = 1, TASKNODE = 5,
     // Task (task.h)
     T_THREADTASK = 0x24, T_REGS = 0x44, T_SP = 0x78, T_LK = 0x7c, T_PC = 0x80, T_PSR = 0x84,
+    T_FLAGS = 0xd0, TASK_ALLOCATED_SP = 2,
     // n_Flags of a task
     TASK_READY = 1, TASK_WAITING = 2, TASK_SUPER = 8,
     SIGF_ABORT = 4, SIGF_DEADTASK = 0x10,
     // CREATETASK_TAG_* (task.h), TAG_NOP (types.h)
     TAG_NAME = 1, TAG_PRI = 2, TAG_PC = 10, TAG_MAXQ = 11, TAG_STACKSIZE = 12, TAG_ARGC = 13,
-    TAG_ARGP = 14, TAG_SP = 15, TAG_BASE = 16, TAG_NOP = 255,
+    TAG_ARGP = 14, TAG_SP = 15, TAG_BASE = 16, TAG_ALLOCDTHREADSP = 24, TAG_NOP = 255,
     // the shell's spawnpri (System/Tasks/shell, 0x64f0): a program it starts runs at 100
     SPAWN_PRI = 100,
 };
@@ -134,7 +135,9 @@ static void block() {
 
 // A thread's host thread: its turn, then its function from the registers CreateTask left in its
 // node; when the function returns (to the kernel's 0x168fc, which deletes the thread) or it exits,
-// the thread is gone and the next ready task runs.
+// the thread is gone and the next ready task runs. 23.10's return (0x631c, through 0x410) first
+// gives a thread made with _ALLOCDTHREADSP its stack back: FreeMemToMemLists of t_StackBase and
+// t_StackSize to the task's lists, each of their semaphores locked before -- the runtime has none.
 static void run_task(Task* t) {
     {
         std::unique_lock<std::mutex> l(*g_lock);
@@ -149,6 +152,9 @@ static void run_task(Task* t) {
         arm_call(c, pf_r32(t->node + T_PC));
         if (c.pc != kThreadExit) arm_fault(c, c.pc, "a thread returned somewhere other than the kernel");
         if (g_pf_trace) pf_log("        (thread \"%s\" returns: gone)\n", name(t));
+        if (pf_r32(t->node + T_THREADTASK) && (pf_r32(t->node + T_FLAGS) & TASK_ALLOCATED_SP))
+            pf_free_mem(pf_r32(t->node + T_FREEMEMORYLISTS), pf_r32(t->node + T_STACKBASE),
+                        (int32_t)pf_r32(t->node + T_STACKSIZE));
     } catch (const PfExit&) {
         if (g_pf_trace) pf_log("        (thread \"%s\" exits: gone)\n", name(t));
     }
@@ -281,7 +287,11 @@ static void k_setitempri(ArmCpu& c) {
 // Tags: TAG_ITEM_NAME (required), TAG_ITEM_PRI (the creator's when not given; 10 to 199 from a
 // task that is not privileged), CREATETASK_TAG_PC, _STACKSIZE (at least 0x80 for a thread), _SP
 // (which makes it a thread: its stack is the caller's memory), _ARGC and _ARGP (r0 and r1, and
-// r5 and r6), _BASE (r9 and r7), _MAXQ (the quantum: kept, unused). A thread shares its creator's
+// r5 and r6), _BASE (r9 and r7), _MAXQ (the quantum: kept, unused), and _ALLOCDTHREADSP (24),
+// whose value is not read: the stack is the thread's, to be freed when it returns (bit 1 of
+// t_Flags, 0xd0). That tag is Portfolio 23.10's (its kernel's tag callback, 0x6400 there, the last
+// of its switch); the 1993 kernel's switch ends at 23 and refuses it (BADTAG), and a program of
+// that time's library never passes it -- 23.10's CreateThread does. A thread shares its creator's
 // memory lists, has the eight system signals, sl at its stack's base + 0x80, and returns to the
 // kernel's 0x168fc. The kernel also gives each of the shared MemLists a semaphore: not here, where
 // item numbers are not the console's anyway.
@@ -294,6 +304,7 @@ static void k_setitempri(ArmCpu& c) {
 uint32_t pf_create_task(ArmCpu& c, uint32_t tags) {
     uint32_t me = pf_current_task();
     uint32_t nm = 0, p = pf_r8(me + 10), pc = 0, size = 0, argc = 0, argp = 0, sp = 0, base = 0, maxq = 0;
+    uint32_t flags = 0;
     for (uint32_t a = tags; a; a += 8) {
         uint32_t tag = pf_r32(a), v = pf_r32(a + 4);
         if (!tag) break;
@@ -307,6 +318,7 @@ uint32_t pf_create_task(ArmCpu& c, uint32_t tags) {
         case TAG_ARGP: argp = v; break;
         case TAG_SP: sp = v; break;
         case TAG_BASE: base = v; break;
+        case TAG_ALLOCDTHREADSP: flags |= TASK_ALLOCATED_SP; break;
         case TAG_NOP: break;
         default: pf_stop(c, "CreateTask: a tag of a task with its own image: not yet");
         }
@@ -329,6 +341,7 @@ uint32_t pf_create_task(ArmCpu& c, uint32_t tags) {
     pf_w32(n + T_STACKBASE, stack_base);
     pf_w32(n + T_STACKSIZE, (size + 3) & ~3u);
     pf_w32(n + T_ALLOCATEDSIGS, 0xFF);
+    pf_w32(n + T_FLAGS, pf_r32(n + T_FLAGS) | flags);
     const uint32_t regs[13] = {argc, argp, 0, 0, 0, argc, argp, base, 0, base, stack_base + 0x80, 0, 0};
     for (int i = 0; i < 13; ++i) pf_w32(n + T_REGS + 4u * i, regs[i]);
     pf_w32(n + T_SP, sp);

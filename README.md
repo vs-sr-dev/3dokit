@@ -321,7 +321,9 @@ both discs:
   movie and reaches its Select Game menu, a second A its Select Character
   screen, five more the circuit, its champion's movie, the pre-race screen
   and the race, whose 3D cels the projector draws; Immercenary's `p` configures itself with the event broker, finds its
-  directory and stops at `CreateThread`'s tag 24, 23.10's. The
+  directory and starts its `GameEntry` thread (`CreateThread`'s tag 24,
+  23.10's); started from the disc, its `launchme` stops at the File folio's
+  `LoadCode`, which 23.10's own File folio (in its `os_code`) has. The
   emitter computes every flag it sets
   (no liveness pass yet), reads literal pools from memory rather than
   folding them, and a return to anywhere but its call's next word stops
