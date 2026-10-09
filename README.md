@@ -4,7 +4,7 @@ A game-agnostic toolkit for Panasonic 3DO reverse engineering and native PC
 ports: disc images and the Opera filesystem, the executables and the ARM60
 code in them, the Portfolio OS surface a program touches, the CEL engine's
 pixel formats, the DataStream with its Cinepak films and SDX2 sound, AIFF
-samples, the DSP instrument library -- and the way three games now run on PC:
+samples, the DSP instrument library -- and the way four games now run on PC:
 an ARM60 static recompiler that turns a 3DO program into C++, and a
 reimplementation of the Portfolio OS (`pfboot`) that answers every OS call
 the way the console's own OS code does, from the boot to the cel engine,
@@ -29,8 +29,9 @@ in the ports.
 | [pc-immercenary](https://github.com/vs-sr-dev/pc-immercenary) | Immercenary (1995, 3DO; Portfolio 23.10) | where the kit was born: the disc, the AIF and binary headers, the ARM cross-referencer, the OS surface, library proofs and the pairing of its two executables, the cels, the DataStream and its Cinepak and SDX2, the AIFF samples, the DSP instruments, the C runtime. Then, recompiled onto the kit: several programs in memory at once and tasks with their own image, 23.10's folios, the drive's reading time, 23.10's DSP instruments and the DSP's interpreter. **Playable** |
 | [pc-crashnburn](https://github.com/vs-sr-dev/pc-crashnburn) | Crash 'n Burn (1993, 3DO; the launch OS) | the route itself: the ARM60 decoder and interpreter, the static recompiler and its self-test, and the Portfolio runtime built call by call on the 1993 OS's own code -- the kernel, the File folio and the shell, the Graphics folio and the cel engine, the audio folio and the DSP, the event broker and the pad, `pfcheck` against the OS's own code. **Playable**, at par with the Phoenix emulator |
 | [pc-doctorhauzer](https://github.com/vs-sr-dev/pc-doctorhauzer) | Doctor Hauzer (1994, 3DO; Portfolio 20.21) | the OS between the other two: each folio's own version deciding the runtime's way rather than the kernel's release, and the folios' nodes carrying the versions the kernel gives them; a kernel with no relocation list (`aif`); the System images' decompressor in C++, GRAPHIX laid in the OS's memory and its built-in font, `GetSysErr` from the disc's own texts; the save -- the `ram` device, the console's NVRAM and the File folio 20.30's linked-memory filesystem, the disc's own `LMADM` and `FORMAT` run by the shell --; OPERAMATH 20.53, `SleepAudioTicks`, the timer's microseconds, an AIFF's rate read as the folio reads it, and the kernel's quantum. **Playable**: the opening, the menu and the real-time 3D rooms, in the window with their music |
+| [pc-escapefrommonstermanor](https://github.com/vs-sr-dev/pc-escapefrommonstermanor) | Escape from Monster Manor (1993, 3DO; Portfolio 21.10) | the fourth release of the OS: a function reached only by a pointer from a literal pool (`recomp.discover`), cels whose preamble opens their pixel data and DataStreams with no header in the file readers, Operamath's `MulMat33Mat33_F16`, Graphics' `FillRect`, the audio folio's envelopes, and a folio's build as well as its version (GRAPHIX 20.45's two builds, the font laid by build; `pfcheck` on both). **Playable**: the first level in the window with its music; the monsters animate at twice the console's pace, the cel engine's time not yet charged |
 
-The three ports keep their game's knowledge to themselves and hold every
+The four ports keep their game's knowledge to themselves and hold every
 kit change against each other: a commit to the kit is checked on every
 disc (traces, frames, sound, `pfcheck`) before it lands in any of them.
 
@@ -205,11 +206,18 @@ both discs:
 
 ## Known gaps
 
-* **Three games.** Four discs and an emulator say these rules are the
-  3DO's, and three games on three releases of the OS (1993's, 20.21,
+* **Four games.** Five discs and an emulator say these rules are the
+  3DO's, and four games on four releases of the OS (1993's, 20.21, 21.10,
   23.10) say the code-side tools and the runtime generalise -- each of
   them asked something new of the kit, and the next will too. OMF2097's
   `LaunchMe` runs only to its 36th OS call.
+* **The cel engine takes no guest time.** The guest's clock counts the
+  ARM60's clocks, not MADAM's work nor the bus it shares: where the
+  console cannot draw a frame every field, the runtime still does. Two
+  games show it -- Total Eclipse's preview on Crash 'n Burn's disc, and
+  Escape from Monster Manor's monsters, which animate once a frame and so
+  at twice the console's pace -- and the developers' pace is the one to
+  keep: charging `DrawCels` its time is the next work.
 * **The CEL engine's projector is the patent's.** `cel` and `tdk_cel` turn
   a cel's pixels into colours with the hardware's transparency; the
   runtime's `pf_cel` runs `DrawCels` as MADAM does -- the CCB list, the
@@ -426,6 +434,14 @@ a NOP at 0x04 has no relocation list; the runtime, the System images'
 decompressor, GRAPHIX's font, `GetSysErr`, the NVRAM and its filesystem,
 and the kernel's quantum -- each checked on the other two games' traces
 before it went in.
+
+Escape from Monster Manor (1993; its European disc of 1994), the fourth
+port and the kit's fifth disc, is the first on Portfolio 21.10: discovery
+learnt a function reached only by a pointer from a literal pool, the file
+readers a cel whose preamble opens its pixel data and DataStreams with no
+header, the runtime the audio folio's envelopes -- and that a folio's
+version does not name its code: GRAPHIX 20.45 comes in two builds, and
+the font is now laid by build. Its first level plays in the window.
 
 ## Licence
 
