@@ -43,8 +43,12 @@ question the Opera emulator's MADAM is the reference it was checked against:
   line, 1 literal run, 2 transparent run, 3 one pixel repeated) and for the
   last three a six-bit count less one. A packed cel ignores PRE1's LRFORM.
 
+* **The preamble** is the CCB's PRE0 and PRE1 when its CCBPRE flag is set;
+  when it is clear, the preamble opens the pixel data -- one word for a
+  packed cel, two for a literal one -- and the pixels follow (the guide's
+  "Creating a Preamble"; Escape from Monster Manor's `statscreen.cel`).
+
 Not done, because no disc read so far needs it and nothing has checked it:
-preamble words in the pixel data rather than the CCB (CCBPRE clear),
 LRFORM on a literal cel, and SKIPX. Each raises rather than guessing.
 
 An IMAG screen image is the frame buffer: the 32-bit word at
@@ -193,10 +197,6 @@ def raw_pixels(ccb, pdat):
     bpp = ccb.depth
     if bpp is None:
         raise ValueError('depth code %d is not a depth' % (ccb.pre0 & 7))
-    if not ccb.flags & CCB_CCBPRE:
-        raise NotImplementedError('CCBPRE clear: the preamble is in the '
-                                  'pixel data, which no disc read so far '
-                                  'does')
     if ccb.skipx:
         raise NotImplementedError('SKIPX %d: not seen on a disc' % ccb.skipx)
     mask = (1 << bpp) - 1
@@ -285,6 +285,23 @@ def colour(ccb, v, plut):
     if bpp == 16:
         return (c & 0x7fff) | (v & 0x8000)
     return c
+
+
+def preamble_in_data(ccb, pdat):
+    """A CCB and its PDAT as the engine reads them: with CCBPRE clear, PRE0
+    (and PRE1, for a literal cel) taken from the PDAT's first words, and the
+    pixels after them."""
+    if ccb.flags & CCB_CCBPRE:
+        return ccb, pdat
+    n = 1 if ccb.packed else 2
+    if len(pdat) < 4 * n:
+        return ccb, pdat
+    pre = struct.unpack_from('>%dI' % n, pdat, 0)
+    words = [getattr(ccb, k) for k in CCB.FIELDS]
+    words[CCB.FIELDS.index('pre0')] = pre[0]
+    if n == 2:
+        words[CCB.FIELDS.index('pre1')] = pre[1]
+    return CCB(words, ccb.version), pdat[4 * n:]
 
 
 class Frame:
@@ -379,7 +396,7 @@ class CelFile:
                 if imag:
                     self.frames.append(Frame(pdat=body, imag=imag))
                 elif ccb:
-                    group.append(('frame', Frame(ccb, body)))
+                    group.append(('frame', Frame(*preamble_in_data(ccb, body))))
                     self.frames.append(group[-1][1])
         for g in groups:
             pluts = [x for k, x in g if k == 'plut']

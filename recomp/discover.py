@@ -164,9 +164,53 @@ class Program:
                     while todo:
                         e = todo.pop()
                         self._descend(self.funcs[e])
+        self._pointed_leaves(todo, seed)
         self.code = set()
         for f in self.funcs.values():
             self.code |= f.code
+
+    def _pointed_leaves(self, todo, seed):
+        """A function with neither a prologue nor a name, reached only through a pointer: a
+        frameless routine the compiler laid right after another function's last word (lib3DO's
+        DataStream hands one over from `OpenStreamFile`: Escape from Monster Manor's 0x1c4c8,
+        Doctor Hauzer's 0x2ced4). A relocated word in a literal pool that reached code loads
+        (`ldr rN, [pc, #k]`), naming the word just past a function's code, a word no function
+        reaches, is such a function when its own descent is clean -- no data met, no word of
+        another function's -- and so is what it calls. The pool matters: a debugger's tables
+        linked into the read-write area (Escape from Monster Manor's Cinepak library, built
+        with them) name the words after functions' last returns too, and no code loads them."""
+        while True:
+            code = set()
+            for f in self.funcs.values():
+                code |= f.code
+            pools = set()
+            for a in code:
+                i = self.at(a)
+                if i.kind == 'sdt' and i.l and i.rn == PC and i.offset[0] == 'imm':
+                    pools.add(a + 8 + (i.offset[1] if i.u else -i.offset[1]))
+            found = []
+            for r in sorted(self.relocs & pools):
+                if r + 4 > len(self.d):
+                    continue
+                v = self._word(r)
+                if v & 3 or not self.start <= v < self.end or v in self.funcs or v in code \
+                        or v - 4 not in code:
+                    continue
+                g = Function(v, 'pointer')
+                self._descend(g)
+                if not g.problems and not g.code & code:
+                    found.append(v)
+            if not found:
+                return
+            for v in found:
+                seed(v, 'pointer')
+                self.pointed.add(v)
+            while todo:
+                f = self.funcs[todo.pop()]
+                self._descend(f)
+                for t in sorted(f.calls):
+                    if t not in self.funcs:
+                        seed(t, 'call')
 
     def _inside(self, a):
         """In the code searched: the image's, or an AIF routine's extent."""

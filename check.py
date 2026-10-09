@@ -90,10 +90,13 @@ def main(argv=None):
         head = head[:min(20, e.size)]
         is_cel = head[:4] in cel.HEADS
         is_strm = len(head) >= 20 and (head[:4] == b'SHDR' or (
-            head[:4] == b'DACQ' and head[16:20] == b'MTBL'))
+            head[:4] == b'DACQ' and head[16:20] == b'MTBL') or
+            head[:4] in stream.HEADERLESS)
         if not is_cel and not is_strm:
             continue
         data = vol.read(e)
+        if is_strm and not stream.opens_as_stream(data[:0x40000]):
+            continue
         if is_cel:
             line = check_cel(e.path, data)
             if line is None:

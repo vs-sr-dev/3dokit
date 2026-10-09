@@ -5,6 +5,7 @@
 #include "pf.h"
 #include <cstdio>
 #include <cstdlib>
+#include <utility>
 #include <vector>
 
 // The folio's structures (graphics.h; the 1.2 and 1.3 headers agree, and the 1993 folio's stores
@@ -726,6 +727,38 @@ static void g_drawto(ArmCpu& c) {
     g_drawcels(c);
 }
 
+// Graphics -136: Err FillRect(Item bitmap, GrafCon* gc, Rect* r) -- SWI 35 (GRAPHIX 20.45: 0x2d8c in
+// Escape from Monster Manor's build 419, 0x2b5c in Doctor Hauzer's build 72, the same code): DrawTo's
+// cel -- one 16-bit uncoded pixel of gc_FGPen after its preamble (0x16 and 0) at the CCB's +0x44, the
+// same flags and PIXC, width and height 1 -- stretched over the rectangle: its corners put in order
+// (left above right, top above bottom), the origin (left, top) in 16.16, HDX the width right - left
+// + 1 in 12.20, VDY the height bottom - top + 1 in 16.16, HDY, VDX, HDDX and HDDY 0; DrawCels'
+// result back.
+static void g_fillrect(ArmCpu& c) {
+    static uint32_t s_block;
+    if (!s_block) s_block = pf_os_alloc(0x50);
+    uint32_t gc = c.r[1], rect = c.r[2], ccb = s_block;
+    int32_t left = (int32_t)pf_r32(rect), top = (int32_t)pf_r32(rect + 4);
+    int32_t right = (int32_t)pf_r32(rect + 8), bottom = (int32_t)pf_r32(rect + 12);
+    if (left > right) std::swap(left, right);
+    if (top > bottom) std::swap(top, bottom);
+    for (uint32_t i = 0; i < 0x50; i += 4) pf_w32(ccb + i, 0);
+    pf_w32(ccb + 0x44, 0x16);
+    pf_w32(ccb + 0x4c, pf_r32(gc + 0x14) << 16);
+    pf_w32(ccb + 0x00, 0x57260030u);
+    pf_w32(ccb + 0x08, ccb + 0x44);
+    pf_w32(ccb + 0x30, 0x1f401f40u);
+    pf_w32(ccb + 0x3c, 1);
+    pf_w32(ccb + 0x40, 1);
+    uint32_t x = (uint32_t)left << 16, y = (uint32_t)top << 16;
+    pf_w32(ccb + 0x10, x);
+    pf_w32(ccb + 0x14, y);
+    pf_w32(ccb + 0x18, (((uint32_t)(right + 1) << 16) - x) << 4);
+    pf_w32(ccb + 0x24, ((uint32_t)(bottom + 1) << 16) - y);
+    c.r[1] = ccb;
+    g_drawcels(c);
+}
+
 // Graphics -60: Err SetClipOrigin(Item bitmap, int32 x, int32 y) -- SWI 3 (0x1e98): the bitmap
 // (CheckItem, else GRAFERR_BADITEM), the caller's or open (else GRAFERR_NOTOWNER); y made even;
 // the clip rectangle must lie inside the bitmap -- x and y at least 0, x + bm_ClipWidth at most
@@ -862,6 +895,7 @@ static void graphics_slots() {
     pf_on_slot(PF_GRAPHICS, -120, g_moveto);
     pf_on_slot(PF_GRAPHICS, -152, g_setcecontrol);
     pf_on_slot(PF_GRAPHICS, -132, g_drawto);
+    pf_on_slot(PF_GRAPHICS, -136, g_fillrect);
     pf_on_delete(NST_GRAPHICS, graphics_delete);
     pf_on_slot(PF_GRAPHICS, -160, g_displayscreen);
     pf_on_slot(PF_GRAPHICS, -172, g_drawcels);

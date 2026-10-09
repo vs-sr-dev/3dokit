@@ -55,14 +55,15 @@ void m_dot3(ArmCpu& c) {
     c.r[0] = (uint32_t)(int32_t)(((int64_t)a[0] * b[0] + (int64_t)a[1] * b[1] + (int64_t)a[2] * b[2]) >> 16);
 }
 
-// swi 0x50002: void MulManyVec3Mat33_F16(vec3f16* dest, vec3f16* src, mat33f16 mat, int32 count)
-// -- Green 0x1ec4, Red 0x1dec: one vector (0x1c30) or a pipeline that reads vector k + 1 before it
-// writes result k, so dest may be src. A count below 1 runs the pipeline about 2^32 times on the
-// console (the software routine would do nothing): stopped here.
-void m_mulmanyvec3mat33(ArmCpu& c) {
-    uint32_t dest = c.r[0], src = c.r[1], mat = c.r[2];
-    int32_t count = (int32_t)c.r[3];
-    if (count < 1) pf_stop(c, "MulManyVec3Mat33_F16 of no vectors (the matrix engine's routine runs on): not yet");
+// count vectors of three through the engine, src to dest: one (0x1c30), or a pipeline that reads
+// vector k + 1 before it writes result k, so dest may be src. A count below 1 runs the pipeline
+// about 2^32 times on the console (the software routine would do nothing): stopped here.
+void mul_many3(ArmCpu& c, uint32_t dest, uint32_t src, uint32_t mat, int32_t count, const char* who) {
+    if (count < 1) {
+        char why[96];
+        std::snprintf(why, sizeof why, "%s of no vectors (the matrix engine's routine runs on): not yet", who);
+        pf_stop(c, why);
+    }
     int32_t m[9], v[3], next[3] = {}, out[3];
     for (int i = 0; i < 9; ++i) m[i] = (int32_t)pf_r32(mat + 4 * i);
     read3(src, v);
@@ -73,6 +74,18 @@ void m_mulmanyvec3mat33(ArmCpu& c) {
         for (int i = 0; i < 3; ++i) v[i] = next[i];
     }
 }
+
+// swi 0x50002: void MulManyVec3Mat33_F16(vec3f16* dest, vec3f16* src, mat33f16 mat, int32 count)
+// -- Green 0x1ec4, Red 0x1dec.
+void m_mulmanyvec3mat33(ArmCpu& c) {
+    mul_many3(c, c.r[0], c.r[1], c.r[2], (int32_t)c.r[3], "MulManyVec3Mat33_F16");
+}
+
+// swi 0x50001: void MulMat33Mat33_F16(mat33f16 dest, mat33f16 src1, mat33f16 src2) -- Escape from
+// Monster Manor's OPERAMATH 21.10, which picks its tables as 20.27 does (0x4f0: Red 0x2d14, Green
+// 0x2d78, else 0x2cb0): Green 0x1f24, a count of 3 into MulManyVec3Mat33_F16's routine (0x1f28) --
+// src1's three rows through the engine, each times src2. 20.53's 0x1ee0 is the same.
+void m_mulmat33mat33(ArmCpu& c) { mul_many3(c, c.r[0], c.r[1], c.r[2], 3, "MulMat33Mat33_F16"); }
 
 // The engine's 4x4 product (23.10's operamath, Immercenary's disc: 0x1a54 one vector, 0x1b1c the
 // pipeline): v times m as operamath.h lays out a mat44f16, out[j] the sum over i of v[i] * m[i][j]
@@ -195,6 +208,7 @@ void m_mulsf16(ArmCpu& c) {
 
 void pf_math_init() {
     pf_on_swi(0x50000, m_mulvec3mat33);
+    pf_on_swi(0x50001, m_mulmat33mat33);
     pf_on_swi(0x50002, m_mulmanyvec3mat33);
     pf_on_swi(0x5000c, m_dot3);
     pf_on_swi(0x50007, m_mulvec4mat44);

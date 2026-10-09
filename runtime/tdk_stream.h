@@ -1,7 +1,8 @@
 /* tdk_stream.h - the 3DO DataStream, Cinepak and SDX2, in C99 for an
  * engine.  The same rules as 3dokit/stream.py, cinepak.py and audio.py:
  *
- *   - a stream is fixed-size blocks, the size at 0x18 of each SHDR; a chunk
+ *   - a stream is fixed-size blocks, the size at 0x18 of each SHDR -- or,
+ *     a stream with no header, where its first FILL chunk ends; a chunk
  *     never straddles a block, and fewer than eight bytes left in a block
  *     means a bare FILL tag with no size;
  *   - a chunk is tag, size, time, channel, sub-type;
@@ -25,6 +26,9 @@ typedef struct {
     uint32_t       len, off, block;
 } tdk_stream;
 
+/* Where the first FILL chunk ends, chunk by chunk from the start (within
+ * the first 0x40000 bytes), when that is a power of two; else 0. */
+uint32_t tdk_stream_first_fill_end(const uint8_t *d, uint32_t len);
 void tdk_stream_init(tdk_stream *s, const uint8_t *d, uint32_t len);
 /* 1 and the next chunk, or 0 at the end. */
 int  tdk_stream_next(tdk_stream *s, tdk_chunk *c);

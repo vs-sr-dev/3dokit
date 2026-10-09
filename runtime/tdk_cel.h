@@ -10,8 +10,10 @@
  *     BGND is set; transparent packets and the rest of a row after its end
  *     of line are never drawn.
  *
- * Preamble words in the pixel data (CCBPRE clear), LRFORM on a literal cel
- * and SKIPX are refused (TDK_CEL_UNSUPPORTED): no disc read so far has them.
+ * A CCB with CCBPRE clear keeps its preamble at the start of its PDAT (one
+ * word packed, two literal): the frame's pre0/pre1 and pdat are those.
+ * LRFORM on a literal cel and SKIPX are refused (TDK_CEL_UNSUPPORTED): no
+ * disc read so far has them.
  */
 #ifndef TDK_CEL_H
 #define TDK_CEL_H

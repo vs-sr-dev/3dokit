@@ -91,6 +91,18 @@ int tdk_cel_parse(const uint8_t *data, uint32_t len, tdk_cel *frames, int max)
                     }
                     f->pdat = body;
                     f->pdat_len = blen;
+                    /* CCBPRE clear: the preamble opens the pixel data, one
+                     * word for a packed cel, two for a literal one */
+                    if (!imag && !(f->flags & CCB_CCBPRE)) {
+                        uint32_t words = f->flags & CCB_PACKED ? 1 : 2;
+                        if (blen >= 4 * words) {
+                            f->pre0 = tdk_be32(body);
+                            if (words == 2)
+                                f->pre1 = tdk_be32(body + 4);
+                            f->pdat = body + 4 * words;
+                            f->pdat_len = blen - 4 * words;
+                        }
+                    }
                 }
                 n++;
             }
@@ -119,7 +131,7 @@ int tdk_cel_raw(const tdk_cel *c, int32_t *out)
     int bpp = depth(c), w = c->width, h = c->height;
     if (c->imag || !bpp || w <= 0 || h <= 0)
         return TDK_CEL_BAD;
-    if (!(c->flags & CCB_CCBPRE) || ((c->pre0 >> 24) & 0xf))
+    if ((c->pre0 >> 24) & 0xf)
         return TDK_CEL_UNSUPPORTED;
     const uint8_t *d = c->pdat;
     uint32_t len = c->pdat_len;

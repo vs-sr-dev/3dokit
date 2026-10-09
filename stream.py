@@ -2,7 +2,9 @@
 travels in.
 
 A stream is a run of fixed-size blocks (`streamBlockSize` from the header,
-64 or 128 KiB on the discs read). A chunk never straddles a block boundary:
+64 or 128 KiB on the discs read; a stream with no header at all -- Escape
+from Monster Manor's four, a `CTRL` chunk first -- has them where its
+first block's `FILL` ends). A chunk never straddles a block boundary:
 slack at the end of a block is a `FILL` chunk, and when fewer than eight
 bytes remain the writer leaves a bare four-byte `FILL` tag with no size
 behind it -- the detail that derails a naive walk.
@@ -76,17 +78,47 @@ class Chunk:
                    self.time, self.chan))
 
 
+HEADERLESS = (b'CTRL', b'FILM', b'SNDS')
+
+
 def is_stream(path):
     """Does a file open like a DataStream: its header, or a marker table
-    in front of it (a container of several streams)?"""
+    in front of it (a container of several streams) -- or, a stream with no
+    header (Escape from Monster Manor's), a CTRL, FILM or SNDS chunk whose
+    first block a FILL chunk fills to a power-of-two boundary?"""
     with open(path, 'rb') as f:
-        h = f.read(20)
-    return h[:4] == b'SHDR' or (h[:4] == b'DACQ' and h[16:20] == b'MTBL')
+        return opens_as_stream(f.read(0x40000))
+
+
+def opens_as_stream(h):
+    """is_stream on a file's first bytes (0x40000 of them are enough)."""
+    if h[:4] == b'SHDR' or (h[:4] == b'DACQ' and h[16:20] == b'MTBL'):
+        return True
+    return h[:4] in HEADERLESS and _first_fill_end(h[:0x40000]) is not None
+
+
+def _first_fill_end(d):
+    """Where the first FILL chunk ends, walking chunk by chunk from the
+    start, when that is a power of two; else None."""
+    off = 0
+    while off + 8 <= len(d):
+        tag, size = d[off:off + 4], struct.unpack_from('>I', d, off + 4)[0]
+        if size < 8 or size & 3:
+            return None
+        if tag == FILL:
+            end = off + size
+            return end if end & (end - 1) == 0 else None
+        off += size
+    return None
 
 
 def block_size(d, default=0x20000):
+    """The header's block size; with no header, where the first block's
+    FILL ends (the stream's first block boundary)."""
     if d[:4] == b'SHDR' and len(d) >= 0x1c:
         return struct.unpack_from('>I', d, 0x18)[0] or default
+    if d[:4] in HEADERLESS:
+        return _first_fill_end(d[:0x40000]) or default
     return default
 
 
