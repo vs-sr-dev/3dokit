@@ -43,7 +43,8 @@ check. Only the GRAPHIX of Crash 'n Burn's disc (16 August 1993) is known.
 
     python -m 3dokit.pfcheck OS_CODE DIR --graphix GRAPHIX [--font-start]
 
-With Doctor Hauzer's GRAPHIX 20.45, a snapshot's call is one of the folio's font calls, run on its
+With GRAPHIX 20.45 (Doctor Hauzer's build 72 or Escape from Monster Manor's build 419, told apart
+by their words), a snapshot's call is one of the folio's font calls, run on its
 code where the runtime laid the folio (its image, relocated, is in the snapshot's OS memory at
 0x4E0000), its few kernel calls stood in the runtime's way (`FontCall`); `--font-start` first
 rebuilds the font as the folio's start leaves it and compares that with the memory before.
@@ -446,6 +447,26 @@ G2045 = {
               0x4078: 0x63c8, 0x40f0: 0x7ef8},
     'drawcels': 0x1954,                  # SWI 39, which DrawChar ends in: not compared here
 }
+# GRAPHIX 20.45 build 419 (Escape from Monster Manor): the same font code 0x2c4 on, its tables and
+# glue elsewhere (51 vectors; the version alone does not tell the two apart, their words do).
+G2045_419 = {
+    'version': (20, 45),
+    'kernelbase': 0x68c4, 'grafbase': 0x6a38,
+    'vectors_end': 0x6bf0,               # slot -4 at 0x6bec
+    'swis_end': 0x6b24, 'nswis': 52,
+    'stack_extend': 0x148,
+    'font_start': 0x4250, 'nchars': 49, 'entry_size': 0x2c,
+    'gf_font': (0xd0, 0x120),
+    'glue': {0x67d0: ('InitList', 0x67d8, 0xe512f024),
+             0x67e0: ('memcpy', 0x67e8, 0xe513f038),
+             0x67f0: ('AddTail', 0x67f8, 0xe512f010),
+             0x6810: ('RemNode', 0x6818, 0xe511f018),
+             0x308: ('AllocMemFromMemLists', 0x318, 0xe519f01c)},
+    'check': {0x6bc4: 0x3c34, 0x6ae8: 0x3be4, 0x6ab4: 0x3e9c,
+              0x433c: 0x68c4, 0x43b4: 0x843c},
+    'drawcels': 0x1b40,
+}
+G2045_BUILDS = (G2045, G2045_419)
 
 
 def graphix_version(path):
@@ -465,11 +486,12 @@ class FontCall:
         with open(graphix_path, 'rb') as f:
             data = f.read()
         raw = aif.relocated(data, 0)
-        g = self.g = G2045
-        word = lambda a: struct.unpack_from('>I', raw, a)[0]
-        for a, v in list(g['check'].items()) + [(at, w) for _, at, w in g['glue'].values()]:
-            if word(a) != v:
-                raise KernelError('%s: the word at %#x is not %#x: not GRAPHIX 20.45' % (graphix_path, a, v))
+        word = lambda a: struct.unpack_from('>I', raw, a)[0] if a + 4 <= len(raw) else None
+        known = lambda g: all(word(a) == v for a, v in list(g['check'].items()) +
+                              [(at, w) for _, at, w in g['glue'].values()])
+        g = self.g = next((g for g in G2045_BUILDS if known(g)), None)
+        if not g:
+            raise KernelError('%s: not a GRAPHIX 20.45 build known here (72 or 419)' % graphix_path)
         self.image = aif.relocated(data, OS_IMAGES)
         self.entries = OS_IMAGES + ((len(self.image) + 3) & ~3)
         mem = self.mem = armemu.Memory()
@@ -533,11 +555,10 @@ class FontCall:
             self.entries = (a + c.r[1] + 3) & ~3
             ret(c, a)
 
-        cpu.traps[G + 0x6170] = init_list
-        cpu.traps[G + 0x6180] = memcpy
-        cpu.traps[G + 0x6190] = add_tail
-        cpu.traps[G + 0x61b0] = rem_node
-        cpu.traps[G + 0x2e0] = alloc
+        stand_in = {'InitList': init_list, 'memcpy': memcpy, 'AddTail': add_tail, 'RemNode': rem_node,
+                    'AllocMemFromMemLists': alloc}
+        for at, (what, _, _) in g['glue'].items():
+            cpu.traps[G + at] = stand_in[what]
         cpu.traps[G + g['stack_extend']] = refuse('the folio ran out of stack')
         cpu.traps[G + g['drawcels']] = refuse('DrawCels: the cel engine is not compared here')
 
@@ -573,7 +594,7 @@ class FontCall:
     def start(self):
         """The folio's start, its font part: the image as the loader leaves it (and the words its
         start writes, KernelBase and GrafBase), the GrafFolio's font fields and the FontEntrys'
-        memory cleared, then 0x3f8c."""
+        memory cleared, then build 72's 0x3f8c (build 419's 0x4250)."""
         g, mem = self.g, self.mem
         for i, b in enumerate(self.image):
             w8(mem, OS_IMAGES + i, b)

@@ -25,7 +25,8 @@
 
 enum : uint32_t {
     NST_AUDIO = 4,
-    TEMPLATE_NODE = 1, INSTRUMENT_NODE = 2, KNOB_NODE = 3, SAMPLE_NODE = 4, CUE_NODE = 5, ATTACHMENT_NODE = 7,
+    TEMPLATE_NODE = 1, INSTRUMENT_NODE = 2, KNOB_NODE = 3, SAMPLE_NODE = 4, CUE_NODE = 5, ENVELOPE_NODE = 6,
+    ATTACHMENT_NODE = 7,
     // audio.h's tags (enum audio_folio_tags)
     AF_TAG_AMPLITUDE = 10, AF_TAG_RATE = 11, AF_TAG_NAME = 12, AF_TAG_PITCH = 14,
     AF_TAG_VELOCITY = 15, AF_TAG_TEMPLATE = 16, AF_TAG_INSTRUMENT = 17, AF_TAG_WIDTH = 22,
@@ -33,26 +34,32 @@ enum : uint32_t {
     AF_TAG_LOWNOTE = 27, AF_TAG_HIGHNOTE = 28, AF_TAG_LOWVELOCITY = 29, AF_TAG_HIGHVELOCITY = 30,
     AF_TAG_SUSTAINBEGIN = 31, AF_TAG_SUSTAINEND = 32, AF_TAG_RELEASEBEGIN = 33,
     AF_TAG_RELEASEEND = 34, AF_TAG_NUMBYTES = 35, AF_TAG_ADDRESS = 36, AF_TAG_SAMPLE = 37,
-    AF_TAG_PRIORITY = 39, AF_TAG_SET_FLAGS = 40, AF_TAG_FREQUENCY = 42, AF_TAG_ENVELOPE = 43,
-    AF_TAG_HOOKNAME = 44, AF_TAG_START_AT = 45, AF_TAG_SAMPLE_RATE = 46,
+    AF_TAG_PRIORITY = 39, AF_TAG_SET_FLAGS = 40, AF_TAG_CLEAR_FLAGS = 41, AF_TAG_FREQUENCY = 42,
+    AF_TAG_ENVELOPE = 43, AF_TAG_HOOKNAME = 44, AF_TAG_START_AT = 45, AF_TAG_SAMPLE_RATE = 46,
     AF_TAG_COMPRESSIONRATIO = 47, AF_TAG_COMPRESSIONTYPE = 48, AF_TAG_NUMBITS = 49,
-    AF_TAG_DELAY_LINE = 57,
+    AF_TAG_SUSTAINTIME = 52, AF_TAG_RELEASETIME = 53, AF_TAG_MICROSPERUNIT = 54,
+    AF_TAG_DELAY_LINE = 57, AF_TAG_RELEASEJUMP = 58, AF_TAG_TIME_SCALE = 61,
     AF_INSF_AUTOABANDON = 1, AF_INSF_LEGALFLAGS = 1,
     // a DSP resource's type (3dokit.dsp): what a knob writes, what a connection joins
     RSRC_KNOB = 1, RSRC_VARIABLE = 2, RSRC_IFIFO = 6, RSRC_OFIFO = 7,
 };
 // The folio's node database (CREATEFOLIO_TAG_NODEDATABASE): a size and n_Flags per node type,
 // 0x90 being NODE_ITEMVALID | NODE_NAMEVALID.
-// Each version's own: 1993's AUDIOFOLIO 20.19 (0xc04c), 20.27 (0xbf94: an instrument 0x64, type 6
-// 0x78) and 23.10 (0xb9e8: a template 0x70, an instrument 0x64, a sample 0x9c, type 6 0x78); the
-// versions between are unread. A node is made that size and cleared; the runtime fills the fields
-// it reads in the 1993 folio.
+// Each version's own: 1993's AUDIOFOLIO 20.19 (0xc04c), 20.27 (0xbf94: an instrument 0x64, an
+// envelope 0x78), 21.10 (0xba48: a template 0x70 as well) and 23.10 (0xb9e8: a sample 0x9c as
+// well); the versions between are unread. A node is made that size and cleared; the runtime fills
+// the fields it reads in the 1993 folio.
 static const uint32_t kNodeSize[] = {0, 0x54, 0x58, 0x34, 0x98, 0x38, 0x74, 0x54, 0x34};
 static const uint32_t kNodeSize2027[] = {0, 0x54, 0x64, 0x34, 0x98, 0x38, 0x78, 0x54, 0x34};
+static const uint32_t kNodeSize2110[] = {0, 0x70, 0x64, 0x34, 0x98, 0x38, 0x78, 0x54, 0x34};
 static const uint32_t kNodeSize2310[] = {0, 0x70, 0x64, 0x34, 0x9c, 0x38, 0x78, 0x54, 0x34};
+static uint32_t audio_version() { return pf_system_version("/System/Folios/AUDIOFOLIO"); }
 static uint32_t node_size(uint32_t type) {
-    uint32_t v = pf_system_version("/System/Folios/AUDIOFOLIO");
-    return (v >= PF_VERSION(23, 10) ? kNodeSize2310 : v >= PF_VERSION(20, 27) ? kNodeSize2027 : kNodeSize)[type];
+    uint32_t v = audio_version();
+    return (v >= PF_VERSION(23, 10)   ? kNodeSize2310
+            : v >= PF_VERSION(21, 10) ? kNodeSize2110
+            : v >= PF_VERSION(20, 27) ? kNodeSize2027
+                                      : kNodeSize)[type];
 }
 static const uint32_t kNodeFlags = 0x90;
 
@@ -181,6 +188,7 @@ struct Instrument {
     // it stops.
     std::map<int, int32_t> playing;
     uint32_t start_time = 0;                // the node's +0x60: the folio's time at the last start (23.10)
+    std::vector<int32_t> envs;              // its envelopes' attachments (+0x9c of the record), in the order made
 };
 struct Knob {
     int32_t ins;
@@ -230,7 +238,40 @@ struct Attachment {
     int32_t next;                           // LinkAttachments (+0x4c): what plays after it, 0 none
     int32_t cue = 0;                        // MonitorAttachment (+0x44): signalled at its end, 0 none
     int32_t cue_index = 0;                  // +0x48: CUE_AT_END (-2), the only one taken
+    // An envelope's (20.27 on): the envelope (+0x30), and the block the folio allocates for it
+    // (+0x50, 0x58 bytes): a node of the timer list (+0x24 to +0x2c), the attachment (+0x30), the
+    // DSP addresses of the hook's variables .target (+0x34) and .current (+0x40) and knobs .incr
+    // (+0x38) and .request (+0x3c), here their resources; the point now reached (+0x44), the
+    // frames left of its segment (+0x48), the value the last chunk went to (+0x4c), the segment's
+    // time in the envelope's units (+0x50) and frames a unit, 16.16 (+0x54). The block is guest
+    // memory, as the timer list links it; the rest is kept here.
+    int32_t env = 0;
+    uint32_t block = 0;
+    int incr = -1, request = -1, target = -1, current = -1;
+    int32_t point = 0, left = 0, value = 0, units = 0;
+    uint32_t frames_per_unit = 0;
 };
+// An envelope (0x5558: the kernel's item tags, the folio's defaults 0x4700, then 0x4e10): points
+// of DataTimePair {time, data} (+0x24 AF_TAG_ADDRESS) and their number (+0x28 AF_TAG_FRAMES),
+// the sustain loop's points (+0x2c, +0x30) and the time back to its start (+0x34), the release
+// loop's (+0x38, +0x3c, +0x40), microseconds a unit of time (+0x44), frames a unit, 16.16 (+0x48),
+// its flags (+0x4c) and the point a release jumps from (+0x50); "EnvelopeRefs" (+0x58), the
+// attachments made with it, in the order made. The addresses are 21.10's.
+struct Envelope {
+    uint32_t points = 0;
+    int32_t count = 0;
+    int32_t sustain_begin = -1, sustain_end = -1, sustain_time = 0;
+    int32_t release_begin = -1, release_end = -1, release_time = 0;
+    int32_t micros = 1000;
+    uint32_t frames_per_unit = 0;
+    uint32_t flags = 0;
+    int32_t release_jump = -1;
+    std::vector<int32_t> refs;
+};
+static std::map<int32_t, Envelope> g_envelopes;
+static uint32_t env_start(int32_t a);       // with the audio clock, below
+static uint32_t env_release(int32_t a);
+static void env_stop(int32_t a);
 static void signal_cue(int32_t& cue);       // with the cues, below
 enum : uint32_t { AF_ATTF_NOAUTOSTART = 1, AF_ERR_NULLADDRESS = 0xD52BF119u };
 static std::map<int32_t, Attachment> g_attachments;
@@ -600,6 +641,63 @@ static uint32_t create_sample(ArmCpu& c, const Tags& tags, uint32_t tag_ptr) {
     return (uint32_t)item;
 }
 
+// An envelope (0x5558, 21.10; 20.27's 0x56e4 and 23.10's the same code): the kernel's item tags (vector -15, with
+// the folio's 0x6abc), the defaults (0x4700), then the tags (0x4e10): AF_TAG_FRAMES (1 or more,
+// else AF_ERR_BADTAGVAL), AF_TAG_SUSTAINBEGIN, AF_TAG_SUSTAINEND, AF_TAG_RELEASEBEGIN,
+// AF_TAG_RELEASEEND, AF_TAG_ADDRESS, AF_TAG_RELEASEJUMP; AF_TAG_SET_FLAGS and AF_TAG_CLEAR_FLAGS
+// (bits 0 and 1 only, else AF_ERR_BADTAGVAL); AF_TAG_SUSTAINTIME, AF_TAG_RELEASETIME and
+// AF_TAG_MICROSPERUNIT straight into the node; any other tag above 9 AF_ERR_BADTAG. The points
+// are then checked readable by the caller (vector -13; not made here, so 0). A sustain loop must
+// begin in [0, count) and end in [begin, count]; a release loop begin in [0, count) and end in
+// [the sustain loop's begin, count] -- the sustain's, as the folio compares it; the release
+// jump below count. A value out of those ranges ends the creation with the readability check's
+// result, 0: the envelope is made, with the fields from there on at their defaults (23.10 says
+// AF_ERR_BADTAGVAL). Last, frames a unit: DivUF16(microseconds * the sample rate, 1,000,000).
+// 20.19's envelopes are another version of this code, not read: they stop.
+static uint32_t create_envelope(ArmCpu& c, const Tags& tags) {
+    if (audio_version() < PF_VERSION(20, 27)) pf_stop(c, "an envelope of AUDIOFOLIO 20.19: not yet");
+    Envelope e;
+    int32_t count = 0, sb = -1, se = -1, rb = -1, re = -1, jump = -1;
+    uint32_t points = 0;
+    for (auto [tag, v] : tags) {
+        int32_t s = (int32_t)v;
+        if (tag == AF_TAG_FRAMES) {
+            if (s < 1) return AF_ERR_BADTAGVAL;
+            count = s;
+        } else if (tag == AF_TAG_SUSTAINBEGIN) sb = s;
+        else if (tag == AF_TAG_SUSTAINEND) se = s;
+        else if (tag == AF_TAG_RELEASEBEGIN) rb = s;
+        else if (tag == AF_TAG_RELEASEEND) re = s;
+        else if (tag == AF_TAG_ADDRESS) points = v;
+        else if (tag == AF_TAG_SET_FLAGS || tag == AF_TAG_CLEAR_FLAGS) {
+            if (v & ~3u) return AF_ERR_BADTAGVAL;
+            e.flags = tag == AF_TAG_SET_FLAGS ? e.flags | v : e.flags & ~v;
+        } else if (tag == AF_TAG_SUSTAINTIME) e.sustain_time = s;
+        else if (tag == AF_TAG_RELEASETIME) e.release_time = s;
+        else if (tag == AF_TAG_MICROSPERUNIT) e.micros = s;
+        else if (tag == AF_TAG_RELEASEJUMP) jump = s;
+        else if (tag > 9) return AF_ERR_BADTAG;
+        else pf_stop(c, "an item tag at an envelope's creation: not yet");
+    }
+    e.points = points;
+    e.count = count;
+    [&] {
+        if (sb != -1 && (sb < 0 || sb >= count || se < sb || se > count)) return;
+        e.sustain_begin = sb;
+        e.sustain_end = se;
+        if (rb != -1 && (rb < 0 || rb >= count || re < sb || re > count)) return;
+        e.release_begin = rb;
+        e.release_end = re;
+        if (jump >= count) return;
+        e.release_jump = jump;
+        e.frames_per_unit = div_uf16((uint32_t)e.micros * (uint32_t)kSampleRate, 1000000);
+    }();
+    int32_t item = audio_item(ENVELOPE_NODE);
+    g_envelopes[item] = std::move(e);
+    if (g_pf_trace) pf_log("        envelope %d: %d points at 0x%x\n", item, count, points);
+    return (uint32_t)item;
+}
+
 // An attachment (0x5d44): the kernel's item tags (vector 38), then AF_TAG_INSTRUMENT,
 // AF_TAG_SAMPLE (a sample, else AF_ERR_BADITEM), AF_TAG_ENVELOPE, AF_TAG_SET_FLAGS (bits 0 and 1
 // only, else AF_ERR_BADTAGVAL; or'd in), AF_TAG_HOOKNAME (a copy of the name; 0 none),
@@ -609,22 +707,28 @@ static uint32_t create_sample(ArmCpu& c, const Tags& tags, uint32_t tag_ptr) {
 // value if it has none), else AF_ERR_BADTAGVAL; the hook (0x8804) is the instrument's first FIFO
 // (input or output, in the template's order) of that name, compared over 32 characters, or with
 // no name its first one -- none: AF_ERR_NOFIFO; an output FIFO takes only a delay line's memory
-// (0x7d68, else AF_ERR_SECURITY). Without a sample or an envelope the attachment is made all the
-// same. Envelopes, templates and item tags are not done yet.
+// (0x7d68, else AF_ERR_SECURITY). With no sample, an envelope (attach_envelope, below; an
+// envelope item, else AF_ERR_BADITEM). With neither the attachment is made all the same.
+// Templates and item tags are not done yet, nor 21.10's AF_TAG_TIME_SCALE (61), the envelope's
+// time scale, 1.0 without it.
+static uint32_t attach_envelope(int32_t ins, int32_t env, uint32_t flags, uint32_t start_at, uint32_t hook);
 static uint32_t create_attachment(ArmCpu& c, const Tags& tags) {
-    int32_t ins = -1, sample = -1;
+    int32_t ins = -1, sample = -1, env = -1;
     uint32_t flags = 0, start_at = 0, hook = 0;
     for (auto [tag, v] : tags) {
         if (tag == AF_TAG_INSTRUMENT) ins = (int32_t)v;
         else if (tag == AF_TAG_SAMPLE) {
             sample = (int32_t)v;
             if (!pf_check_item(sample, NST_AUDIO, SAMPLE_NODE)) return AF_ERR_BADITEM;
-        } else if (tag == AF_TAG_ENVELOPE) pf_stop(c, "an envelope's attachment: not yet");
-        else if (tag == AF_TAG_SET_FLAGS) {
+        } else if (tag == AF_TAG_ENVELOPE) {
+            env = (int32_t)v;
+            if (!pf_check_item(env, NST_AUDIO, ENVELOPE_NODE)) return AF_ERR_BADITEM;
+        } else if (tag == AF_TAG_SET_FLAGS) {
             if (v & ~3u) return AF_ERR_BADTAGVAL;
             flags |= v;
         } else if (tag == AF_TAG_HOOKNAME) hook = v;
         else if (tag == AF_TAG_START_AT) start_at = v;
+        else if (tag == AF_TAG_TIME_SCALE) pf_stop(c, "an attachment's AF_TAG_TIME_SCALE: not yet");
         else if (tag > 9) return AF_ERR_BADTAG;
         else pf_stop(c, "an item tag at an attachment's creation: not yet");
     }
@@ -645,9 +749,46 @@ static uint32_t create_attachment(ArmCpu& c, const Tags& tags) {
         if (rsrc < 0) return AF_ERR_NOFIFO;
         if (t.rsrc[(size_t)rsrc].type == RSRC_OFIFO && !(s.flags & 2)) return AF_ERR_SECURITY;
         if (g_pf_trace) pf_log("        attach sample %d to instrument %d's \"%s\"\n", sample, ins, t.rsrc[(size_t)rsrc].name.c_str());
-    }
+    } else if (env > 0) return attach_envelope(ins, env, flags, start_at, hook);
     int32_t item = audio_item(ATTACHMENT_NODE);
     g_attachments[item] = {ins, sample, rsrc, flags, start_at, 0, 0};
+    return (uint32_t)item;
+}
+
+// An envelope's attachment (0x5e14 on, 21.10): AF_TAG_START_AT not below 0 and before the
+// envelope's last point -- past it, the folio reads its sample's frame count from a sample node
+// it does not have, the word at 0x28: 0 lets it through, anything else is AF_ERR_BADTAGVAL. The
+// hook (0x5058) must be named (else AF_ERR_BADNAME): the instrument's knobs <hook>.incr and
+// <hook>.request and its variables <hook>.target and <hook>.current, as find_rsrc finds them (21.10's
+// 0x8540 compares as 23.10's), each else AF_ERR_BADNAME. Then the attachment goes on the
+// instrument's list of envelopes' attachments; the envelope's flag 2 becomes its
+// AF_ATTF_FATLADYSINGS; its frames a unit are the envelope's times the time scale (0x5208:
+// MulUF16, 1.0 here); and it goes on the envelope's "EnvelopeRefs". The folio makes the item
+// first and an error from the hook is the creation's, the node then freed by the kernel (its place
+// on "EnvelopeRefs" with it); here nothing is made.
+static uint32_t attach_envelope(int32_t ins, int32_t env, uint32_t flags, uint32_t start_at, uint32_t hook) {
+    Envelope& e = g_envelopes[env];
+    if ((int32_t)start_at < 0 || ((int32_t)start_at >= e.count && pf_r32(0x28))) return AF_ERR_BADTAGVAL;
+    if (!hook) return AF_ERR_BADNAME;
+    const Template& t = g_templates[g_instruments[ins].tmpl];
+    std::string name = guest_string(hook);
+    int incr = find_rsrc(t, RSRC_KNOB, name + ".incr"), request = find_rsrc(t, RSRC_KNOB, name + ".request");
+    int target = find_rsrc(t, RSRC_VARIABLE, name + ".target"), current = find_rsrc(t, RSRC_VARIABLE, name + ".current");
+    if (incr < 0 || request < 0 || target < 0 || current < 0) return AF_ERR_BADNAME;
+    int32_t item = audio_item(ATTACHMENT_NODE);
+    Attachment& at = g_attachments[item];
+    at = {ins, -1, -1, flags | (e.flags & 2), start_at, 0, 0};
+    at.env = env;
+    at.block = pf_os_alloc(0x58);
+    pf_w32(at.block + 0x30, pf_item_node(item));
+    at.incr = incr;
+    at.request = request;
+    at.target = target;
+    at.current = current;
+    at.frames_per_unit = mul_uf16(e.frames_per_unit, 0x10000);
+    g_instruments[ins].envs.push_back(item);
+    e.refs.push_back(item);
+    if (g_pf_trace) pf_log("        attach envelope %d to instrument %d's \"%s\"\n", env, ins, name.c_str());
     return (uint32_t)item;
 }
 
@@ -662,6 +803,7 @@ static uint32_t create(ArmCpu& c, int type, const Tags& tags, uint32_t tag_ptr =
     case KNOB_NODE: return create_knob(c, tags);
     case SAMPLE_NODE: return create_sample(c, tags, tag_ptr);
     case CUE_NODE: return create_cue(c, tags);
+    case ENVELOPE_NODE: return create_envelope(c, tags);
     case ATTACHMENT_NODE: return create_attachment(c, tags);
     default: {
         char why[80];
@@ -772,9 +914,9 @@ static void attachment_stop(int32_t a) {
     at.state = 1;
 }
 
-// An instrument's DSP side stopped (0x7be8), when it runs: out of the DSP's program, and every
-// FIFO's playing attachment stopped, while it is still an attachment (the envelopes' attachments,
-// a list of their own, are not made here).
+// An instrument's DSP side stopped (0x7be8), when it runs: out of the DSP's program, every FIFO's
+// playing attachment stopped, while it is still an attachment, then its envelopes' attachments,
+// in the order made (21.10's 0x7b74: 0x5548 each).
 static void dsp_stop(Instrument& ins) {
     if (ins.dsp_state <= 1) return;
     pf_dsp_run(ins.self, false);
@@ -782,6 +924,7 @@ static void dsp_stop(Instrument& ins) {
     std::map<int, int32_t> was = ins.playing;
     for (auto [rsrc, a] : was)
         if (pf_check_item(a, NST_AUDIO, ATTACHMENT_NODE)) attachment_stop(a);
+    for (int32_t a : ins.envs) env_stop(a);
 }
 
 // swi 0x40003: Err StopInstrument(Item instrument, TagArg* tags) -- 0x1ddc: an instrument (else
@@ -875,8 +1018,9 @@ static void fifo_ended(int32_t ins, uint32_t rsrc) {
 // (else AF_ERR_BADITEM), no tags (else AF_ERR_BADTAG); neither the folio's open nor the owner
 // asked. Started, it is released, and its DSP side with it (0x7b1c): on each of its FIFOs, in the
 // template's order, the attachment playing there, while it is still an attachment, released --
-// the first error ends the round and is the call's result; then the envelopes' attachments (none
-// made here); its DSP side's state becomes 2.
+// the first error ends the round and is the call's result; then its envelopes' attachments that
+// play, in the order made, released (21.10's 0x7a40: 0x54a8 each, their results unread); its DSP
+// side's state becomes 2 unless it is below (one that ended its instrument has stopped it).
 static uint32_t release_instrument(int32_t item, uint32_t tags) {
     if (!pf_check_item(item, NST_AUDIO, INSTRUMENT_NODE)) return AF_ERR_BADITEM;
     if (tags) return AF_ERR_BADTAG;
@@ -887,7 +1031,9 @@ static uint32_t release_instrument(int32_t item, uint32_t tags) {
     std::map<int, int32_t> was = ins.playing;
     for (auto [rsrc, a] : was)
         if (pf_check_item(a, NST_AUDIO, ATTACHMENT_NODE) && (int32_t)(err = attachment_release(a)) < 0) break;
-    ins.dsp_state = 2;
+    for (int32_t a : ins.envs)
+        if (g_attachments[a].state == 3) env_release(a);
+    if (ins.dsp_state > 2) ins.dsp_state = 2;
     return err;
 }
 static void a_releaseinstrument(ArmCpu& c) {
@@ -899,11 +1045,14 @@ static void a_releaseinstrument(ArmCpu& c) {
 // A knob (0x27a8): off its instrument's list of grabbed knobs (RemNode), and 0. An instrument
 // (0x2294): every knob grabbed on it (the node's list at +0x34, in the order grabbed) deleted as
 // by its owner (vector 34, 0x6a6c), then 0x8dc4: its DSP side stopped, every attachment on each
-// of its FIFOs deleted the same way, then a list at +0x9c of its private data (nothing the
-// programs run so far put there), its DSP resources and memory freed; and off its template's
+// of its FIFOs deleted the same way, then the attachments of its envelopes (the list at +0x9c,
+// in the order made; 21.10's 0x8b50), its DSP resources and memory freed; and off its template's
 // list while the template is an item. The results of those deletions are not read. An attachment
 // (0x61cc): if it is playing, its instrument stopped (StopInstrument, whose result is the
-// deletion's) and it too, then off its hook's list and its sample's "SampleRefs". FreeInstrument and ReleaseKnob are DeleteItem in the 1993 lib,
+// deletion's) and it too, then off its hook's list and its sample's "SampleRefs" -- an
+// envelope's (21.10's 0x6050) off its instrument's list and the envelope's "EnvelopeRefs", its
+// block freed. An envelope (21.10's 0x5624): each attachment made with it deleted as by its owner,
+// the first error the deletion's. FreeInstrument and ReleaseKnob are DeleteItem in the 1993 lib,
 // DetachSample the folio's own glue for it. A sample (0x3d18): every attachment made with it
 // stopped, then each deleted as by its owner (the first error is the deletion's, the rest left);
 // a delay line's memory freed; then off the folio's "AudioSamples" -- unless its word at +0x40
@@ -936,7 +1085,9 @@ static int32_t audio_delete(ArmCpu& c, int type, int32_t item, uint32_t) {
         dsp_stop(g_instruments[item]);
         doomed.clear();
         for (const auto& [a, v] : g_attachments)
-            if (v.ins == item) doomed.push_back(a);
+            if (v.ins == item && !v.env) doomed.push_back(a);
+        for (int32_t a : doomed) pf_delete_item_as_owner(c, a);
+        doomed = g_instruments[item].envs;
         for (int32_t a : doomed) pf_delete_item_as_owner(c, a);
         pf_dsp_delete(item);
         g_instruments.erase(item);
@@ -955,11 +1106,26 @@ static int32_t audio_delete(ArmCpu& c, int type, int32_t item, uint32_t) {
         return err;
     }
     case CUE_NODE: delete_cue(item); return 0;
+    case ENVELOPE_NODE: {
+        std::vector<int32_t> refs = g_envelopes[item].refs;
+        for (int32_t a : refs)
+            if (int32_t err = pf_delete_item_as_owner(c, a); err < 0) return err;
+        g_envelopes.erase(item);
+        return 0;
+    }
     case ATTACHMENT_NODE: {
+        Attachment& at = g_attachments[item];
         int32_t err = 0;
-        if (pf_check_item(g_attachments[item].ins, NST_AUDIO, INSTRUMENT_NODE) && g_attachments[item].state > 1) {
-            err = (int32_t)stop_instrument(g_attachments[item].ins, 0);
-            attachment_stop(item);
+        if (pf_check_item(at.ins, NST_AUDIO, INSTRUMENT_NODE) && at.state > 1) {
+            err = (int32_t)stop_instrument(at.ins, 0);
+            if (!at.env) attachment_stop(item);
+        }
+        if (at.env) {
+            auto& envs = g_instruments[at.ins].envs;
+            envs.erase(std::remove(envs.begin(), envs.end(), item), envs.end());
+            auto& refs = g_envelopes[at.env].refs;
+            refs.erase(std::remove(refs.begin(), refs.end(), item), refs.end());
+            pf_os_free(at.block);
         }
         g_attachments.erase(item);
         return err;
@@ -1379,6 +1545,30 @@ static void a_attachsample(ArmCpu& c) {
 }
 static void a_detachsample(ArmCpu& c) { c.r[0] = (uint32_t)pf_delete_item(c, (int32_t)c.r[0]); }
 
+// audio -136: Item CreateEnvelope(DataTimePair* points, int32 count, int32 sustainBegin, int32
+// sustainEnd) -- 21.10's 0x4dbc: CreateItem(MKNODEID(AUDIONODE, AUDIO_ENVELOPE_NODE),
+// {AF_TAG_ADDRESS, AF_TAG_FRAMES, AF_TAG_SUSTAINBEGIN, AF_TAG_SUSTAINEND}). audio -140: Err
+// DeleteEnvelope(Item envelope) -- 0x55cc: an envelope (else AF_ERR_BADITEM); its points freed
+// when it has them and its flag 1 says they are the folio's; DeleteItem. audio -128: Item
+// AttachEnvelope(Item instrument, Item envelope, char* hook) -- 0x564c: CreateItem(MKNODEID(
+// AUDIONODE, AUDIO_ATTACHMENT_NODE), {AF_TAG_INSTRUMENT, AF_TAG_ENVELOPE, and AF_TAG_HOOKNAME
+// when hook is not 0}). audio -132: Err DetachEnvelope(Item attachment) -- 0x56a0: DeleteItem.
+static void a_createenvelope(ArmCpu& c) {
+    c.r[0] = create(c, ENVELOPE_NODE, {{AF_TAG_ADDRESS, c.r[0]}, {AF_TAG_FRAMES, c.r[1]},
+                                       {AF_TAG_SUSTAINBEGIN, c.r[2]}, {AF_TAG_SUSTAINEND, c.r[3]}});
+}
+static void a_deleteenvelope(ArmCpu& c) {
+    int32_t env = (int32_t)c.r[0];
+    if (!pf_check_item(env, NST_AUDIO, ENVELOPE_NODE)) { c.r[0] = AF_ERR_BADITEM; return; }
+    if (g_envelopes[env].points && (g_envelopes[env].flags & 1)) pf_stop(c, "DeleteEnvelope of the folio's points: not yet");
+    c.r[0] = (uint32_t)pf_delete_item(c, env);
+}
+static void a_attachenvelope(ArmCpu& c) {
+    Tags t = {{AF_TAG_INSTRUMENT, c.r[0]}, {AF_TAG_ENVELOPE, c.r[1]}};
+    if (c.r[2]) t.push_back({AF_TAG_HOOKNAME, c.r[2]});
+    c.r[0] = create(c, ATTACHMENT_NODE, t);
+}
+
 // swi 0x40015: Err LinkAttachments(Item at1, Item at2) -- 0x63d4: at1 an attachment (else
 // AF_ERR_BADITEM), at2 0 or an attachment (else the same); at2 is what plays after at1. Neither
 // the folio's open nor the owner is asked. When at1 is playing, at2 is queued as its FIFO's next
@@ -1391,6 +1581,7 @@ static void a_linkattachments(ArmCpu& c) {
         return;
     }
     Attachment& at = g_attachments[a1];
+    if (at.env || (a2 && g_attachments[a2].env)) pf_stop(c, "LinkAttachments of an envelope's attachment: not yet");
     at.next = a2;
     if (at.state > 1) {
         if (a2) queue_next(g_attachments[a2]);
@@ -1412,6 +1603,7 @@ static int32_t attachment_call(ArmCpu& c) {
     pf_dsp_sync();
     if (!pf_check_item((int32_t)c.r[0], NST_AUDIO, ATTACHMENT_NODE)) { c.r[0] = AF_ERR_BADITEM; return 0; }
     if (c.r[1]) { c.r[0] = AF_ERR_BADTAG; return 0; }
+    if (g_attachments[(int32_t)c.r[0]].env) pf_stop(c, "Start/Release/StopAttachment of an envelope's attachment: not yet");
     return (int32_t)c.r[0];
 }
 static void a_startattachment(ArmCpu& c) {
@@ -1445,8 +1637,9 @@ static void a_tweakrawknob(ArmCpu& c) { tweak_knob(c, false); }
 // AF_TAG_VELOCITY (velocity << 8: the Amplitude knob, cooked), each when the instrument has that
 // knob. Its DSP side, when running, is stopped first (before the tags, so a bad tag leaves it
 // stopped). Then on each of its FIFOs, in the template's order, the first attachment (in the order
-// made) not marked AF_ATTF_NOAUTOSTART starts -- whether it can is not the call's result -- and
-// its DSP side runs; its node's state becomes 3.
+// made) not marked AF_ATTF_NOAUTOSTART starts -- whether it can is not the call's result -- then
+// each of its envelopes' attachments not so marked, in the order made (21.10's 0x72cc: 0x5420,
+// the result unread); its DSP side runs; its node's state becomes 3.
 static void a_startinstrument(ArmCpu& c) {
     pf_dsp_sync();
     if (!audio_open()) { c.r[0] = AF_ERR_AUDIOCLOSED; return; }
@@ -1465,6 +1658,7 @@ static void a_startinstrument(ArmCpu& c) {
         else if (tag == AF_TAG_RATE) { freq = (int32_t)v; have_freq = true; cooked_freq = false; }
         else if (tag == AF_TAG_FREQUENCY) { freq = (int32_t)v; have_freq = true; cooked_freq = true; }
         else if (tag == AF_TAG_PITCH) pf_stop(c, "StartInstrument: AF_TAG_PITCH: not yet");
+        else if (tag == AF_TAG_TIME_SCALE) pf_stop(c, "StartInstrument: AF_TAG_TIME_SCALE: not yet");
         else { c.r[0] = AF_ERR_BADTAG; return; }
     }
     if (const DspKnob* k = find_knob(t, "Frequency"); k && have_freq) tweak(c, ins, t, *k, freq, cooked_freq);
@@ -1479,6 +1673,8 @@ static void a_startinstrument(ArmCpu& c) {
                 break;
             }
     }
+    for (int32_t a : ins.envs)
+        if (!(g_attachments[a].flags & AF_ATTF_NOAUTOSTART)) env_start(a);
     pf_dsp_run(item, true);
     ins.dsp_state = 3;
     ins.state = 3;
@@ -1686,11 +1882,13 @@ static uint32_t folio() { return pf_folio_base(PF_AUDIO); }
 // earliest wake-up is at +0xa0, wanted while +0xac is set. A cue (0x469c) is such a node with a
 // signal of its maker's (+0x30) and its maker's task (+0x34, the Task); its function (0x4600) is
 // the kernel's own SendSignal of that signal to that task. The folio keeps the function's address
-// in the node, as here; the cue's is the only one run so far.
+// in the node, as here. The other nodes are envelopes' attachments' blocks (below): their
+// function is 21.10's step (0x5234), their +0x30 the attachment's node.
+static uint32_t env_step(int32_t a);
 enum : uint32_t {
     AF_WAKE = 0xa0, AF_WAKEWANTED = 0xac,
     TN_TIME = 0x24, TN_FN = 0x28, TN_LIST = 0x2c, CUE_SIGNAL = 0x30, CUE_TASK = 0x34,
-    kCueFn = 0x4600, AF_ERR_NOSIGNAL = 0xD52BF116u, AF_ERR_NOTOWNER = 0xD52BF11Cu,
+    kCueFn = 0x4600, kEnvFn = 0x5234, AF_ERR_NOSIGNAL = 0xD52BF116u, AF_ERR_NOTOWNER = 0xD52BF11Cu,
 };
 
 // What the daemon does when signalled (0x460c): from the head, every node whose time has come (at
@@ -1703,6 +1901,7 @@ static void run_timers() {
         pf_list_rem_node(n);
         pf_w32(n + TN_LIST, 0);
         if (pf_r32(n + TN_FN) == kCueFn) pf_signal(pf_r32(n + CUE_TASK), pf_r32(n + CUE_SIGNAL));
+        else if (pf_r32(n + TN_FN) == kEnvFn) env_step((int32_t)pf_r32(pf_r32(n + 0x30) + 24));
         n = next;
     }
     uint32_t head = pf_r32(f + AF_TIMERLIST + PF_LIST_HEAD);
@@ -1728,6 +1927,140 @@ static uint32_t timer_add(uint32_t n, uint32_t time) {
     pf_list_insert_before(m, n);
     pf_w32(n + TN_LIST, list);
     return 0;
+}
+
+// A node off the list (21.10's 0x4068), when it is on it; the wake-up stays where it was.
+static void timer_remove(uint32_t n) {
+    if (!pf_r32(n + TN_LIST)) return;
+    pf_list_rem_node(n);
+    pf_w32(n + TN_LIST, 0);
+}
+
+// ---- envelopes ----------------------------------------------------------------------------------
+// An envelope's attachment on the audio clock, as 21.10's code runs it (20.27's is the same but
+// for the one-tick minimum below, 23.10's the same; 20.19's envelopes stop at their creation).
+// The folio writes the hook's knobs straight into DSP memory (0x9758) and its variables through
+// head.dsp's semaphore (0x9b60); envelope.dsp (pf_dsp.cpp) starts a segment whenever .request is
+// not .target, from .current to .request, its phase stepping by .incr a frame up to 0x8000.
+
+static void env_knob(const Attachment& at, int rsrc, int32_t v) {
+    Instrument& ins = g_instruments[at.ins];
+    ins.value[(uint32_t)rsrc] = v;
+    pf_dsp_write(ins.self, (uint32_t)rsrc, v);
+}
+static void env_variable(const Attachment& at, int rsrc, int32_t v) {
+    pf_dsp_write(g_instruments[at.ins].self, (uint32_t)rsrc, v);
+}
+// A point's time and data (a DataTimePair: dtpr_Time, dtpr_Data).
+static int32_t point_time(const Envelope& e, int32_t i) { return (int32_t)pf_r32(e.points + 8u * (uint32_t)i); }
+static int32_t point_data(const Envelope& e, int32_t i) { return (int32_t)pf_r32(e.points + 8u * (uint32_t)i + 4); }
+// The compiler's signed division (0x470), which truncates; a divisor of 0, which only a segment
+// of negative length would give, is taken as a quotient of 0.
+static int32_t sdiv(int32_t n, int32_t d) { return d ? n / d : 0; }
+
+static uint32_t stop_instrument(int32_t item, uint32_t tags);
+
+// The next chunk (0x5234), when the timer comes, and at a start or a release. Past the last point
+// it ends: with AF_ATTF_FATLADYSINGS its instrument stopped (StopInstrument, whose result is the
+// step's), then its cue (+0x44) signalled while it is one (0x5a28). Else the segment's frames --
+// those left of it, or its time in units times frames a unit (MulUF16), and at least 1 -- go in
+// chunks: .incr is 0x8000 over the frames, rounded up (1 above 0x8000 frames), and a chunk covers
+// 0x8000 / .incr of them. With more than 400 frames left after it, the chunk goes to the value
+// that far along the segment, the rest left for the next; else to the point itself, and the next
+// segment's time is the next point's less this one's. The value is kept, .incr and .request
+// written. While the attachment plays unreleased (3) with a sustain loop, past the loop's end it
+// is back at its begin with the sustain time, and a loop of one point holds there: no timer. Past
+// a release loop's end it is back at that begin with the release time. The timer then comes the
+// chunk's frames later in the clock's ticks (the duration's frames; at least 1 from 21.10 on).
+static uint32_t env_step(int32_t a) {
+    Attachment& at = g_attachments[a];
+    const Envelope& e = g_envelopes[at.env];
+    if (at.point >= e.count) {
+        uint32_t r = 0;
+        if (at.flags & 2) r = stop_instrument(at.ins, 0);
+        if (at.cue) signal_cue(at.cue);
+        if (g_pf_trace >= 2) pf_log("        envelope attachment %d ends\n", a);
+        return r;
+    }
+    int32_t frames = at.left;
+    if (frames <= 0) frames = (int32_t)mul_uf16((uint32_t)at.units, at.frames_per_unit);
+    int32_t to = point_data(e, at.point), incr, covered;
+    if (frames > 0x8000) {
+        incr = 1;
+        covered = 0x8000;
+    } else {
+        if (!frames) frames = 1;
+        incr = sdiv(0x8000 + frames - 1, frames);
+        covered = sdiv(0x8000, incr);
+    }
+    if (frames - covered > 400) {
+        at.left = frames - covered;
+        to = at.value + sdiv((int32_t)((uint32_t)(to - at.value) * (uint32_t)covered), frames);
+    } else {
+        at.left = 0;
+        ++at.point;
+        at.units = point_time(e, at.point) - point_time(e, at.point - 1);
+    }
+    at.value = to;
+    env_knob(at, at.incr, incr);
+    env_knob(at, at.request, to);
+    bool more = true;
+    if (at.state == 3 && e.sustain_begin >= 0 && at.point > e.sustain_end) {
+        at.point = e.sustain_begin;
+        at.units = e.sustain_time;
+        if (e.sustain_begin == e.sustain_end) more = false;
+    }
+    if (e.release_begin >= 0 && at.point > e.release_end) {
+        at.point = e.release_begin;
+        at.units = e.release_time;
+    }
+    if (g_pf_trace >= 2) pf_log("        envelope attachment %d: to %d by 0x%x over %d frames\n", a, to, incr, covered);
+    if (!more) return 0;
+    uint32_t ticks = (uint32_t)covered / pf_r32(folio() + AF_DURATION);
+    if (!ticks && audio_version() >= PF_VERSION(21, 10)) ticks = 1;
+    return timer_add(at.block, pf_r32(folio() + AF_TIME) + ticks);
+}
+
+// An envelope's attachment started (0x5420): .current its first point's data, .target one less
+// (so that the first .request starts a segment), from the first point with nothing left; playing
+// (3); then its first chunk.
+static uint32_t env_start(int32_t a) {
+    Attachment& at = g_attachments[a];
+    int32_t first = point_data(g_envelopes[at.env], 0);
+    env_variable(at, at.current, first);
+    env_variable(at, at.target, first - 1);
+    at.point = at.left = at.value = at.units = 0;
+    pf_w32(at.block + TN_FN, kEnvFn);
+    at.state = 3;
+    return env_step(a);
+}
+
+// Released (0x54a8): released (2). With a release jump above 0: from a point at or before it, on
+// to the point after it; past it, nothing more. Without one: while its timer waits, nothing more
+// (the chunks go on, now past the sustain loop); else on to the next point. Then off the timer
+// list, nothing left, the segment's time from the point before, and the next chunk.
+static uint32_t env_release(int32_t a) {
+    Attachment& at = g_attachments[a];
+    const Envelope& e = g_envelopes[at.env];
+    at.state = 2;
+    if (e.release_jump > 0) {
+        if (at.point > e.release_jump) return 0;
+        at.point = e.release_jump + 1;
+    } else {
+        if (pf_r32(at.block + TN_LIST)) return 0;
+        ++at.point;
+    }
+    timer_remove(at.block);
+    at.left = 0;
+    at.units = point_time(e, at.point) - point_time(e, at.point - 1);
+    return env_step(a);
+}
+
+// Stopped (0x5548): stopped (1), off the timer list.
+static void env_stop(int32_t a) {
+    Attachment& at = g_attachments[a];
+    at.state = 1;
+    timer_remove(at.block);
 }
 
 // A cue (0x469c): the kernel's item tags (vector 38; the folio's own part of the walk, 0x6b68,
@@ -1914,6 +2247,7 @@ void pf_audio_init() {
     g_knobs.clear();
     g_samples.clear();
     g_attachments.clear();
+    g_envelopes.clear();
     pf_dsp_init();
     g_pf_dsp_ended = fifo_ended;
     clock_init();
@@ -1943,6 +2277,10 @@ void pf_audio_init() {
     pf_on_slot(PF_AUDIO, -92, a_unloadinstemplate);
     pf_on_slot(PF_AUDIO, -144, a_attachsample);
     pf_on_slot(PF_AUDIO, -148, a_detachsample);
+    pf_on_slot(PF_AUDIO, -128, a_attachenvelope);
+    pf_on_slot(PF_AUDIO, -132, a_detachsample);
+    pf_on_slot(PF_AUDIO, -136, a_createenvelope);
+    pf_on_slot(PF_AUDIO, -140, a_deleteenvelope);
     pf_on_swi(0x40000, a_tweakknob);
     pf_on_swi(0x40001, a_startinstrument);
     pf_on_swi(0x40002, a_releaseinstrument);

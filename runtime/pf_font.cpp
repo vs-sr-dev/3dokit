@@ -7,15 +7,19 @@
 // loader leaves it -- unpacked by its own decompressor (pf_aif.cpp), its relocation list applied
 // for that address, its zero-initialised data cleared -- and none of its code runs: what the code
 // does is done here, on those bytes. The addresses in the comments are Doctor Hauzer's GRAPHIX
-// 20.45; each version's own addresses are in a table (kFonts), and a version without one has no
-// font here (a program that calls for it stops).
+// 20.45 (build 72); each build's own addresses are in a table (kFonts), and a build without one
+// has no font here (a program that calls for it stops). A version does not name a build: Escape
+// from Monster Manor's GRAPHIX is 20.45 too, build 419, its font code the same and every address
+// of it elsewhere.
 //
 // The characters are FontEntrys (graphics.h) in a binary search tree by ft_CharValue: a head node
 // whose ft_GreaterBranch is the root, and every missing branch a "butt" node, both in the folio's
 // data (gf_FontEntryHead, gf_FontEntryButt).
 #include "pf.h"
 #include <algorithm>
+#include <cctype>
 #include <cstdio>
+#include <cstring>
 #include <fstream>
 #include <iterator>
 #include <string>
@@ -35,10 +39,10 @@ enum : uint32_t {
     GRAFERR_NO_FONT = 0xD55B9122u,
 };
 
-// One version's addresses: the folio's static data (offsets in its image) and the GrafFolio's
+// One build's addresses: the folio's static data (offsets in its image) and the GrafFolio's
 // font fields (graphics.h's, from gf_CurrentFontStream on; their offsets are the code's).
 struct FontVersion {
-    uint32_t version;
+    uint32_t version, build;        // the 3DO header's version, and the build from the image's build line
     uint32_t chars, nchars;         // the built-in characters: 12-byte records {value, width (u8), image}
     uint32_t image_bytes;           // each one's ft_ImageByteCount
     uint32_t font;                  // the built-in Font
@@ -52,10 +56,31 @@ struct FontVersion {
 };
 
 const FontVersion kFonts[] = {
-    // GRAPHIX 20.45 (Doctor Hauzer): the start 0x3f8c, the characters' records 0x407c
-    {PF_VERSION(20, 45), 0x7ef8, 49, 0x60, 0x6a9c, 0x69e4, 0x69a0, 0x8268, 0x69f0, 0x6a1c, 0x699c, 0x7e90,
+    // GRAPHIX 20.45 build 72 (Doctor Hauzer): the start 0x3f8c, the characters' records 0x407c
+    {PF_VERSION(20, 45), 72, 0x7ef8, 49, 0x60, 0x6a9c, 0x69e4, 0x69a0, 0x8268, 0x69f0, 0x6a1c, 0x699c, 0x7e90,
      0x3850, 0xd0, 0x63c8, 0x6978},
+    // GRAPHIX 20.45 build 419 (Escape from Monster Manor): the same code 0x2c4 on (the start
+    // 0x4250, the records 0x4340), its data 0x544 on but for the PLUT, 0x878c
+    {PF_VERSION(20, 45), 419, 0x843c, 49, 0x60, 0x6fe0, 0x6f28, 0x6ee4, 0x878c, 0x6f34, 0x6f60, 0x6ee0, 0x83d4,
+     0x3b14, 0xd0, 0x68c4, 0x6a38},
 };
+
+// The build of a folio's image, placed in [from, to): the number after "<version>.<revision>." in
+// its build line ("graphix 20.45.419 05/10/94 22:11:11 stan port1_3"); 0 when it has none.
+uint32_t image_build(uint32_t from, uint32_t to, uint32_t version) {
+    char key[16];
+    std::snprintf(key, sizeof key, "%u.%u.", version >> 8, version & 0xff);
+    size_t n = std::strlen(key);
+    for (uint32_t a = from; a + n < to; ++a) {
+        size_t i = 0;
+        while (i < n && pf_r8(a + (uint32_t)i) == (uint8_t)key[i]) ++i;
+        uint32_t d = a + (uint32_t)n, b = 0;
+        if (i < n || !std::isdigit((int)pf_r8(d))) continue;
+        while (std::isdigit((int)pf_r8(d))) b = b * 10 + (pf_r8(d++) - '0');
+        return b;
+    }
+    return 0;
+}
 
 // The GrafFolio's fields, from gf_CurrentFontStream (graphics.h).
 enum : uint32_t {
@@ -338,13 +363,15 @@ void pf_font_init() {
     pf_on_slot(PF_GRAPHICS, -36, g_drawtext16);
     g_font = nullptr;
     uint32_t v = pf_system_version("/System/Folios/GRAPHIX");
-    const FontVersion* f = nullptr;
-    for (const FontVersion& k : kFonts)
-        if (k.version == v) f = &k;
-    if (!f) return;
+    if (std::none_of(std::begin(kFonts), std::end(kFonts), [v](const FontVersion& k) { return k.version == v; })) return;
     uint32_t end;
     g_img = PF_OS_IMAGES;
     if (!place_image(pf_host_path("/System/Folios/GRAPHIX"), g_img, end)) return;
+    uint32_t build = image_build(g_img, end, v);
+    const FontVersion* f = nullptr;
+    for (const FontVersion& k : kFonts)
+        if (k.version == v && k.build == build) f = &k;
+    if (!f) return;
     g_font = f;
     pf_w32(at(f->kernelbase), pf_folio_base(PF_KERNEL));     // its start, 0x110
     pf_w32(at(f->grafbase), pf_folio_base(PF_GRAPHICS));
