@@ -2,6 +2,7 @@
 // runtime, tracing its OS calls.
 //
 //     pfboot PROGRAM [--trace N] [--lenient] [--max-calls N] [--snap N DIR] [--disc DIR] [--nvram DIR]
+//                    [--cmdline LINE]
 //                    [--frames DIR [--frames-at FIRST[-LAST][/EVERY]]] [--pad BUTTONS@FIELD[xN][/E][+H]]...
 //                    [--window [--record FILE]] [--wav FILE] [--dsp-code] [--dsp-check]
 //
@@ -15,8 +16,11 @@
 // disc's root, where the program's files are; by default the program's own
 // directory. --nvram DIR keeps the console's NVRAM in DIR/nvram.bin between
 // runs (pf_nvram.cpp); without it the NVRAM is blank at each start, as a
-// fresh console's. --frames DIR writes what the display shows, at each vertical
-// blank that changes it, as a PPM (pf_graphics.cpp); --frames-at FIRST[-LAST][/EVERY]
+// fresh console's. --cmdline LINE gives PROGRAM the command line the shell
+// would (its name first: "format ram 3 0 nvram", the disc's FORMAT making a
+// blank NVRAM a filesystem, which 21.10's LMADM does not do). --frames DIR
+// writes what the display shows, at each vertical blank that changes it, as a
+// PPM (pf_graphics.cpp); --frames-at FIRST[-LAST][/EVERY]
 // looks only at the fields from FIRST to LAST, every EVERY-th of them (a long race
 // writes some 230 KB a field). --pad BUTTONS@FIELD[xN][/E][+H]
 // presses the first Control Pad's BUTTONS (up down left right a b c start x l r,
@@ -166,6 +170,7 @@ int main(int argc, char** argv) {
     const char* memtest = nullptr;
     const char* disc = nullptr;
     const char* record = nullptr;
+    const char* cmdline = nullptr;
     bool window = false, boot = false;
     int ops = 2000;
     uint32_t seed = 1;
@@ -196,6 +201,7 @@ int main(int argc, char** argv) {
         else if (!std::strcmp(argv[i], "--dsp-code")) g_pf_dsp_code = true;
         else if (!std::strcmp(argv[i], "--dsp-check")) g_pf_dsp_check = true;
         else if (!std::strcmp(argv[i], "--boot")) boot = true;
+        else if (!std::strcmp(argv[i], "--cmdline") && i + 1 < argc) cmdline = argv[++i];
         else if (!std::strcmp(argv[i], "--record") && i + 1 < argc) record = argv[++i];
         else if (!std::strcmp(argv[i], "--wav") && i + 1 < argc) {
             if (!pf_dsp_wav(argv[++i])) {
@@ -261,5 +267,6 @@ int main(int argc, char** argv) {
         std::fprintf(stderr, "--record: only with --window\n");
         return 2;
     }
+    if (cmdline) return pf_run(d.data(), stub, ro + rw + bss, entry, d.size(), cmdline);
     return pf_run(d.data(), stub, ro + rw + bss, entry);
 }

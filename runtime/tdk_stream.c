@@ -25,6 +25,25 @@ uint32_t tdk_stream_first_fill_end(const uint8_t *d, uint32_t len)
     return 0;
 }
 
+static int headerless_tag(uint32_t tag)
+{
+    return tag == TDK_TAG('C', 'T', 'R', 'L') || tag == TDK_TAG('F', 'I', 'L', 'M') ||
+           tag == TDK_TAG('S', 'N', 'D', 'S');
+}
+
+uint32_t tdk_stream_headerless(const uint8_t *d, uint32_t len)
+{
+    uint32_t end = len >= 8 ? tdk_stream_first_fill_end(d, len) : 0;
+    if (!end)
+        return 0;
+    if (headerless_tag(tdk_be32(d)))
+        return end;
+    if (tdk_be32(d) == TDK_TAG('F', 'I', 'L', 'L') && end + 4 <= len &&
+        headerless_tag(tdk_be32(d + end)))
+        return end;                     /* a first block all FILL */
+    return 0;
+}
+
 void tdk_stream_init(tdk_stream *s, const uint8_t *d, uint32_t len)
 {
     s->d = d;
@@ -34,11 +53,8 @@ void tdk_stream_init(tdk_stream *s, const uint8_t *d, uint32_t len)
     if (len >= 0x1c && tdk_be32(d) == TDK_TAG('S', 'H', 'D', 'R')) {
         if (tdk_be32(d + 0x18))
             s->block = tdk_be32(d + 0x18);
-    } else if (len >= 4 && (tdk_be32(d) == TDK_TAG('C', 'T', 'R', 'L') ||
-                            tdk_be32(d) == TDK_TAG('F', 'I', 'L', 'M') ||
-                            tdk_be32(d) == TDK_TAG('S', 'N', 'D', 'S')) &&
-               tdk_stream_first_fill_end(d, len)) {
-        s->block = tdk_stream_first_fill_end(d, len);   /* no header */
+    } else if (tdk_stream_headerless(d, len)) {
+        s->block = tdk_stream_headerless(d, len);   /* no header */
     }
 }
 

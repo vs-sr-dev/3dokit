@@ -51,14 +51,15 @@ static int is_cel(const uint8_t *d, uint32_t n)
 }
 
 /* 1 a stream by its header, 2 one that may be a stream with no header
- * (CTRL, FILM or SNDS first: its whole data decides), 0 none. */
+ * (CTRL, FILM, SNDS or FILL first: its whole data decides), 0 none. */
 static int is_stream(const uint8_t *d, uint32_t n)
 {
     if (n < 20)
         return 0;
     if (!memcmp(d, "SHDR", 4) || (!memcmp(d, "DACQ", 4) && !memcmp(d + 16, "MTBL", 4)))
         return 1;
-    return !memcmp(d, "CTRL", 4) || !memcmp(d, "FILM", 4) || !memcmp(d, "SNDS", 4) ? 2 : 0;
+    return !memcmp(d, "CTRL", 4) || !memcmp(d, "FILM", 4) || !memcmp(d, "SNDS", 4) ||
+           !memcmp(d, "FILL", 4) ? 2 : 0;
 }
 
 static void check_cel(const char *path, const uint8_t *d, uint32_t n,
@@ -199,7 +200,7 @@ int main(int argc, char **argv)
             continue;
         if (cel)
             check_cel(e->path, d, e->size, &cels, &celframes, &failed);
-        else if (strm == 1 || tdk_stream_first_fill_end(d, e->size))
+        else if (strm == 1 || tdk_stream_headerless(d, e->size))
             check_stream(e->path, d, e->size, limit, &streams, &frames);
         free(d);
     }

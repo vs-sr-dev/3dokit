@@ -55,6 +55,22 @@ void m_dot3(ArmCpu& c) {
     c.r[0] = (uint32_t)(int32_t)(((int64_t)a[0] * b[0] + (int64_t)a[1] * b[1] + (int64_t)a[2] * b[2]) >> 16);
 }
 
+// swi 0x5000e: void Cross3_F16(vec3f16 dest, vec3f16 v1, vec3f16 v2) -- OPERAMATH 21.10's Green
+// 0x1b48 (its table 0x2d78, SWI n at word 24 - n): v1 = (a, b, c) laid into the engine's rows as
+// (0, -c, b), (c, 0, -a), (-b, a, 0) -- each negation a 32-bit one --, v2 its vector, a 3x3 product:
+// each output the 64-bit sum of its row's products shifted down 16, so v1 x v2.
+void m_cross3(ArmCpu& c) {
+    int32_t a[3], b[3];
+    read3(c.r[1], a);
+    read3(c.r[2], b);
+    auto neg = [](int32_t x) { return (int32_t)(0u - (uint32_t)x); };
+    const int32_t rows[3][3] = {{0, neg(a[2]), a[1]}, {a[2], 0, neg(a[0])}, {neg(a[1]), a[0], 0}};
+    int32_t out[3];
+    for (int k = 0; k < 3; ++k)
+        out[k] = (int32_t)(((int64_t)rows[k][0] * b[0] + (int64_t)rows[k][1] * b[1] + (int64_t)rows[k][2] * b[2]) >> 16);
+    write3(c.r[0], out);
+}
+
 // count vectors of three through the engine, src to dest: one (0x1c30), or a pipeline that reads
 // vector k + 1 before it writes result k, so dest may be src. A count below 1 runs the pipeline
 // about 2^32 times on the console (the software routine would do nothing): stopped here.
@@ -211,6 +227,7 @@ void pf_math_init() {
     pf_on_swi(0x50001, m_mulmat33mat33);
     pf_on_swi(0x50002, m_mulmanyvec3mat33);
     pf_on_swi(0x5000c, m_dot3);
+    pf_on_swi(0x5000e, m_cross3);
     pf_on_swi(0x50007, m_mulvec4mat44);
     pf_on_swi(0x50008, m_mulmat44mat44);
     pf_on_swi(0x50009, m_mulmanyvec4mat44);

@@ -38,6 +38,16 @@ const ArmModule* arm_identify(uint32_t at) {
     return nullptr;
 }
 
+const ArmModule* arm_identify_body(uint32_t at) {
+    for (int i = 0; i < g_arm_nmodules; ++i) {
+        const ArmModule* m = g_arm_modules[i];
+        if (m->size > 0x80 && at + m->size <= ARM_MEM_SIZE &&
+            arm_crc32(g_arm_mem + at + 0x80, m->size - 0x80) == m->crc_body)
+            return m;
+    }
+    return nullptr;
+}
+
 void arm_activate(const ArmModule* m) {
     g_active = m;
     g_nloaded = 0;

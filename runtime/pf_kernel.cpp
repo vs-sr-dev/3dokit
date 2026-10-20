@@ -293,8 +293,16 @@ static bool same_name(uint32_t a, const char* b) {
 
 // swi 0x10004: Item FindItem(int32 ctype, TagArg* tags) -- ctype is
 // MKNODEID(subsystem, type); the tags give TAG_ITEM_NAME (1)
+// A ctype of subsystem 0, which no folio is, finds nothing and its tags are not read: The Need
+// for Speed's debug hooks (0x3d3c8 on) reach FindItem so, as `swi 0x104` with their flag word
+// in r0 and a CCB in r1, and put r0 back after it. (The kernel's own error here is not read: the
+// runtime's NOTFOUND.)
 static void k_finditem(ArmCpu& c) {
     uint32_t ctype = c.r[0];
+    if (!(ctype >> 8 & 0xFF)) {
+        c.r[0] = (uint32_t)PF_ERR_NOTFOUND;
+        return;
+    }
     char name[64] = "";
     for (uint32_t t = c.r[1]; t; t += 8) {
         uint32_t tag = pf_r32(t), arg = pf_r32(t + 4);

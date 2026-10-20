@@ -91,7 +91,7 @@ def main(argv=None):
         is_cel = head[:4] in cel.HEADS
         is_strm = len(head) >= 20 and (head[:4] == b'SHDR' or (
             head[:4] == b'DACQ' and head[16:20] == b'MTBL') or
-            head[:4] in stream.HEADERLESS)
+            head[:4] in stream.HEADERLESS or head[:4] == stream.FILL)
         if not is_cel and not is_strm:
             continue
         data = vol.read(e)

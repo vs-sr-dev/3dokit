@@ -14,7 +14,8 @@ it. Writes, into --out:
 
     p_<name>_funcs.h        prototypes and the module descriptor
     p_<name>_NNN.cpp        the functions, split by instruction count
-    p_<name>_table.cpp      the module: its read-only area's size and crc32, its entries
+    p_<name>_table.cpp      the module: its read-only area's size and crc32 (whole, and past
+                            the AIF header), its entries
     modules.cpp             every module of the build (g_arm_modules)
     pf_names.cpp            the SDK's names for SWIs and folio slots (3dokit.sdk)
     CMakeLists.txt          the library `recomp`, the runtime, the self-test
@@ -79,6 +80,7 @@ class Module:
         self.aif = self.prog.aif
         self.size = self.aif.ro
         self.crc = zlib.crc32(self.aif.d[:self.size])
+        self.crc_body = zlib.crc32(self.aif.d[0x80:self.size]) if self.size > 0x80 else 0
         self.entries = sorted(self.prog.funcs)
         self.files, self.sites, self.unknown = [], {}, []
         self.n_ins = 0
@@ -128,8 +130,8 @@ class Module:
                 f.write('    {0x%08Xu, %s},\n' % (e, E.fname(e)))
             f.write('};\n\n')
             f.write('uint32_t mb = 0;\n')
-            f.write('extern const ArmModule module = {"%s", &mb, %du, 0x%08Xu, funcs, %d};\n'
-                    % (self.name, self.size, self.crc, len(self.entries)))
+            f.write('extern const ArmModule module = {"%s", &mb, %du, 0x%08Xu, 0x%08Xu, funcs, %d};\n'
+                    % (self.name, self.size, self.crc, self.crc_body, len(self.entries)))
             f.write('\n}  // namespace %s\n' % self.ns)
         self.files.append(self.ns + '_table.cpp')
 

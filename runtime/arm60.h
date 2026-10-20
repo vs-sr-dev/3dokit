@@ -34,6 +34,8 @@ struct ArmModule {
     const char* name;
     uint32_t* base;                     // where it is loaded: its code's `mb`
     uint32_t size, crc;                 // crc32 of the read-only area as the file holds it
+    uint32_t crc_body;                  // the same past the AIF header (0x80 on): what a program's own
+                                        // loader has read, whatever it then did to the header
     const ArmFuncEntry* funcs;
     uint32_t nfuncs;
 };
@@ -138,6 +140,7 @@ extern const ArmModule* const g_arm_modules[];
 extern const int g_arm_nmodules;
 const ArmModule* arm_module(const char* name);
 const ArmModule* arm_identify(uint32_t at = 0); // the module whose image is in memory at `at`
+const ArmModule* arm_identify_body(uint32_t at); // ...by its read-only area past the AIF header
 void    arm_activate(const ArmModule* m);       // the program at 0, and no other loaded
 bool    arm_load(const ArmModule* m, uint32_t base);  // false if it is loaded already
 void    arm_unload(const ArmModule* m);

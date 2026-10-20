@@ -92,6 +92,22 @@ static fs::path host_of(const std::string& at) {
     return p;
 }
 
+// The disc's filesystem's name, as the folio mounts it: its label's volume identifier (the disc's
+// block 0, the file "Disc label" at its root: discdata.h's dl_VolumeIdentifier, +0x28, 32 bytes) --
+// "CD-ROM" on the discs read. "" when the disc has no label to read.
+static const std::string& disc_volume_name() {
+    static std::string name, root;
+    if (root != g_pf_disc_root) {
+        root = g_pf_disc_root;
+        name.clear();
+        std::ifstream f(host_of("/") / "Disc label", std::ios::binary);
+        char label[0x48] = {};
+        if (f.read(label, sizeof label) && (uint8_t)label[0] == 1 && label[1] == 0x5a)
+            for (int i = 0; i < 32 && label[0x28 + i]; ++i) name += label[0x28 + i];
+    }
+    return name;
+}
+
 static std::string parent_of(const std::string& at) {
     size_t slash = at.find_last_of('/');
     return slash == 0 ? "/" : at.substr(0, slash);
@@ -100,11 +116,13 @@ static std::string parent_of(const std::string& at) {
 // The entry `name` of the directory `at`, matched without case (the folio's 0x61e0, as the
 // kernel's FindNamedNode matches); "" when there is none. At the root a mounted filesystem's name
 // comes first (the folio's root holds the filesystems: 20.30's walk, 0x3078), and a linked-memory
-// directory's entries are its own (lm_child).
+// directory's entries are its own (lm_child); the disc's own name there (disc_volume_name) is the
+// disc's root, which is the runtime's "/" as well.
 static std::string child_of(const std::string& at, const std::string& name) {
     if (at == "/") {
         std::string top = lm_top(name);
         if (!top.empty()) return top;
+        if (!disc_volume_name().empty() && same_name(name, disc_volume_name())) return "/";
     }
     if (lm_of(at)) return lm_child(at, name);
     std::error_code ec;
@@ -1340,30 +1358,33 @@ static void f_changedirectory(ArmCpu& c) {
 // swi 0x30008: Item GetDirectory(char* pathBuf, int pathBufLen) -- 0x3598: with a buffer, the
 // buffer checked (ValidateMem for the current task, its error returned) and the current
 // directory's path written into it (0x32c0); the directory's item. The path is the names from
-// the folio's root down, each after a '/', and "" for the root itself: their lengths, a '/' each
-// and the NUL are counted first, and a path that does not fit is -1 with nothing written. The
-// folio's root is "/" here (above), so a path never names the mounted filesystem -- the console
-// would say "/cd-rom/..." -- and ChangeDirectory takes it back to the same place.
+// the folio's root down, each after a '/': their lengths, a '/' each and the NUL are counted
+// first, and a path that does not fit is -1 with nothing written. The folio's root is the
+// disc's here (above), so a place on the disc has the disc's filesystem's name before it, as the
+// console's mount of the disc is named ("/CD-ROM/DriveData/dsp", "/CD-ROM" for its root): The
+// Need for Speed keeps the path and goes back to it with ChangeDirectory. (A disc with no label
+// to read: no name, and "" for its root.)
 static int32_t get_directory(uint32_t buf, int32_t len) {
     uint32_t dir = file_node(g_cwd), root = file_node("/");
     if (!buf) return (int32_t)pf_r32(dir + 24);
     int32_t err = pf_task_can_write(pf_current_task(), buf, len);
     if (err) return err;
-    auto name_len = [](uint32_t f) {
-        uint32_t n = 0;
-        while (pf_r8(f + FI_NAME + n)) ++n;
-        return (int32_t)n;
-    };
-    int32_t need = 1;
-    for (uint32_t f = dir; f && f != root; f = pf_r32(f + FI_PARENT)) need += name_len(f) + 1;
-    if (need > len) return -1;
-    pf_w8(buf + (uint32_t)--need, 0);
+    std::vector<std::string> names;
     for (uint32_t f = dir; f && f != root; f = pf_r32(f + FI_PARENT)) {
-        int32_t n = name_len(f);
-        need -= n;
-        for (int32_t i = 0; i < n; ++i) pf_w8(buf + (uint32_t)(need + i), pf_r8(f + FI_NAME + (uint32_t)i));
-        pf_w8(buf + (uint32_t)--need, '/');
+        std::string n;
+        for (uint32_t i = 0; pf_r8(f + FI_NAME + i); ++i) n += (char)pf_r8(f + FI_NAME + i);
+        names.push_back(n);
     }
+    if (!lm_of(g_cwd) && !disc_volume_name().empty()) names.push_back(disc_volume_name());
+    int32_t need = 1;
+    for (const std::string& n : names) need += (int32_t)n.size() + 1;
+    if (need > len) return -1;
+    uint32_t at = buf;
+    for (size_t k = names.size(); k-- > 0;) {
+        pf_w8(at++, '/');
+        for (char ch : names[k]) pf_w8(at++, (uint8_t)ch);
+    }
+    pf_w8(at, 0);
     return (int32_t)pf_r32(dir + 24);
 }
 

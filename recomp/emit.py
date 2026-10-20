@@ -368,6 +368,8 @@ class Body:
                 out.add(i.target)
             if a in self.f.switches:
                 out |= {t for t in self.f.switches[a] if t in code}
+            if a in getattr(self.f, 'computed', {}):
+                out |= {t for t in self.f.computed[a][1].values() if t in code}
         out |= {t for t in getattr(self.f, 'local_returns', ()) if t in code}
         return out
 
@@ -379,6 +381,7 @@ class Body:
         k = i.kind
         cond = COND.get(i.cond)
         on = True
+        computed = getattr(self.f, 'computed', {})
         leaves = k in ('b', 'swi') or i.writes_pc() or a in self.f.switches
         if k == 'b':
             if i.link:
@@ -399,6 +402,15 @@ class Body:
             cases = ' '.join('case %d: goto L_%08X;' % (n, t) for n, t in enumerate(targets[1:]))
             text = 'switch (%s) { %s default: arm_fault(c, %s, "switch index"); }' % (
                 R(i.op2[1]), cases, _abs(a))
+            self._count('switch')
+        elif a in computed:
+            # hand-written code's jump into the code after it: pc = a + 8 + rX, rX one of the
+            # values discovery found it can take
+            x, cases = computed[a]
+            body = ' '.join('case 0x%Xu: goto L_%08X;' % (v, t) for v, t in sorted(cases.items()))
+            text = 'switch (%s) { %s default: arm_fault(c, %s, "computed jump"); }' % (
+                R(x), body, _abs(a))
+            on = False
             self._count('switch')
         elif i.writes_pc():
             on = cond is not None

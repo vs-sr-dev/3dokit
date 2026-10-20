@@ -19,9 +19,13 @@ enum : uint32_t {
     SCR_SCREENGROUPPTR = 0x24, SCR_VDLPTR = 0x28, SCR_VDLITEM = 0x2c, SCR_VDLTYPE = 0x30,
     SCR_BITMAPLIST = 0x38, SCR_TEMPBITMAP = 0x78,
     BM_BUFFER = 0x24, BM_WIDTH = 0x28, BM_HEIGHT = 0x2c, BM_VERTICALOFFSET = 0x30, BM_FLAGS = 0x34,
-    BM_CLIPWIDTH = 0x38, BM_CLIPHEIGHT = 0x3c, BM_WATCHDOGCTR = 0x48, BM_SYSMALLOC = 0x4c,
+    BM_CLIPWIDTH = 0x38, BM_CLIPHEIGHT = 0x3c, BM_CLIPX = 0x40, BM_CLIPY = 0x44,
+    BM_WATCHDOGCTR = 0x48, BM_SYSMALLOC = 0x4c, BM_SHAREDLIST = 0x50,
     BM_CECONTROL = 0x70, BM_REGCTL0 = 0x74, BM_REGCTL1 = 0x78, BM_REGCTL2 = 0x7c, BM_REGCTL3 = 0x80,
     VDL_SCREENPTR = 0x24, VDL_DATAPTR = 0x28, VDL_TYPE = 0x2c, VDL_DATASIZE = 0x30,
+    // what 20.45's VDL and folio node add (the later headers)
+    VDL_FLAGS = 0x34, VDL_DISPLAYTYPE = 0x38, VDL_HEIGHT = 0x3c, VDL_OFFSET = 0x40,
+    GF_DEFAULTDISPLAYTYPE = 0x140, GF_DISPLAYTYPEMASK = 0x144,
 };
 static const uint32_t kNodeSize[] = {0, 0x54, 0x7c, 0x84, 0x34};
 // GRAPHIX 20.45 (0x6698) and 23.10 (0x762c) make a ScreenGroup of 0x74 bytes and a VDL of 0x44, the
@@ -37,10 +41,11 @@ enum : uint32_t {
     GRAFERR_BADITEM = 0xD55B9001u, GRAFERR_BADTAG = 0xD55B9002u, GRAFERR_BADTAGVAL = 0xD55B9003u,
     GRAFERR_NOMEM = 0xD55B9006u, GRAFERR_BADVDLTYPE = 0xD55B9116u, GRAFERR_INDEXRANGE = 0xD55B9117u,
     GRAFERR_BUFWIDTH = 0xD55B9118u, GRAFERR_VDLWIDTH = 0xD55B911Au, GRAFERR_NOTYET = 0xD55B911Bu,
-    GRAFERR_MIXEDSCREENS = 0xD55B911Cu, GRAFERR_VDL_LENGTH = 0xD55B9121u,
+    GRAFERR_MIXEDSCREENS = 0xD55B911Cu, GRAFERR_VDL_FLAGS = 0xD55B9121u,
     GRAFERR_BADDISPDIMS = 0xD55B9123u, GRAFERR_BADBITMAPSPEC = 0xD55B9124u,
     GRAFERR_INTERNALERROR = 0xD55B9125u, GRAFERR_SGINUSE = 0xD55B9126u, GRAFERR_SGNOTINUSE = 0xD55B9127u,
     GRAFERR_NOWRITEACCESS = 0xD55B9129u, GRAFERR_NOTOWNER = 0xD55B9012u,
+    GRAFERR_PROOF_ERR = 0xD55B9120u, GRAFERR_BADDISPLAYTYPE = 0xD55B912Au, GRAFERR_BADCLIP = 0xD55B9115u,
 };
 
 static uint32_t graf(uint32_t field) { return pf_r32(pf_folio_base(PF_GRAPHICS) + field); }
@@ -164,6 +169,13 @@ void pf_graphics_init() {
     pf_w32(g + GF_DEFAULTDISPLAYHEIGHT, 240);
     pf_w32(g + GF_VBLTIME, 16684);                          // microseconds
     pf_w32(g + GF_VBLFREQ, 60);
+    // 20.45's start (0x14f8) asks the hardware for the display: on an NTSC console its type 1
+    // (DI_TYPE_NTSC) and the mask of those it has, 1 << 1 (the folio's DisplayInfo list, at
+    // +0x120, is not made)
+    if (pf_system_version("/System/Folios/GRAPHIX") >= PF_VERSION(20, 45)) {
+        pf_w32(g + GF_DEFAULTDISPLAYTYPE, 1);
+        pf_w32(g + GF_DISPLAYTYPEMASK, 2);
+    }
     // Two VRAM pages of the OS's: the VIRS page, cleared, then two runs of words from
     // +0x44 (148 of 0x04210421, 73 of 0x08420842), and the zero page after it, which lib3DO
     // reads to learn which VRAM bank to put screens in (GetBankBits).
@@ -407,7 +419,7 @@ static void g_createscreengroup(ArmCpu& c) {
     int32_t screens = (int32_t)arg[CSG_SCREENCOUNT];
     uint32_t err = 0;
     if (dh < 1 || dh > (int32_t)graf(GF_DEFAULTDISPLAYHEIGHT)) err = GRAFERR_BADDISPDIMS;
-    else if (arg[CSG_VDLPTRS] && !arg[CSG_VDLLENGTHS]) err = GRAFERR_VDL_LENGTH;
+    else if (arg[CSG_VDLPTRS] && !arg[CSG_VDLLENGTHS]) err = GRAFERR_VDL_FLAGS;
     else if (screens < 1 || (int32_t)arg[CSG_SCREENHEIGHT] < dh) err = GRAFERR_BADDISPDIMS;
     else if (bitmaps < 0 || (bitmaps > 1 && !arg[CSG_HEIGHTS])) err = GRAFERR_BADBITMAPSPEC;
     if (err) {
@@ -567,6 +579,15 @@ static void must_own(ArmCpu& c, uint32_t n) {
     if (pf_r32(n + 28) != task_item()) pf_stop(c, "the Graphics folio: an item of another task");
 }
 
+// 20.45's DisplayScreen (build 419's SWI 45, 0x37d8) lets a screen through when the caller owns it
+// or has it open (ItemOpened; a thread has its own resource table: a screen of its parent's it has
+// not opened is not its), else GRAFERR_NOTOWNER; the folios before 20.45 are not read here.
+static bool owned_or_opened(ArmCpu& c, uint32_t n) {
+    if (pf_r32(n + 28) == task_item()) return true;
+    if (pf_system_version("/System/Folios/GRAPHIX") < PF_VERSION(20, 45)) must_own(c, n);
+    return pf_item_opened((int32_t)task_item(), (int32_t)pf_r32(n + 24)) >= 0;
+}
+
 // SWI 13 (0x1fc8): Err SetScreenColors(Item screen, uint32* entries, int32 count) -- the screen
 // (CheckItem, its owner), its VDL of type VDLTYPE_SIMPLE (else GRAFERR_BADVDLTYPE); then each
 // entry, index (its top byte) at most 32 (else GRAFERR_INDEXRANGE, the earlier ones written) and
@@ -615,7 +636,8 @@ static void g_resetscreencolors(ArmCpu& c) {
 }
 
 // Graphics -160: Err DisplayScreen(Item screen0, Item screen1) -- SWI 45 (0x307c): both screens
-// (screen1 0: screen0 again), CheckItem'd, then each owned; the first's group (none:
+// (screen1 0: screen0 again), CheckItem'd, then each owned (or, from 20.45, opened: else
+// GRAFERR_NOTOWNER); the first's group (none:
 // GRAFERR_INTERNALERROR) an item still (else GRAFERR_SGNOTINUSE -- AddScreenGroup is not asked
 // for), the second's the same group (else GRAFERR_MIXEDSCREENS); then the first VDL's data into
 // gf_CurrentVDLEven and the second's into gf_CurrentVDLOdd, which the next blanks link in.
@@ -623,8 +645,7 @@ static void g_displayscreen(ArmCpu& c) {
     uint32_t s0 = pf_check_item((int32_t)c.r[0], NST_GRAPHICS, TYPE_SCREEN);
     uint32_t s1 = c.r[1] ? pf_check_item((int32_t)c.r[1], NST_GRAPHICS, TYPE_SCREEN) : s0;
     if (!s0 || !s1) { c.r[0] = GRAFERR_BADITEM; return; }
-    must_own(c, s0);
-    must_own(c, s1);
+    if (!owned_or_opened(c, s0) || !owned_or_opened(c, s1)) { c.r[0] = GRAFERR_NOTOWNER; return; }
     uint32_t sg = pf_r32(s0 + SCR_SCREENGROUPPTR);
     if (!sg) { c.r[0] = GRAFERR_INTERNALERROR; return; }
     if (!pf_check_item((int32_t)pf_r32(sg + 24), NST_GRAPHICS, TYPE_SCREENGROUP)) { c.r[0] = GRAFERR_SGNOTINUSE; return; }
@@ -634,6 +655,230 @@ static void g_displayscreen(ArmCpu& c) {
     pf_w32(g + GF_CURRENTVDLODD, pf_r32(pf_r32(s1 + SCR_VDLPTR) + VDL_DATAPTR));
     if (g_pf_trace) pf_log("        display %d and %d\n", (int32_t)c.r[0], (int32_t)c.r[1]);
     c.r[0] = 0;
+}
+
+// ---- a program's own VDLs --------------------------------------------------------------------
+// GRAPHIX 20.45's display types (DI_TYPE_NTSC 1, PAL1 2, PAL2 3), from build 419's tables at
+// 0x6e00, 0x6e80 and 0x6ea0: the most lines each shows, the mode bits the folio puts into a
+// display control word, and the lines the picture starts down.
+static const uint32_t kDisplayLines[4] = {0, 240, 288, 288};
+static const uint32_t kDisplayMode[4] = {0, 0, 0, 0x08000000u};
+static const uint32_t kDisplayTop[4] = {0, 0, 1, 1};
+
+// The copy of a program's VDL the display is given (0x56ec): `words` words from `src`, checked
+// entry by entry into the OS's VRAM (AllocMemFromMemLists of the kernel's lists, MEMTYPE_VRAM |
+// MEMTYPE_DMA, words * 4 bytes): each entry's DMA control word only of the bits the hardware
+// defines (0x03AFFFFF), 1 to 34 words after its header, a display mode below 5; an entry of 0
+// lines given all those left; its relative link (VDL_RELSEL) made absolute, its buffers copied;
+// then its words -- a colour as it is, a display control word (110, bits 26-28 clear) with the
+// display type's mode bits, a 111 word as it is, an AMY control word (10) refused -- and the next
+// entry 16-byte aligned in the copy. It goes on while the next entry lies inside the program's
+// words, the copy has room, and lines are left; more lines than the display type's, or a copy
+// past its room, is refused. The last link is post-display. A refusal is GRAFERR_PROOF_ERR, and
+// its copy is not given back (as the folio leaves it); the folio's kprintf of why is the trace's.
+static uint32_t copy_vdl(ArmCpu& c, uint32_t src, uint32_t words, uint32_t dtype, int32_t lines, uint32_t& err) {
+    auto reject = [&](const char* why, uint32_t at) {
+        if (g_pf_trace) pf_log("        VDL Rejected - %s (%08X)\n", why, at);
+        err = GRAFERR_PROOF_ERR;
+        return 0u;
+    };
+    if ((int32_t)words < 5) return reject("bad length", words);
+    uint32_t copy = pf_alloc_mem(pf_kernel_lists(), (int32_t)(words * 4), MEMTYPE_VRAM | MEMTYPE_DMA, false);
+    if (!copy) {
+        if (g_pf_trace) pf_log("        VDL Rejected - unable to allocate VRAM\n");
+        err = GRAFERR_NOMEM;
+        return 0;
+    }
+    uint32_t end = copy + words * 4, src_end = src + words * 4, d = copy, s = src, entry = src;
+    uint32_t link = 0, next = 0;
+    do {
+        if (d + 16 > end) return reject("system copy of VDL exceeded specified length", d);
+        uint32_t w0 = pf_r32(s);
+        if (w0 & ~0x03AFFFFFu) return reject("DMA control word has illegal/reserved bits set", s);
+        uint32_t n = (w0 & 0x7e00) >> 9;
+        if (n < 1 || n > 34) return reject("DMA control word specifies bad length", s);
+        uint32_t count = w0 & 0x1ff;
+        lines -= (int32_t)count;
+        if (!count) {
+            w0 |= (uint32_t)lines;
+            lines = 0;
+        }
+        if (((w0 & 0x3800000) >> 23) >= 5) return reject("DMA control word contains illegal display mode", s);
+        bool relative = w0 & 0x40000u;
+        pf_w32(d, w0 & ~0x40000u);
+        pf_w32(d + 4, pf_r32(s + 4));
+        pf_w32(d + 8, pf_r32(s + 8));
+        next = pf_r32(s + 12);
+        if (relative) next = next + entry + 16;
+        entry = next;
+        link = d + 12;
+        s += 16;
+        d += 16;
+        if (d + 4 * n > end) return reject("system copy of VDL exceeded specified length", d);
+        for (uint32_t k = 0; k < n; ++k, s += 4, d += 4) {
+            uint32_t v = pf_r32(s);
+            if (v & 0x80000000u) {
+                if ((v & 0xC0000000u) != 0xC0000000u) return reject("AMY control code", s);
+                if (!(v & 0x20000000u)) {
+                    if (v & 0x1C000000u) return reject("display control word has illegal/reserved flags", s);
+                    v |= kDisplayMode[dtype];
+                }
+            }
+            pf_w32(d, v);
+        }
+        d = (d + 15) & ~15u;
+        pf_w32(link, d);
+        s = next;
+    } while (next < src_end && d < end && lines > 0);
+    if (lines < 0) return reject("VDL list attempts too many lines of display", s);
+    if (d > end) pf_stop(c, "SubmitVDL: VDL size overrun (the folio hangs here)");
+    pf_w32(link, graf(GF_VDLPOSTDISPLAY));
+    return copy;
+}
+
+// CreateItem of a VDL (MKNODEID(NST_GRAPHICS, TYPE_VDL)) -- the folio's ir_Create for it, 0x52e0:
+// the tags (0x4fdc) over the defaults, a height of 240 and VDLTYPE_FULL; a type other than
+// VDLTYPE_FULL or _SIMPLE is GRAFERR_BADVDLTYPE; the display type (0: gf_DefaultDisplayType) one
+// the console has (gf_DisplayTypeMask), else GRAFERR_BADDISPLAYTYPE; the height from 1 to the type's
+// lines, else GRAFERR_BADDISPDIMS. Then (0x4d7c) the program's VDL copied (copy_vdl), and the
+// node: its data, type, size in bytes, display type, height, and the line it starts at -- the
+// type's top and half the lines it leaves. The folio's own VDLs (made with its flag at 0x8694 set,
+// which skips all this) are not made here. The display control tags (11 to 22, the averaging
+// and the CLUT bypass) are not yet read.
+static uint32_t create_vdl(ArmCpu& c, uint32_t tags) {
+    uint32_t height = 240, type = 1, dtype = 0, words = 0, data = 0;
+    for (uint32_t t = tags; t; t += 8) {
+        uint32_t tag = pf_r32(t), arg = pf_r32(t + 4);
+        if (!tag) break;
+        switch (tag) {
+        case 100: type = arg; break;
+        case 101: dtype = arg; break;
+        case 102: words = arg; break;
+        case 103: height = arg; break;
+        case 104: data = arg; break;
+        default:
+            if (tag >= 11 && tag <= 22) pf_stop(c, "CreateItem of a VDL: a display control tag: not yet");
+            if (tag <= 10) pf_stop(c, "CreateItem of a VDL: an item tag: not yet");
+            return GRAFERR_BADTAG;
+        }
+    }
+    if (type != 1 && type != 4) return GRAFERR_BADVDLTYPE;
+    if (!dtype) dtype = graf(GF_DEFAULTDISPLAYTYPE);
+    if (dtype > 31 || !(graf(GF_DISPLAYTYPEMASK) & 1u << dtype)) return GRAFERR_BADDISPLAYTYPE;
+    if (dtype > 3 || (int32_t)height < 1 || height > kDisplayLines[dtype]) return GRAFERR_BADDISPDIMS;
+    uint32_t err = 0, copy = copy_vdl(c, data, words, dtype, (int32_t)height, err);
+    if (!copy) return err;
+    int32_t item = graf_item(TYPE_VDL);
+    uint32_t vdl = pf_item_node(item);
+    pf_w32(vdl + VDL_DATAPTR, copy);
+    pf_w32(vdl + VDL_TYPE, type);
+    pf_w32(vdl + VDL_DATASIZE, words * 4);
+    pf_w32(vdl + VDL_FLAGS, 0);
+    pf_w32(vdl + VDL_DISPLAYTYPE, dtype);
+    pf_w32(vdl + VDL_HEIGHT, height);
+    int32_t spare = (int32_t)(kDisplayLines[dtype] - height);
+    pf_w32(vdl + VDL_OFFSET, kDisplayTop[dtype] + (uint32_t)(spare / 2));
+    if (g_pf_trace) pf_log("        VDL %d: %u words at %08X, type %u, %u lines\n", item, words, copy, type, height);
+    return (uint32_t)item;
+}
+
+// CreateItem of a Bitmap (MKNODEID(NST_GRAPHICS, TYPE_BITMAP)) -- the folio's ir_Create for it,
+// 0x5e80: the tags (0x5df8: CBM_TAG_WIDTH 11, _HEIGHT, _BUFFER, _CLIPWIDTH, _CLIPHEIGHT, _CLIPX,
+// _CLIPY, _WATCHDOGCTR, _CECONTROL 19) over the defaults, a watchdog of 1,000,000 and the control
+// word 0xE1500000; a width the cel engine has (the table at 0x86a4, exactly: regctl0), else
+// GRAFERR_BUFWIDTH; a height of 1 to 2048, else GRAFERR_BADBITMAPSPEC; the buffer, width * height
+// * 2 bytes, the task's to write, else GRAFERR_NOWRITEACCESS; the clip (its size the bitmap's
+// unless given) inside the bitmap, else GRAFERR_BADCLIP. Then the node: the buffer, the size, the
+// clip, the watchdog in 16s, the control word, REGCTL0 from the width, REGCTL1 from the size,
+// REGCTL2 and 3 the buffer, and its list of the tasks that share it.
+static uint32_t create_bitmap(ArmCpu& c, uint32_t tags) {
+    int32_t width = 0, height = 0, clipw = 0, cliph = 0, clipx = 0, clipy = 0;
+    uint32_t watchdog = 1000000, control = 0xE1500000u, buffer = 0;
+    for (uint32_t t = tags; t; t += 8) {
+        uint32_t tag = pf_r32(t), arg = pf_r32(t + 4);
+        if (!tag) break;
+        switch (tag) {
+        case 11: width = (int32_t)arg; break;
+        case 12: height = (int32_t)arg; break;
+        case 13: buffer = arg; break;
+        case 14: clipw = (int32_t)arg; break;
+        case 15: cliph = (int32_t)arg; break;
+        case 16: clipx = (int32_t)arg; break;
+        case 17: clipy = (int32_t)arg; break;
+        case 18: watchdog = arg; break;
+        case 19: control = arg; break;
+        default:
+            if (tag <= 10) pf_stop(c, "CreateItem of a Bitmap: an item tag: not yet");
+            return GRAFERR_BADTAG;
+        }
+    }
+    uint32_t r0 = regctl0((uint32_t)width);
+    if (!r0) return GRAFERR_BUFWIDTH;
+    if (height < 1 || height > 0x800) return GRAFERR_BADBITMAPSPEC;
+    if (pf_task_can_write(pf_current_task(), buffer, width * height * 2) < 0) return GRAFERR_NOWRITEACCESS;
+    if (!clipw) clipw = width;
+    if (!cliph) cliph = height;
+    if (clipx < 0 || clipx >= width || clipy < 0 || clipy >= height || clipw < 0 || clipx + clipw > width ||
+        cliph < 0 || clipy + cliph > height)
+        return GRAFERR_BADCLIP;
+    int32_t item = graf_item(TYPE_BITMAP);
+    uint32_t bm = pf_item_node(item);
+    pf_w32(bm + BM_BUFFER, buffer);
+    pf_w32(bm + BM_WIDTH, (uint32_t)width);
+    pf_w32(bm + BM_HEIGHT, (uint32_t)height);
+    pf_w32(bm + BM_VERTICALOFFSET, 0);
+    pf_w32(bm + BM_FLAGS, 0);
+    pf_w32(bm + BM_CLIPWIDTH, (uint32_t)clipw);
+    pf_w32(bm + BM_CLIPHEIGHT, (uint32_t)cliph);
+    pf_w32(bm + BM_CLIPX, (uint32_t)clipx);
+    pf_w32(bm + BM_CLIPY, (uint32_t)clipy);
+    pf_w32(bm + BM_WATCHDOGCTR, (uint32_t)((int32_t)watchdog >> 4));
+    pf_w32(bm + BM_SYSMALLOC, 0);
+    pf_w32(bm + BM_CECONTROL, control);
+    pf_w32(bm + BM_REGCTL0, r0);
+    pf_w32(bm + BM_REGCTL1, (uint32_t)(width - 1) | (uint32_t)(height - 1) << 16);
+    pf_w32(bm + BM_REGCTL2, buffer);
+    pf_w32(bm + BM_REGCTL3, buffer);
+    pf_list_init(bm + BM_SHAREDLIST, "Bitmap shared access list");
+    if (g_pf_trace) pf_log("        Bitmap %d: %dx%d at %08X\n", item, width, height, buffer);
+    return (uint32_t)item;
+}
+
+// The folio's ir_Create (0x24ac), for the node types the programs make with CreateItem themselves.
+static uint32_t graphics_create(ArmCpu& c, int type, uint32_t tags) {
+    if (pf_system_version("/System/Folios/GRAPHIX") < PF_VERSION(20, 45))
+        pf_stop(c, "CreateItem of a Graphics node before GRAPHIX 20.45: not yet");
+    if (type == (int)TYPE_VDL) return create_vdl(c, tags);
+    if (type == (int)TYPE_BITMAP) return create_bitmap(c, tags);
+    pf_stop(c, "CreateItem of a Graphics screen group or screen: not yet");
+}
+
+// Graphics -168: Item SubmitVDL(VDLEntry* vdl, int32 length, int32 type) -- the folio's user
+// half (0x5d80) is CreateItem of a VDL with CREATEVDL_TAG_DATAPTR, _LENGTH, _VDLTYPE and a
+// _HEIGHT of 240.
+static void g_submitvdl(ArmCpu& c) {
+    if (pf_system_version("/System/Folios/GRAPHIX") < PF_VERSION(20, 45)) pf_stop(c, "SubmitVDL before GRAPHIX 20.45: not yet");
+    const uint32_t tags[10] = {104, c.r[0], 102, c.r[1], 100, c.r[2], 103, 240, 0, 0};
+    uint32_t t = c.r[13] - 40;
+    for (int i = 0; i < 10; ++i) pf_w32(t + 4u * (uint32_t)i, tags[i]);
+    c.r[0] = create_vdl(c, t);
+}
+
+// Graphics -164: Item SetVDL(Item screen, Item vdl) -- SWI 47 (0x4e60): the VDL, then the screen
+// (CheckItem, else GRAFERR_BADITEM; each the caller's); the screen given the VDL -- its item,
+// node and type --, the VDL the screen, and the screen's VDL before it returned. The display
+// changes at the next DisplayScreen.
+static void g_setvdl(ArmCpu& c) {
+    uint32_t vdl = own_item(c, c.r[1], TYPE_VDL);
+    if (!vdl) { c.r[0] = GRAFERR_BADITEM; return; }
+    uint32_t scr = own_item(c, c.r[0], TYPE_SCREEN);
+    if (!scr) { c.r[0] = GRAFERR_BADITEM; return; }
+    uint32_t old = pf_r32(scr + SCR_VDLITEM);
+    pf_w32(vdl + VDL_SCREENPTR, scr);
+    pf_w32(scr + SCR_VDLITEM, c.r[1]);
+    pf_w32(scr + SCR_VDLPTR, vdl);
+    pf_w32(scr + SCR_VDLTYPE, pf_r32(vdl + VDL_TYPE));
+    c.r[0] = old;
 }
 
 // ---- the cel engine --------------------------------------------------------------------------
@@ -766,7 +1011,6 @@ static void g_fillrect(ArmCpu& c) {
 // (x, y) in the line pairs becomes the cel engine's write address (REGCTL3), and its read address
 // (REGCTL2) too when that was the write address; bm_ClipX and bm_ClipY take x and y. The clip's
 // size (REGCTL1) stays.
-enum : uint32_t { BM_CLIPX = 0x40, BM_CLIPY = 0x44, GRAFERR_BADCLIP = 0xD55B9115u };
 static void g_setcliporigin(ArmCpu& c) {
     uint32_t bm = pf_check_item((int32_t)c.r[0], NST_GRAPHICS, TYPE_BITMAP);
     if (!bm) { c.r[0] = GRAFERR_BADITEM; return; }
@@ -898,5 +1142,8 @@ static void graphics_slots() {
     pf_on_slot(PF_GRAPHICS, -136, g_fillrect);
     pf_on_delete(NST_GRAPHICS, graphics_delete);
     pf_on_slot(PF_GRAPHICS, -160, g_displayscreen);
+    pf_on_slot(PF_GRAPHICS, -164, g_setvdl);
+    pf_on_slot(PF_GRAPHICS, -168, g_submitvdl);
+    pf_on_create(NST_GRAPHICS, graphics_create);
     pf_on_slot(PF_GRAPHICS, -172, g_drawcels);
 }

@@ -29,6 +29,11 @@ typedef struct {
 /* Where the first FILL chunk ends, chunk by chunk from the start (within
  * the first 0x40000 bytes), when that is a power of two; else 0. */
 uint32_t tdk_stream_first_fill_end(const uint8_t *d, uint32_t len);
+/* A stream with no header: its block size, else 0. Its first chunk CTRL,
+ * FILM or SNDS and its first block ended by a FILL at a power of two; or
+ * its first block one FILL, a power of two long, and the next block
+ * opened by CTRL, FILM or SNDS. */
+uint32_t tdk_stream_headerless(const uint8_t *d, uint32_t len);
 void tdk_stream_init(tdk_stream *s, const uint8_t *d, uint32_t len);
 /* 1 and the next chunk, or 0 at the end. */
 int  tdk_stream_next(tdk_stream *s, tdk_chunk *c);

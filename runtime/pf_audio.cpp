@@ -945,6 +945,35 @@ static void a_stopinstrument(ArmCpu& c) {
     c.r[0] = stop_instrument((int32_t)c.r[0], c.r[1]);
 }
 
+// swi 0x4001c: Err PauseInstrument(Item instrument) -- 21.10's 0x1bd4: an instrument (else
+// AF_ERR_BADITEM; neither the folio's open nor the owner asked). Started or released (its state
+// above 1), its DSP side paused (0x79b8): when it runs, its code passed over in the DSP's program
+// (the jump before it made to reach the next) and its DSP state 1. The instrument's own state stays,
+// and its FIFOs' DMA is not touched. swi 0x4001d: Err ResumeInstrument(Item instrument) -- 0x1c24:
+// the same checks, then (0x7920), when its DSP side does not run, back into the DSP's program at
+// its priority, its DSP state 3.
+static uint32_t pause_instrument(int32_t item, bool resume) {
+    if (!pf_check_item(item, NST_AUDIO, INSTRUMENT_NODE)) return AF_ERR_BADITEM;
+    Instrument& ins = g_instruments[item];
+    if (ins.state <= 1) return 0;
+    if (!resume && ins.dsp_state > 1) {
+        pf_dsp_run(item, false);
+        ins.dsp_state = 1;
+    } else if (resume && ins.dsp_state <= 1) {
+        pf_dsp_run(item, true);
+        ins.dsp_state = 3;
+    }
+    return 0;
+}
+static void a_pauseinstrument(ArmCpu& c) {
+    pf_dsp_sync();
+    c.r[0] = pause_instrument((int32_t)c.r[0], false);
+}
+static void a_resumeinstrument(ArmCpu& c) {
+    pf_dsp_sync();
+    c.r[0] = pause_instrument((int32_t)c.r[0], true);
+}
+
 // An attachment released (0x79a0): its sample must have an address (else AF_ERR_NULLADDRESS); a
 // link to what is no longer an attachment is forgotten (0x795c). With a release loop, that is the
 // FIFO's next chunk (0x76d0). Else, when something is linked after it: a sustain loop beginning
@@ -1256,24 +1285,47 @@ static uint32_t be16(uint32_t a) { return pf_r8(a) << 8 | pf_r8(a + 1); }
 
 struct IffRead {
     const ArmCpu& c;
-    uint32_t below, st;
+    uint32_t below, st;                         // the file's stream; 0 for an image in memory
     int32_t left;                               // what is left of the enclosing chunk
     uint32_t buf;                               // a chunk's bytes, on the caller's stack
     bool load = true;                           // the sample's data loaded (ScanSample: not)
+    uint32_t image = 0, pos = 0, length = 0;    // the image, where the reads are, its bytes
 };
+
+// 21.10's reader takes an image in memory as well as a file (AF_TAG_IMAGE_ADDRESS: its source a
+// stream or an image, 0xa898 and 0xa89c): a read (0xab1c) copies what is left of the image, at
+// most the count, and moves on by it, its result what it copied; a seek (0xab98) from the start,
+// the place or the end (SeekDiskStream's 1, 2, 3) to a place inside the image, else 0xE18BF104,
+// its result the place.
+enum : uint32_t { IFF_ERR_SEEK = 0xE18BF104u };
+static int32_t iff_src_read(IffRead& r, uint32_t dst, int32_t n) {
+    if (r.st) return pf_stream_read(r.c, r.below, r.st, dst, n);
+    int32_t k = std::min(n, (int32_t)(r.length - r.pos));
+    if (k <= 0) return k;
+    for (int32_t i = 0; i < k; ++i) pf_w8(dst + (uint32_t)i, pf_r8(r.image + r.pos + (uint32_t)i));
+    r.pos += (uint32_t)k;
+    return k;
+}
+static int32_t iff_src_seek(IffRead& r, int32_t off, int whence) {
+    if (r.st) return pf_stream_seek(r.c, r.below, r.st, off, whence);
+    int32_t to = whence == 1 ? off : whence == 2 ? (int32_t)r.pos + off : (int32_t)r.length + off;
+    if (to < 0 || to > (int32_t)r.length) return (int32_t)IFF_ERR_SEEK;
+    r.pos = (uint32_t)to;
+    return to;
+}
 static int32_t iff_read(IffRead& r, uint32_t dst, int32_t n) {
     if (n & 1) ++n;
     if (r.left - n < 0) return (int32_t)IFF_ERR_SHORT;
-    int32_t got = pf_stream_read(r.c, r.below, r.st, dst, n);
+    int32_t got = iff_src_read(r, dst, n);
     r.left -= n;
     return got;
 }
 static int32_t iff_skip(IffRead& r, int32_t n) {
-    int32_t pos = pf_stream_seek(r.c, r.below, r.st, 0, 2), to = pos + n;
+    int32_t pos = iff_src_seek(r, 0, 2), to = pos + n;
     if (to & 1) ++to;
     n = to - pos;
     if (r.left - n < 0) return (int32_t)IFF_ERR_SHORT;
-    int32_t got = pf_stream_seek(r.c, r.below, r.st, n, 2);
+    int32_t got = iff_src_seek(r, n, 2);
     r.left -= n;
     return got;
 }
@@ -1394,11 +1446,14 @@ static int32_t aiff_chunk(IffRead& r, Sample& s, AiffMarkers& mk, bool aifc, uin
     return 0;                                                       // APPL, FVER and the rest
 }
 
-static uint32_t parse_aiff(ArmCpu& c, uint32_t name, Sample& s, uint32_t alloc_fn, bool load = true) {
+static uint32_t parse_aiff(ArmCpu& c, uint32_t name, Sample& s, uint32_t alloc_fn, bool load = true,
+                           uint32_t image = 0, uint32_t length = 0) {
     const uint32_t below = 0xb00;
-    uint32_t st = pf_stream_open(c, below, name, 0);
-    if (!st) return IFF_ERR_OPEN;
+    uint32_t st = image ? 0 : pf_stream_open(c, below, name, 0);
+    if (!st && !image) return IFF_ERR_OPEN;
     IffRead r{c, below, st, 8, c.r[13] - 0xa00, load};
+    r.image = image;
+    r.length = length;
     AiffMarkers mk;
     int32_t err = 0;
     uint32_t h = r.buf + 0x200;
@@ -1420,17 +1475,17 @@ static uint32_t parse_aiff(ArmCpu& c, uint32_t name, Sample& s, uint32_t alloc_f
                         int32_t csize = (int32_t)pf_r32(h + 4);
                         if (id == id4("FORM") || id == id4("XREF"))
                             pf_stop(c, "an AIFF file with a FORM or XREF inside: not yet");
-                        int32_t end = pf_stream_seek(c, below, st, 0, 2) + csize;
+                        int32_t end = iff_src_seek(r, 0, 2) + csize;
                         if (end & 1) ++end;
                         if ((err = aiff_chunk(r, s, mk, aifc, alloc_fn, id, csize)) < 0) break;
-                        int32_t now = pf_stream_seek(c, below, st, 0, 2);
+                        int32_t now = iff_src_seek(r, 0, 2);
                         if (now != end) err = iff_skip(r, end - now);
                     }
                 }
             }
         }
     }
-    pf_stream_close(c, below, st);
+    if (st) pf_stream_close(c, below, st);
     return err < 0 ? (uint32_t)err : 0;
 }
 
@@ -1454,6 +1509,29 @@ static uint32_t load_sample_here(ArmCpu& c, uint32_t name, uint32_t alloc_fn, ui
     return audio_create(c, SAMPLE_NODE, tags);
 }
 static void a_loadsample(ArmCpu& c) { c.r[0] = load_sample_here(c, c.r[0], 0, 0); }
+
+// audio -164: Item DefineSampleHere(uint8* data, int32 numBytes, alloc, free) -- 21.10's 0x26ec:
+// CreateSample (0x2808) of AF_TAG_IMAGE_ADDRESS data, _IMAGE_LENGTH numBytes, _ALLOC_FUNCTION and
+// _FREE_FUNCTION: the two functions both given or neither (else AF_ERR_OUTOFRANGE); the sample's
+// information at its defaults (0x2b74), the AIFF image read into it as a file is (0xa71c: the
+// reader on the image), its data copied out of the image into memory from the allocator or the
+// folio's AllocMem (0x3064); then CreateItem(sample, {AF_TAG_SAMPLE the information}), from the
+// caller's stack. Read in 21.10 only.
+static void a_definesamplehere(ArmCpu& c) {
+    if (audio_version() != PF_VERSION(21, 10)) pf_stop(c, "DefineSampleHere of an AUDIOFOLIO other than 21.10: not yet");
+    uint32_t image = c.r[0], length = c.r[1], alloc_fn = c.r[2], free_fn = c.r[3];
+    if ((alloc_fn == 0) != (free_fn == 0)) { c.r[0] = AF_ERR_OUTOFRANGE; return; }
+    Sample s;
+    uint32_t err = parse_aiff(c, 0, s, alloc_fn, true, image, length);
+    if (g_pf_trace) pf_log("        DefineSampleHere %u bytes at 0x%x -> 0x%x\n", length, image, err);
+    if ((int32_t)err < 0) { c.r[0] = err; return; }
+    s.free_fn = free_fn;
+    uint32_t tags = c.r[13] - 32 - 0xb0, info = tags + 0x18;
+    sample_info_write(info, s);
+    const uint32_t t[3] = {AF_TAG_SAMPLE, info, 0};
+    for (int k = 0; k < 3; ++k) pf_w32(tags + 4u * k, t[k]);
+    c.r[0] = audio_create(c, SAMPLE_NODE, tags);
+}
 
 // audio -48: Item ScanSample(char* name, int32 bufferSize) -- 1993's 0x2b78 (23.10's 0x2c5c makes
 // it by tags, the size as tag 0x44): the AIFF read for its information as LoadSample reads it, but
@@ -2260,6 +2338,7 @@ void pf_audio_init() {
     pf_on_slot(PF_AUDIO, -76, a_ownaudioclock);
     pf_on_slot(PF_AUDIO, -80, a_disownaudioclock);
     pf_on_slot(PF_AUDIO, -168, a_getaudiotime);
+    pf_on_slot(PF_AUDIO, -164, a_definesamplehere);
     pf_on_swi(0x4000f, a_setaudiorate);
     pf_on_swi(0x40010, a_setaudioduration);
     pf_on_create(NST_AUDIO, audio_create);
@@ -2294,4 +2373,6 @@ void pf_audio_init() {
     pf_on_swi(0x40015, a_linkattachments);
     pf_on_swi(0x40016, a_monitorattachment);
     pf_on_swi(0x4001b, a_setaudioiteminfo);
+    pf_on_swi(0x4001c, a_pauseinstrument);
+    pf_on_swi(0x4001d, a_resumeinstrument);
 }

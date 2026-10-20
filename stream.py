@@ -2,9 +2,11 @@
 travels in.
 
 A stream is a run of fixed-size blocks (`streamBlockSize` from the header,
-64 or 128 KiB on the discs read; a stream with no header at all -- Escape
-from Monster Manor's four, a `CTRL` chunk first -- has them where its
-first block's `FILL` ends). A chunk never straddles a block boundary:
+32, 64 or 128 KiB on the discs read; a stream with no header at all --
+Escape from Monster Manor's four, a `CTRL` chunk first -- has them where
+its first block's `FILL` ends, and so does one whose first block is all
+`FILL`, its first `CTRL` the second block's -- 54 of The Need for Speed's
+films). A chunk never straddles a block boundary:
 slack at the end of a block is a `FILL` chunk, and when fewer than eight
 bytes remain the writer leaves a bare four-byte `FILL` tag with no size
 behind it -- the detail that derails a naive walk.
@@ -84,8 +86,10 @@ HEADERLESS = (b'CTRL', b'FILM', b'SNDS')
 def is_stream(path):
     """Does a file open like a DataStream: its header, or a marker table
     in front of it (a container of several streams) -- or, a stream with no
-    header (Escape from Monster Manor's), a CTRL, FILM or SNDS chunk whose
-    first block a FILL chunk fills to a power-of-two boundary?"""
+    header, a CTRL, FILM or SNDS chunk whose first block a FILL chunk
+    fills to a power-of-two boundary (Escape from Monster Manor's), or a
+    first block all FILL with such a chunk after it (The Need for
+    Speed's)?"""
     with open(path, 'rb') as f:
         return opens_as_stream(f.read(0x40000))
 
@@ -94,7 +98,20 @@ def opens_as_stream(h):
     """is_stream on a file's first bytes (0x40000 of them are enough)."""
     if h[:4] == b'SHDR' or (h[:4] == b'DACQ' and h[16:20] == b'MTBL'):
         return True
-    return h[:4] in HEADERLESS and _first_fill_end(h[:0x40000]) is not None
+    return _headerless(h[:0x40000]) is not None
+
+
+def _headerless(d):
+    """The block size of a stream with no header, or None: its first chunk
+    CTRL, FILM or SNDS and its first block ended by a FILL at a power of
+    two; or its first block one FILL, a power of two long, and the next
+    block opened by CTRL, FILM or SNDS."""
+    end = _first_fill_end(d)
+    if end is None:
+        return None
+    if d[:4] in HEADERLESS or (d[:4] == FILL and d[end:end + 4] in HEADERLESS):
+        return end
+    return None
 
 
 def _first_fill_end(d):
@@ -117,9 +134,7 @@ def block_size(d, default=0x20000):
     FILL ends (the stream's first block boundary)."""
     if d[:4] == b'SHDR' and len(d) >= 0x1c:
         return struct.unpack_from('>I', d, 0x18)[0] or default
-    if d[:4] in HEADERLESS:
-        return _first_fill_end(d[:0x40000]) or default
-    return default
+    return _headerless(d[:0x40000]) or default
 
 
 def chunks(d, blocksize=None):

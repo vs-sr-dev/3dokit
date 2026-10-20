@@ -209,10 +209,10 @@ static void configure(int32_t msg, uint32_t m, int32_t reply_port, uint32_t data
         l->trigger[i] = pf_r32(data + CR_TRIGGERMASK + 4u * i);
         l->capture[i] = pf_r32(data + CR_CAPTUREMASK + 4u * i);
     }
-    // The broker stores a cr_QueueMax of 1 to 20 as a word over its byte fields (0x107c: `str` at
-    // +0x60), which leaves the queue at 0 and the focus bytes cleared: not followed here yet.
+    // A cr_QueueMax of 1 to 20 is the listener's queue (0x107c: `strleb` at +0x60; the 20.31 and
+    // 21.10 brokers the same, 0xfe4 and 0x1084); any other leaves it as it was.
     int32_t qmax = (int32_t)pf_r32(data + CR_QUEUEMAX);
-    if (qmax > 0 && qmax <= 20) not_yet("a configure with cr_QueueMax");
+    if (qmax > 0 && qmax <= 20) l->queue_max = (uint32_t)qmax;
     if (fresh && (l->category == LC_FOCUSLISTENER || l->category == LC_FOCUSUI)) {
         if (g_focus) g_focus->focus = false;
         to_head(l);

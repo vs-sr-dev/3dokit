@@ -180,6 +180,47 @@ void arm_swi(ArmCpu& c, uint32_t number, uint32_t site) {
     os_call(c, it == g_swis.end() ? nullptr : it->second, what, site, call);
 }
 
+// Code a program loads itself (The Need for Speed's `LaunchMe` reads `frontovl` into memory it
+// allocated): an AIF image entered at its header, which the program may have changed first
+// (Need for Speed's makes its fourth word, the BL to the entry, `mov pc, r7`, to come back once
+// the image has relocated itself). The image is the recompiled module whose read-only area past
+// the header it is (arm_identify_body), loaded there -- moved there, when it was loaded somewhere
+// else before: that memory was given back -- and its header is run word by word as it stands in
+// memory: a no-op, a BL to the module's own code (its self-relocation, its zero-init, its entry),
+// `mov pc, rN` leaving it, or the exit. False when no module's image is there.
+static bool enter_image(ArmCpu& c, uint32_t addr) {
+    if (addr & 3) return false;
+    const ArmModule* m = arm_identify_body(addr);
+    if (!m) return false;
+    if (!arm_load(m, addr) && *m->base != addr) {
+        arm_unload(m);
+        arm_load(m, addr);
+    }
+    if (g_pf_trace) pf_log("        (module %s entered at its AIF header, %08X)\n", m->name, addr);
+    for (uint32_t off = 0; off <= 0x10; off += 4) {
+        uint32_t w = pf_r32(addr + off);
+        if (w == 0xE1A00000u) continue;                 // mov r0, r0
+        if (w >> 24 == 0xEB) {
+            uint32_t disp = w & 0xFFFFFF;
+            uint32_t to = addr + off + 8 + 4 * (disp & 0x800000 ? disp - 0x1000000 : disp);
+            c.r[14] = addr + off + 4;
+            arm_call(c, to);
+            if (c.pc != addr + off + 4) arm_bad_return(c, addr + off + 4);
+            continue;
+        }
+        if ((w & 0xFFFFFFF0u) == 0xE1A0F000u && (w & 15) != 15) {   // mov pc, rN
+            c.pc = c.r[w & 15] & ~3u;
+            return true;
+        }
+        if (w == 0xEF000011u) {                         // swi 0x11, the exit
+            arm_swi(c, 0x11, addr + off);
+            return true;
+        }
+        break;
+    }
+    pf_stop(c, "an image entered at its AIF header: a header word that is no BL, no-op, return or exit: not yet");
+}
+
 void arm_call_unknown(ArmCpu& c, uint32_t addr) {
     if (addr - PF_TRAP_BASE < PF_TRAP_SIZE) {
         uint32_t off = addr - PF_TRAP_BASE;
@@ -195,6 +236,7 @@ void arm_call_unknown(ArmCpu& c, uint32_t addr) {
             return;
         }
     }
+    if (enter_image(c, addr)) return;
     arm_fault(c, addr, "a call to an address that is no function's entry and no OS trap");
 }
 

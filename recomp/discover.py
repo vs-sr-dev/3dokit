@@ -26,7 +26,10 @@ word as code or data while it finds the functions:
    make a function (the read-only data decodes as plenty of them).
 4. **Indirect transfers**: `mov lr, pc` followed by a write to `pc` is a
    call and returns to the word after it -- and so is `add lr, pc, #0` (or
-   any `add`/`sub lr, pc, #k` that gives lr the same word); a folio vector is
+   any `add`/`sub lr, pc, #k` that gives lr the same word), and `mov rN,
+   pc` with another register, the callee returning through it (The Need
+   for Speed's entry of an overlay at its AIF header, whose fourth word it
+   has made `mov pc, r7`); a folio vector is
    `ldr pc, [rB, #-slot]` (`portfolio`); a load of `pc` from the word the
    function stored `lr` in, both addresses computed from `pc`, is a return
    (hand-written code that parks its return address in a word of its own);
@@ -38,13 +41,20 @@ word as code or data while it finds the functions:
 5. **The compiler's switch**: `cmp rI, #n` ... `addls pc, pc, rI, lsl #2`,
    then `b default`, then n+1 cases, each a `b case` word except perhaps the
    last, whose code can follow the table: every case is a code address.
+   And hand-written code's jump into the code after it, `add pc, pc, rX`
+   (shifted or not), where the straight line before it makes rX from a
+   `mov rX, #k` or an `and rX, rY, #mask`, then constants or'd, added,
+   subtracted, and'd or eor'd in, under any condition (The Need for Speed's
+   arctangent picks its octant so, its decompressor its unrolled copy's
+   length): every value rX can take is a case (`computed`).
 6. **Data** is every word of the image that no function reaches. The image
    is searched whole, not to `aif.code_end`: hand-written routines can be
    linked past the compiler's read-only area. A descent that meets an `undefined` word is
    reported: code does not run into data.
 
 `Program` keeps funcs {entry: Function}, code (word addresses), switches
-{the addls: [targets]}, and the indirect transfers by kind.
+{the addls: [targets]}, computed jumps {the add: (rX, {value: target})},
+and the indirect transfers by kind.
 """
 import argparse
 import bisect
@@ -62,14 +72,14 @@ EXIT_SWI = 0x11
 
 class Function:
     __slots__ = ('entry', 'code', 'calls', 'tails', 'origin', 'name',
-                 'problems', 'switches', 'indirect', 'local_returns')
+                 'problems', 'switches', 'computed', 'indirect', 'local_returns')
 
     def __init__(self, entry, origin):
         self.entry, self.origin = entry, origin
         self.code = set()
         self.calls, self.tails = set(), set()
         self.name, self.problems = None, []
-        self.switches, self.indirect = {}, []
+        self.switches, self.computed, self.indirect = {}, {}, []
         self.local_returns = set()
 
     @property
@@ -176,9 +186,22 @@ class Program:
         Doctor Hauzer's 0x2ced4). A relocated word in a literal pool that reached code loads
         (`ldr rN, [pc, #k]`), naming the word just past a function's code, a word no function
         reaches, is such a function when its own descent is clean -- no data met, no word of
-        another function's -- and so is what it calls. The pool matters: a debugger's tables
-        linked into the read-write area (Escape from Monster Manor's Cinepak library, built
-        with them) name the words after functions' last returns too, and no code loads them."""
+        another function's -- and so is what it calls. So is one named by a relocated word that
+        such a pool word itself names: a pointer variable whose address the code loads, to call
+        through it (`ldr r2, =var; ldr pc, [r2]`: the C library's `return 0` stub as The Need
+        for Speed's hook at 0x4245c holds it), and that one may follow a routine nothing
+        reaches, when the word before it is an unconditional return. So, too, is a word of a
+        table of functions: a relocated word of the read-write data with a relocated word
+        beside it naming a function's entry (in the read-only area, a literal pool's words sit
+        side by side so) (the services The Need for Speed's `LaunchMe` hands its overlay,
+        0x3ebf4 on), wherever it lies -- after a literal pool too -- and so is code a pointer
+        names that opens as a function does: a push of lr (`LaunchMe`'s 0x2a4d8, after a
+        string, a callback its objects hold), or a wrapper, a few data-processing words and a `b`
+        to a function's entry (`frontovl`'s 0x5c14, after a string: the allocator it hands
+        DefineSampleHere). The pool and the table matter: a debugger's tables linked into the
+        read-write area (Escape from Monster Manor's Cinepak library, built with them) name the
+        words after functions' last returns too, and no code loads them nor any function sits
+        beside them."""
         while True:
             code = set()
             for f in self.funcs.values():
@@ -188,13 +211,22 @@ class Program:
                 i = self.at(a)
                 if i.kind == 'sdt' and i.l and i.rn == PC and i.offset[0] == 'imm':
                     pools.add(a + 8 + (i.offset[1] if i.u else -i.offset[1]))
+            pooled = self.relocs & pools
+            named = {self._word(p) for p in pooled if p + 4 <= len(self.d)}
+
+            def beside_a_function(r):
+                return any(q in self.relocs and q + 4 <= len(self.d) and self._word(q) in self.funcs
+                           for q in (r - 4, r + 4))
+            tabled = {r for r in self.relocs if r >= self.aif.ro and r + 4 <= len(self.d) and
+                      beside_a_function(r)}
             found = []
-            for r in sorted(self.relocs & pools):
+            for r in sorted(pooled | (self.relocs & named) | tabled):
                 if r + 4 > len(self.d):
                     continue
                 v = self._word(r)
-                if v & 3 or not self.start <= v < self.end or v in self.funcs or v in code \
-                        or v - 4 not in code:
+                if v & 3 or not self.start <= v < self.end or v in self.funcs or v in code:
+                    continue
+                if v - 4 not in code and r not in tabled and not self._thunk(v) and                         (r in pooled or not self._return_before(v)):
                     continue
                 g = Function(v, 'pointer')
                 self._descend(g)
@@ -211,6 +243,33 @@ class Program:
                 for t in sorted(f.calls):
                     if t not in self.funcs:
                         seed(t, 'call')
+
+    def _thunk(self, v):
+        """Does the code at `v` look like a function's entry: an unconditional push of lr
+        (`stmfd sp!, {..., lr}`, a prologue without `mov ip, sp`), or a wrapper -- at most eight
+        unconditional data-processing words that leave pc alone, then an unconditional `b` to a
+        function's entry (a tail call)?"""
+        i = self.at(v)
+        if i.kind == 'bdt' and not i.l and i.w and i.p and not i.u and i.rn == SP and i.cond == 14 \
+                and i.regs & (1 << LR) and not i.regs & (1 << PC):
+            return True
+        for a in range(v, v + 36, 4):
+            if not self._inside(a):
+                return False
+            i = self.at(a)
+            if i.kind == 'b':
+                return not i.link and i.cond == 14 and i.target in self.funcs
+            if i.kind != 'dp' or i.cond != 14 or i.writes_pc():
+                return False
+        return False
+
+    def _return_before(self, v):
+        """Is the word before `v` an unconditional return (`mov pc, lr`, `ldm ..., pc`,
+        `ldr pc, [sp], #4`)?"""
+        if v - 4 < self.start:
+            return False
+        i = self.at(v - 4)
+        return i.cond == 14 and i.writes_pc() and self._pc_write(i, v - 4) == 'return'
 
     def _inside(self, a):
         """In the code searched: the image's, or an AIF routine's extent."""
@@ -233,7 +292,7 @@ class Program:
     # -- the descent ------------------------------------------------------
     def _descend(self, f):
         f.code, f.calls, f.tails = set(), set(), set()
-        f.problems, f.switches, f.indirect = [], {}, []
+        f.problems, f.switches, f.computed, f.indirect = [], {}, {}, []
         f.local_returns = set()
         todo = [f.entry]
         while todo or self._unreached_returns(f, todo):
@@ -296,6 +355,12 @@ class Program:
                         todo.extend(targets)
                         todo.append(a + 4)
                         break
+                    if kind == 'jump' and always:
+                        cases = self._computed(f, a)
+                        if cases is not None:
+                            f.computed[a] = (i.op2[1], cases)
+                            todo.extend(sorted(cases.values()))
+                            break
                     if kind == 'call':
                         f.indirect.append((a, self._indirect_kind(i)))
                         taken.clear()
@@ -348,9 +413,9 @@ class Program:
         if f is not None and self._parked_lr(f, i, a):
             return 'return'                                  # ldr pc, [the word lr was stored in]
         prev = self.at(a - 4) if a - 4 >= self.start else None
-        if prev is not None and prev.kind == 'dp' and prev.op == 13 and \
-                prev.rd == LR and prev.op2 == ('reg', PC, 'lsl', 0):
-            return 'call'                                    # mov lr, pc first
+        if prev is not None and prev.kind == 'dp' and prev.op == 13 and not prev.s and \
+                prev.rd != PC and prev.op2 == ('reg', PC, 'lsl', 0):
+            return 'call'                                    # mov lr (or rN), pc first
         if prev is not None and prev.kind == 'dp' and prev.op in (2, 4) and prev.rd == LR and \
                 prev.rn == PC and prev.op2[0] == 'imm' and not prev.s and \
                 (a - 4 + 8 + (prev.op2[1] if prev.op == 4 else -prev.op2[1])) & 0xFFFFFFFF == a + 4:
@@ -428,6 +493,54 @@ class Program:
                 return None
         return None
 
+    def _computed(self, f, a):
+        """The cases of a computed jump at `a`, `add pc, pc, rX[, lsl #s]`: {value of rX:
+        target}, when the straight line before it, in f's code, makes rX from an
+        unconditional `mov rX, #k` or `and rX, rY, #mask` (any of the mask's bits), then
+        any number of `orr`, `add`, `sub`, `rsb`, `and` or `eor rX, rX, #k` -- under a
+        condition, either value --, nothing else writing rX; each target a + 8 + (value <<
+        s) word-aligned and inside the code. None otherwise."""
+        i = self.at(a)
+        if not (i.kind == 'dp' and i.op == 4 and i.rn == PC and not i.s and
+                i.op2[0] == 'reg' and i.op2[2] == 'lsl' and isinstance(i.op2[3], int)):
+            return None
+        x, shift = i.op2[1], i.op2[3]
+        if x in (PC, SP, LR):
+            return None
+        ops = {12: lambda v, k: v | k, 4: lambda v, k: v + k, 2: lambda v, k: v - k,
+               3: lambda v, k: k - v, 0: lambda v, k: v & k, 1: lambda v, k: v ^ k}
+        steps = []
+        for b in range(a - 4, max(self.start, a - 256) - 4, -4):
+            if b not in f.code:
+                return None
+            j = self.at(b)
+            if x not in j.writes():
+                continue
+            if j.kind != 'dp' or j.op2[0] != 'imm' or j.s:
+                return None
+            k = j.op2[1]
+            if j.cond == 14 and j.op == 13:                 # mov rX, #k
+                values = {k}
+            elif j.cond == 14 and j.op == 0 and j.rn != x and bin(k).count('1') <= 6:
+                bits = [1 << n for n in range(32) if k >> n & 1]
+                values = {sum(bt for n, bt in enumerate(bits) if m >> n & 1)
+                          for m in range(1 << len(bits))}   # and rX, rY, #mask
+            elif j.op in ops and j.rn == x:
+                steps.append((j.op, k, j.cond != 14))
+                continue
+            else:
+                return None
+            for op, k, cond in reversed(steps):
+                after = {ops[op](v, k) & 0xFFFFFFFF for v in values}
+                values = values | after if cond else after
+            if len(values) > 64:
+                return None
+            cases = {v: (a + 8 + (v << shift)) & 0xFFFFFFFF for v in sorted(values)}
+            if any(t & 3 or not self._inside(t) or t - a > 0x400 for t in cases.values()):
+                return None
+            return cases
+        return None
+
     # -- reading out -------------------------------------------------------
     def func_of(self, a):
         es = sorted(self.funcs)
@@ -460,6 +573,9 @@ class Program:
         out.append('functions nothing calls, tail-calls or points at: %d' % len(uncalled))
         sw = sum(len(f.switches) for f in fs)
         out.append('switches: %d' % sw)
+        cj = sum(len(f.computed) for f in fs)
+        if cj:
+            out.append('computed jumps: %d' % cj)
         ind = collections.Counter(k for f in fs for _, k in f.indirect)
         out.append('indirect transfers: %s' % ', '.join(
             '%s %d' % kv for kv in sorted(ind.items())))
