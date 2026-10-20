@@ -219,30 +219,78 @@ class Program:
                            for q in (r - 4, r + 4))
             tabled = {r for r in self.relocs if r >= self.aif.ro and r + 4 <= len(self.d) and
                       beside_a_function(r)}
-            found = []
+            found, regrow = [], set()
             for r in sorted(pooled | (self.relocs & named) | tabled):
                 if r + 4 > len(self.d):
                     continue
                 v = self._word(r)
-                if v & 3 or not self.start <= v < self.end or v in self.funcs or v in code:
+                if v & 3 or not self.start <= v < self.end or v in self.funcs:
+                    continue
+                if v in code:
+                    # code of another function that it reaches only by a branch -- a tail branch
+                    # to a routine a table or a pool names (Demolition Man's bytecode handlers:
+                    # 0xd514's `b 0x8f78`, the 0x2931c table's second entry). Its own function
+                    # when no word of that function runs into it and its descent is that
+                    # function's code from it; that function's branch is then a tail call.
+                    if (r in pooled or r in tabled) and self._splits(v):
+                        found.append(v)
+                        regrow.update(f.entry for f in self.funcs.values() if v in f.code)
                     continue
                 if v - 4 not in code and r not in tabled and not self._thunk(v) and                         (r in pooled or not self._return_before(v)):
                     continue
                 g = Function(v, 'pointer')
                 self._descend(g)
-                if not g.problems and not g.code & code:
+                if g.problems:
+                    continue
+                if not g.code & code:
                     found.append(v)
+                    continue
+                # A tail it shares with a function found before it: the code both branch to,
+                # which no word of that function runs into (Demolition Man's handlers 0x74ac and
+                # 0x74c8, each ending in `b 0x742c`). The tail is a function of its own, and the
+                # branches to it tail calls, when that leaves this one's descent clear.
+                tails = {t for t in self._branch_targets(g) if t in code and self._splits(t)}
+                if not tails:
+                    continue
+                shared = set()
+                for t in tails:
+                    h = Function(t, 'tail')
+                    self._descend(h)
+                    shared |= h.code
+                    self.funcs[t] = h
+                self._descend(g)
+                for t in tails:
+                    del self.funcs[t]
+                if not g.problems and not g.code & (code - shared):
+                    found.append(v)
+                    for t in tails:
+                        if t not in found:
+                            found.append(t)
+                        regrow.update(f.entry for f in self.funcs.values() if t in f.code)
             if not found:
                 return
             for v in found:
                 seed(v, 'pointer')
                 self.pointed.add(v)
+            for e in regrow:
+                self._descend(self.funcs[e])
             while todo:
                 f = self.funcs[todo.pop()]
                 self._descend(f)
                 for t in sorted(f.calls):
                     if t not in self.funcs:
                         seed(t, 'call')
+
+    def _splits(self, t):
+        """Is `t`, code of other functions and no function's entry, reached by them only by a
+        branch -- no word of any of them runs into it --, its own descent clean and inside each
+        of them? Then it can be a function of its own, their branches to it tail calls."""
+        owners = [f for f in self.funcs.values() if t in f.code]
+        if not owners or t in self.funcs:
+            return False
+        h = Function(t, 'tail')
+        self._descend(h)
+        return not h.problems and all(t - 4 not in f.code and h.code <= f.code for f in owners)
 
     def _thunk(self, v):
         """Does the code at `v` look like a function's entry: an unconditional push of lr

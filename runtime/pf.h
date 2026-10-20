@@ -173,6 +173,7 @@ void     pf_mem_task_gone(uint32_t task);       // a task with its own lists end
 void     pf_unload_image(uint32_t image);       // a program's image gone: its module unloaded (pf_file.cpp)
 // 0 when every page of [p, p + size) is writable by `task`, else the kernel's BADPTR
 int32_t  pf_task_can_write(uint32_t task, uint32_t p, int32_t size);
+bool     pf_mem_readable(uint32_t p, uint32_t size);           // the 21.10 kernel's IsMemReadable
 
 // A test of the allocator (pf_memtest.cpp): after the boot, `ops` random allocations, frees
 // and scavenges from `seed`, written to DIR as ops.txt with the guest memory before and
@@ -311,6 +312,17 @@ bool     pf_pad_record_open(const char* path);
 void     pf_pad_record_close();
 // A button's name as --pad takes it (up down left right a b c start x l r), "" for none.
 const char* pf_pad_button_name(uint32_t bit);
+// A light gun (a Gamegun) on the port after the pad, when attached: its counter's timing (a line's
+// counts in tenths, the counts across 320 pixels, the counts before the first; Opera's 12707,
+// 1030, 12835 unless told; a line of 0 keeps it), its buttons (the trigger 0x80000000, the option button 0x08000000)
+// and where it points -- the pixel (x, y) of the 320-wide display, x < 0 off the picture --
+// scheduled (pf_gun_press: from field `first` for `hold` fields; a press attaches the gun) or from
+// the host (pf_gun_live, any thread; written to the record as --gun options).
+void     pf_gun_attach(int line_tenths, int width, int origin);
+bool     pf_gun_attached();
+void     pf_gun_press(uint32_t bits, uint64_t first, int hold, int x, int y);
+void     pf_gun_live(uint32_t bits, int x, int y);
+const char* pf_gun_button_name(uint32_t bit);       // trigger option
 
 // Files (pf_file.cpp). The disc is a directory on the host, `g_pf_disc_root` (pfboot: the
 // program's own directory unless --disc says otherwise); a program's path is walked there as the
@@ -401,6 +413,7 @@ void     pf_dsp_dma_stop(int32_t ins, uint32_t rsrc);
 void     pf_dsp_dma_waiting(int32_t ins, uint32_t rsrc, uint32_t addr, uint32_t bytes);
 void     pf_dsp_dma_arm(int32_t ins, uint32_t rsrc);
 void     pf_dsp_dma_quiet(int32_t ins, uint32_t rsrc);
+uint32_t pf_dsp_dma_address(int32_t ins, uint32_t rsrc, uint32_t silence);   // CLIO's current address
 void     pf_dsp_sync();                     // every frame up to the guest's present
 bool     pf_dsp_wav(const char* path);      // pfboot --wav
 // The folio's daemon, when an armed FIFO's chunk has run out (AUDIOFOLIO 0x5cc0).

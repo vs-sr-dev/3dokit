@@ -2207,6 +2207,22 @@ static void a_monitorattachment(ArmCpu& c) {
     at.cue_index = index;
 }
 
+// swi 0x4001e: int32 WhereAttachment(Item attachment) -- 21.10's 0x62a8: an attachment (else
+// AF_ERR_BADITEM); of a sample, CLIO's current address of its FIFO's channel (0x3300400 + 16 *
+// the channel, +0x40) less the sample's data (+0x34's +0x24) -- how far the DMA has read it, in
+// bytes; of an envelope, the point its block has reached (+0x50's +0x44). The folio's silence is
+// not laid out in memory here: while a FIFO plays it the address is taken as 0.
+static void a_whereattachment(ArmCpu& c) {
+    if (pf_system_version("/System/Folios/AUDIOFOLIO") != PF_VERSION(21, 10))
+        pf_stop(c, "WhereAttachment of an AUDIOFOLIO other than 21.10: not yet");
+    int32_t a = (int32_t)c.r[0];
+    if (!pf_check_item(a, NST_AUDIO, ATTACHMENT_NODE)) { c.r[0] = AF_ERR_BADITEM; return; }
+    pf_dsp_sync();
+    const Attachment& at = g_attachments[a];
+    if (at.env) { c.r[0] = (uint32_t)at.point; return; }
+    c.r[0] = pf_dsp_dma_address(at.ins, (uint32_t)at.rsrc, 0) - g_samples[at.sample].address;
+}
+
 // swi 0x4000d: Err SignalAtTime(Item cue, AudioTime time) -- 0x41d8: the folio open; a cue (else
 // AF_ERR_BADITEM) of the caller's (n_Owner, else AF_ERR_NOTOWNER); onto the timer list.
 static uint32_t signal_at_time(int32_t cue, uint32_t time) {
@@ -2372,6 +2388,7 @@ void pf_audio_init() {
     pf_on_swi(0x40014, a_stopattachment);
     pf_on_swi(0x40015, a_linkattachments);
     pf_on_swi(0x40016, a_monitorattachment);
+    pf_on_swi(0x4001e, a_whereattachment);
     pf_on_swi(0x4001b, a_setaudioiteminfo);
     pf_on_swi(0x4001c, a_pauseinstrument);
     pf_on_swi(0x4001d, a_resumeinstrument);

@@ -14,7 +14,9 @@
 //
 // Keys: the arrows; Z, X, C for A, B, C; Enter for P (start); Backspace for X (stop); Q and W for
 // L and R. A gamepad: the d-pad or the left stick; south, east, west for A, B, C; start for P;
-// back for X; the shoulders for L and R. Closing the window ends the run (no key does: a player
+// back for X; the shoulders for L and R. With a light gun on the port (--lightgun) the mouse is
+// the gun: it points where the pointer is over the picture (off it when the pointer is outside),
+// the left button the trigger, the right the option button. Closing the window ends the run (no key does: a player
 // reaching for Esc to pause would end it -- the game's pause is P).
 #include "pf.h"
 #include <SDL3/SDL.h>
@@ -178,6 +180,14 @@ int pf_window_run(const char* title, const char* record, const std::function<int
             }
         }
         pf_pad_live(keyboard_pad() | gamepad_pad(pad));
+        if (pf_gun_attached() && tex_lines) {
+            float mx, my, lx, ly;
+            SDL_MouseButtonFlags b = SDL_GetMouseState(&mx, &my);
+            SDL_RenderCoordinatesFromWindow(ren, mx, my, &lx, &ly);
+            bool on = SDL_GetMouseFocus() == win && lx >= 0 && lx < 320 && ly >= 0 && ly < tex_lines;
+            uint32_t bits = (b & SDL_BUTTON_LMASK ? 0x80000000u : 0) | (b & SDL_BUTTON_RMASK ? 0x08000000u : 0);
+            pf_gun_live(bits, on ? (int)lx : -1, on ? (int)ly : -1);
+        }
         int lines = 0;
         {
             std::lock_guard<std::mutex> l(g_lock);

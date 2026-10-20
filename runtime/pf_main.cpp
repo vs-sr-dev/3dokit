@@ -5,6 +5,7 @@
 //                    [--nvram-blank] [--cmdline LINE]
 //                    [--frames DIR [--frames-at FIRST[-LAST][/EVERY]]] [--pad BUTTONS@FIELD[xN][/E][+H]]...
 //                    [--window [--record FILE]] [--wav FILE] [--dsp-code] [--dsp-check]
+//                    [--lightgun] [--lightgun-timing L,W,O] [--gun BUTTONS@FIELD[+H][:X,Y]]...
 //
 // PROGRAM is the AIF file the build was recompiled from (its module must be
 // in this build). --trace 0 is quiet, 1 (the default) every OS call, 2 also
@@ -31,7 +32,17 @@
 // 7600 to 8199). --pad may be given more than once (pf_event.cpp). --window
 // (a pfboot built with SDL3) shows the display in a window, in real time, with
 // the keyboard and a gamepad as the pad as well (pf_window.cpp); --record FILE
-// writes the presses made there as --pad options that replay them. The
+// writes the presses made there as --pad options that replay them.
+// --lightgun puts a light gun (a Gamegun) on the Control Port after the pad
+// (pf_event.cpp); in the window the mouse is the gun -- the pointer aims, the
+// left button is the trigger, the right the option button -- and --record
+// writes its presses as --gun options. --gun BUTTONS@FIELD[+H][:X,Y] presses
+// the gun's BUTTONS (trigger, option, joined by +) at field FIELD for H
+// fields (6 by default), pointed at the display's pixel (X, Y), or off the
+// picture without one (it attaches the gun too). --lightgun-timing L,W,O sets
+// the gun's counter: L a line's counts in tenths, W the counts across 320
+// pixels, O the counts before the picture's first pixel (Opera's 12707,1030,
+// 12835 by default). The
 // window plays the sound too; --wav FILE writes it (44,100 Hz, 16-bit
 // stereo), in the guest's time: the same for every run of the same pad.
 // The DSP's instruments play by their native models where one was written,
@@ -64,6 +75,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <fstream>
+#include <string>
 #include <functional>
 #include <vector>
 
@@ -103,6 +115,38 @@ static bool pad_option(const char* spec) {
     if (count < 0) count = 4;
     if (*p || !bits || count < 1 || hold < 1 || (count > 1 && every <= hold)) return false;
     pf_pad_press(bits, first, (int)count, (int)every, (int)hold);
+    return true;
+}
+
+// --gun BUTTONS@FIELD[+H][:X,Y]: the light gun's buttons (trigger, option, joined by +) down from
+// field FIELD for H fields (6 by default), the gun pointed at the display's pixel (X, Y), or off
+// the picture without one.
+static bool gun_option(const char* spec) {
+    std::string s = spec;
+    size_t at = s.find('@');
+    if (at == std::string::npos) return false;
+    uint32_t bits = 0;
+    for (size_t b = 0; b < at;) {
+        size_t e = s.find('+', b);
+        if (e == std::string::npos || e > at) e = at;
+        std::string name = s.substr(b, e - b);
+        if (name == pf_gun_button_name(0x80000000u)) bits |= 0x80000000u;
+        else if (name == pf_gun_button_name(0x08000000u)) bits |= 0x08000000u;
+        else return false;
+        b = e + 1;
+    }
+    char* p;
+    unsigned long long first = std::strtoull(s.c_str() + at + 1, &p, 10);
+    long hold = 6, x = -1, y = -1;
+    if (*p == '+') hold = std::strtol(p + 1, &p, 10);
+    if (*p == ':') {
+        x = std::strtol(p + 1, &p, 10);
+        if (*p != ',') return false;
+        y = std::strtol(p + 1, &p, 10);
+        if (x < 0 || y < 0) return false;
+    }
+    if (*p || !bits || hold < 1) return false;
+    pf_gun_press(bits, first, (int)hold, (int)x, (int)y);
     return true;
 }
 
@@ -163,6 +207,7 @@ int main(int argc, char** argv) {
         std::fprintf(stderr, "usage: pfboot PROGRAM [--trace N] [--lenient] [--max-calls N] [--snap N DIR] [--disc DIR]\n"
                              "                      [--frames DIR [--frames-at FIRST[-LAST][/EVERY]]]\n"
                              "                      [--pad BUTTONS@FIELD[xN][/E][+H]]... [--window [--record FILE]] [--wav FILE]\n"
+                             "                      [--lightgun] [--lightgun-timing L,W,O] [--gun BUTTONS@FIELD[+H][:X,Y]]...\n"
                              "       pfboot PROGRAM --memtest DIR [--ops N] [--seed S]\n"
                              "       pfboot DISC --boot [the options above]\n"
                              "       pfboot FILE --unpack OUT\n");
@@ -196,6 +241,21 @@ int main(int argc, char** argv) {
         else if (!std::strcmp(argv[i], "--pad") && i + 1 < argc) {
             if (!pad_option(argv[++i])) {
                 std::fprintf(stderr, "--pad %s: BUTTONS@FIELD[xN][/E][+H], BUTTONS of up down left right a b c start x l r\n", argv[i]);
+                return 2;
+            }
+        }
+        else if (!std::strcmp(argv[i], "--lightgun")) pf_gun_attach(0, 0, 0);
+        else if (!std::strcmp(argv[i], "--lightgun-timing") && i + 1 < argc) {
+            int l, w, o;
+            if (std::sscanf(argv[++i], "%d,%d,%d", &l, &w, &o) != 3 || l <= 0 || w <= 0) {
+                std::fprintf(stderr, "--lightgun-timing %s: LINE,WIDTH,ORIGIN (Opera's 12707,1030,12835)\n", argv[i]);
+                return 2;
+            }
+            pf_gun_attach(l, w, o);
+        }
+        else if (!std::strcmp(argv[i], "--gun") && i + 1 < argc) {
+            if (!gun_option(argv[++i])) {
+                std::fprintf(stderr, "--gun %s: BUTTONS@FIELD[+H][:X,Y], BUTTONS of trigger option\n", argv[i]);
                 return 2;
             }
         }

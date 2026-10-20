@@ -9,6 +9,8 @@
 // position 1, the first pad of its kind), whose buttons pf_pad_press schedules and pf_pad_live
 // adds from the host (pfboot's window), read once a field at the vertical blank. So what is modelled
 // is the broker above its driverlets: its port, its listeners, the focus, the event records.
+// When pfboot attaches one, a light gun follows the pad on the port, its events as the disc's own
+// driverlet for it makes them (below, "the light gun").
 //
 // * Its port, "eventbroker" (0x650); the broker task runs at priority 199 (0x5e8), above any
 //   program, so it answers a message as soon as it is sent, and reports a field's events as soon
@@ -43,6 +45,7 @@
 #include <cstdlib>
 #include <map>
 #include <mutex>
+#include <string>
 #include <vector>
 
 enum : uint32_t {
@@ -83,6 +86,9 @@ static std::vector<Listener*> g_listeners;          // the broker's list, head f
 static Listener* g_focus;
 static std::vector<int32_t> g_free;                 // messages back, head first
 static std::map<int32_t, Listener*> g_pending;      // messages out, and to whom
+
+// The light gun's buttons and where it points (below).
+struct GunState { uint32_t bits = 0; int x = -1, y = -1; };     // x < 0: off the picture
 
 // The pad: what pf_pad_press scheduled, and its buttons at the last field.
 struct Press { uint32_t bits; uint64_t first; int count, every, hold; };
@@ -137,8 +143,10 @@ static void record(uint32_t now, uint32_t field, bool all_up) {
     g_record_was = all_up ? 0 : now;
 }
 
+static void gun_record(const GunState& now, uint32_t field, bool end);
 void pf_pad_record_close() {
     record(0, 0, true);
+    gun_record(GunState{}, 0, true);
     std::lock_guard<std::mutex> l(g_record_lock);
     if (g_record) std::fclose(g_record);
     g_record = nullptr;
@@ -154,6 +162,119 @@ static uint32_t pad_at(uint64_t field) {
             if (field >= at && field < at + (uint64_t)p.hold) bits |= p.bits;
         }
     return bits;
+}
+
+// ---- the light gun ------------------------------------------------------------------------------
+// A Gamegun (the American Laser Games light gun, Control Port id 0x4D), when pfboot attaches one
+// (--lightgun): on the port after the pad, as a pad's daisy chain carries it -- pod 2, position 2,
+// the first light gun. What it reports is what the disc's driverlet for it, System/Drivers/
+// CPORT4D.ROM (an AIF behind a 32-byte header, as 21.10's broker loads it), makes of its five
+// bytes on the port: the id; the trigger (bit 7), the option button (bit 3) and the counter's bit
+// 19; the counter's bits 18-11; 10-3; 2-0 above the count of lines the gun saw the beam on (5
+// bits). The driverlet (0x230) keeps the buttons as bits 31-27 of a word (the trigger 0x80000000,
+// the option button 0x08000000), the counter's 20 bits and the line count: the LightGunEventData
+// of each frame (0x150), after the pod's number, position and generic number (0x134).
+//
+// The counter is the time from the field's start to the beam passing where the gun points. The
+// runtime counts it as Opera does (opera_pbus.c) unless told otherwise: ((y * L + x * W * 10 /
+// 320) / 10 + O) & 0xFFFFF for the pixel (x, y) of the 320-wide display -- L a line's counts in
+// tenths (12707), W the counts across 320 pixels (1030), O the counts before the first (12835);
+// --lightgun-timing L,W,O sets them. No console has been measured: a game's own calibration (its
+// gun pointed at a mark and a button pressed) takes the difference up, as on the console. Aimed
+// off the picture the gun sees no beam: the counter 0 and no lines, as Opera's reload. Aimed on
+// it, it sees 31 lines, Opera's count, whatever the picture's brightness there.
+enum : uint32_t {
+    GUN_TRIGGER = 0x80000000u, GUN_OPTION = 0x08000000u,
+    GUN_POD = 2, GUN_POSITION = 2, GUN_GENERIC = 1,
+    EVENTNUM_LIGHTGUNBUTTONPRESSED = 21, EVENTNUM_LIGHTGUNBUTTONRELEASED = 22,
+    EVENTNUM_LIGHTGUNUPDATE = 23, EVENTNUM_LIGHTGUNFIRETRACKING = 24, EVENTNUM_LIGHTGUNDATAARRIVED = 25,
+};
+struct GunPress { GunState s; uint64_t first; int hold; };
+static bool g_gun;
+static int g_gun_line = 12707, g_gun_width = 1030, g_gun_origin = 12835;
+static std::vector<GunPress> g_gun_presses;
+static GunState g_gun_was;
+static std::mutex g_gun_lock;
+static GunState g_gun_live;
+
+void pf_gun_attach(int line_tenths, int width, int origin) {
+    g_gun = true;
+    if (line_tenths <= 0) return;                       // the timing as it is
+    g_gun_line = line_tenths;
+    g_gun_width = width;
+    g_gun_origin = origin;
+}
+bool pf_gun_attached() { return g_gun; }
+void pf_gun_press(uint32_t bits, uint64_t first, int hold, int x, int y) {
+    g_gun = true;
+    g_gun_presses.push_back({{bits, x, y}, first, hold});
+}
+const char* pf_gun_button_name(uint32_t bit) {
+    return bit == GUN_TRIGGER ? "trigger" : bit == GUN_OPTION ? "option" : "";
+}
+
+// The gun from the host: its buttons and where it points (x < 0 off the picture). With a record
+// open, each field the trigger or the option button is down, a change of either or of the aim
+// ends the press written so far: --gun BUTTONS@FIELD+HELD[:X,Y], so that the replay points the
+// gun where the player did each field the game reads it.
+struct GunRecord { GunState s; uint32_t since = 0, field = 0; bool open = false; };
+static GunRecord g_gun_rec;
+void pf_gun_live(uint32_t bits, int x, int y) {
+    std::lock_guard<std::mutex> l(g_gun_lock);
+    g_gun_live = {bits, x, y};
+}
+
+static void gun_record_write(const GunRecord& r) {
+    std::string b;
+    for (uint32_t bit : {GUN_TRIGGER, GUN_OPTION})
+        if (r.s.bits & bit) b += std::string(b.empty() ? "" : "+") + pf_gun_button_name(bit);
+    if (r.s.x >= 0)
+        std::fprintf(g_record, "--gun %s@%u+%u:%d,%d\n", b.c_str(), r.since, r.field - r.since, r.s.x, r.s.y);
+    else
+        std::fprintf(g_record, "--gun %s@%u+%u\n", b.c_str(), r.since, r.field - r.since);
+    std::fflush(g_record);
+}
+
+static void gun_record(const GunState& now, uint32_t field, bool end) {
+    std::lock_guard<std::mutex> l(g_record_lock);
+    if (!g_record) return;
+    GunRecord& r = g_gun_rec;
+    bool same = r.open && now.bits == r.s.bits && now.x == r.s.x && now.y == r.s.y;
+    if (r.open && (end || !same)) {
+        if (!end) r.field = field;
+        if (r.field > r.since) gun_record_write(r);
+        r.open = false;
+    }
+    if (!end && now.bits && !r.open) r = {now, field, field, true};
+    if (r.open) r.field = field + 1;
+}
+
+static GunState gun_at(uint64_t field) {
+    GunState s;
+    {
+        std::lock_guard<std::mutex> l(g_gun_lock);
+        s = g_gun_live;
+    }
+    gun_record(s, (uint32_t)field, false);
+    for (const GunPress& p : g_gun_presses)
+        if (field >= p.first && field < p.first + (uint64_t)p.hold) {
+            s.bits |= p.s.bits;
+            s.x = p.s.x;
+            s.y = p.s.y;
+        }
+    return s;
+}
+
+// The counter and the line count the gun sends for where it points.
+static void gun_aim(const GunState& s, uint32_t& counter, uint32_t& lines) {
+    if (s.x < 0 || s.y < 0) {
+        counter = lines = 0;
+        return;
+    }
+    int x = s.x > 319 ? 319 : s.x, y = s.y;
+    int32_t c = (y * g_gun_line + x * g_gun_width * 10 / 320) / 10 + g_gun_origin;
+    counter = (uint32_t)c & 0xFFFFFu;
+    lines = 31;
 }
 
 [[noreturn]] static void not_yet(const char* what) {
@@ -273,6 +394,17 @@ struct Record {
         w[at + EF_EVENTNUMBER / 4] = event << 24 | (pad ? PAD_POD << 16 | PAD_POSITION << 8 | PAD_GENERIC : 0);
         if (pad) w[at + EF_EVENTDATA / 4] = bits;
     }
+    // the light gun's (CPORT4D's 0x150): its LightGunEventData, 12 bytes
+    void gun_frame(uint32_t event, uint32_t bits, uint32_t counter, uint32_t lines) {
+        size_t at = w.size();
+        w.resize(at + (EF_HEADER + 12) / 4, 0);
+        w[at + EF_BYTECOUNT / 4] = EF_HEADER + 12;
+        w[at + EF_SYSTEMTIMESTAMP / 4] = field;
+        w[at + EF_EVENTNUMBER / 4] = event << 24 | GUN_POD << 16 | GUN_POSITION << 8 | GUN_GENERIC;
+        w[at + EF_EVENTDATA / 4] = bits;
+        w[at + EF_EVENTDATA / 4 + 1] = counter;
+        w[at + EF_EVENTDATA / 4 + 2] = lines;
+    }
 };
 
 static void broker_vbl(uint64_t) {
@@ -282,6 +414,20 @@ static void broker_vbl(uint64_t) {
     uint32_t down = now & ~was, up = was & ~now;
     // the pad's events this field (0x2c1c), in word 0 of the masks
     uint32_t ready = down ? (up ? 0xF0000000u : 0xB0000000u) : (up ? 0x70000000u : 0x10000000u);
+    // the light gun's (CPORT4D's 0x230), in the same word: Pressed, Released and Update when its
+    // buttons changed, FireTracking while the trigger is down or has just come up, DataArrived
+    // always
+    GunState gun, gun_was = g_gun_was;
+    uint32_t gdown = 0, gup = 0, counter = 0, lines = 0;
+    if (g_gun) {
+        gun = gun_at(field);
+        g_gun_was = gun;
+        gdown = gun.bits & ~gun_was.bits;
+        gup = gun_was.bits & ~gun.bits;
+        gun_aim(gun, counter, lines);
+        ready |= gdown ? (gup ? 0xE80u : 0xA80u) : (gup ? 0x680u : 0x80u);
+        if ((gun.bits | gun_was.bits) & GUN_TRIGGER) ready |= 0x100u;
+    }
     std::vector<Listener*> all = g_listeners;
     for (Listener* l : all) {
         // 0x160c, first: the listener's port still a MsgPort (CheckItem), else it goes
@@ -308,6 +454,13 @@ static void broker_vbl(uint64_t) {
         if (want & 0x40000000u) r.frame(EVENTNUM_CONTROLBUTTONRELEASED, true, up);
         if (l->overflow || (want & 0x20000000u)) r.frame(EVENTNUM_CONTROLBUTTONUPDATE, true, now);
         if (want & 0x10000000u) r.frame(EVENTNUM_CONTROLBUTTONARRIVED, true, now);
+        if (g_gun) {
+            if (want & 0x800u) r.gun_frame(EVENTNUM_LIGHTGUNBUTTONPRESSED, gdown, counter, lines);
+            if (want & 0x400u) r.gun_frame(EVENTNUM_LIGHTGUNBUTTONRELEASED, gup, counter, lines);
+            if (l->overflow || (want & 0x200u)) r.gun_frame(EVENTNUM_LIGHTGUNUPDATE, gun.bits, counter, lines);
+            if (want & 0x100u) r.gun_frame(EVENTNUM_LIGHTGUNFIRETRACKING, gun.bits, counter, lines);
+            if (want & 0x80u) r.gun_frame(EVENTNUM_LIGHTGUNDATAARRIVED, gun.bits, counter, lines);
+        }
         r.w.push_back(0);                                   // the empty frame
         if (r.w.size() <= 2) continue;                      // nothing to report
         if (l->in_transit >= l->queue_max) {
@@ -328,7 +481,10 @@ static void broker_vbl(uint64_t) {
         g_pending[msg] = l;
         l->overflow = false;
         ++l->in_transit;
-        if (g_pf_trace)
+        if (g_pf_trace && g_gun)
+            pf_log("        event broker: field %u, pad %08x, gun %08x at %d,%d (%05x, %u): %u bytes to port %d\n", field,
+                   now, gun.bits, gun.x, gun.y, counter, lines, size, l->port);
+        else if (g_pf_trace)
             pf_log("        event broker: field %u, pad %08x: %u bytes to port %d\n", field, now, size, l->port);
     }
 }
@@ -340,6 +496,7 @@ void pf_event_init() {
     g_free.clear();
     g_pending.clear();
     g_pad = 0;
+    g_gun_was = GunState{};
     g_port = pf_msgport_new("eventbroker", on_msg);
     pf_on_vbl(broker_vbl);
 }

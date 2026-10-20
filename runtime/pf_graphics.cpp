@@ -40,7 +40,7 @@ static uint32_t node_size(uint32_t type) {
 enum : uint32_t {
     GRAFERR_BADITEM = 0xD55B9001u, GRAFERR_BADTAG = 0xD55B9002u, GRAFERR_BADTAGVAL = 0xD55B9003u,
     GRAFERR_NOMEM = 0xD55B9006u, GRAFERR_BADVDLTYPE = 0xD55B9116u, GRAFERR_INDEXRANGE = 0xD55B9117u,
-    GRAFERR_BUFWIDTH = 0xD55B9118u, GRAFERR_VDLWIDTH = 0xD55B911Au, GRAFERR_NOTYET = 0xD55B911Bu,
+    GRAFERR_BUFWIDTH = 0xD55B9118u, GRAFERR_COORDRANGE = 0xD55B9119u, GRAFERR_VDLWIDTH = 0xD55B911Au, GRAFERR_NOTYET = 0xD55B911Bu,
     GRAFERR_MIXEDSCREENS = 0xD55B911Cu, GRAFERR_VDL_FLAGS = 0xD55B9121u,
     GRAFERR_BADDISPDIMS = 0xD55B9123u, GRAFERR_BADBITMAPSPEC = 0xD55B9124u,
     GRAFERR_INTERNALERROR = 0xD55B9125u, GRAFERR_SGINUSE = 0xD55B9126u, GRAFERR_SGNOTINUSE = 0xD55B9127u,
@@ -1055,6 +1055,116 @@ static void set_clip_size(ArmCpu& c, bool height) {
 static void g_setclipwidth(ArmCpu& c) { set_clip_size(c, false); }
 static void g_setclipheight(ArmCpu& c) { set_clip_size(c, true); }
 
+// The cel engine's read address: where DrawCels reads the frame buffer from, for the cels whose
+// pixels combine with what is there already (REGCTL2, and the read width in REGCTL0's low byte).
+// Each takes the bitmap as SetClipOrigin does: CheckItem, else GRAFERR_BADITEM; the caller's or
+// open, else GRAFERR_NOTOWNER (the folio also prints "Task %lx does not own item %lx", 0x13d4).
+static uint32_t read_address_bitmap(ArmCpu& c) {
+    if (pf_system_version("/System/Folios/GRAPHIX") < PF_VERSION(20, 45))
+        pf_stop(c, "the read address before GRAPHIX 20.45: not yet");
+    uint32_t bm = pf_check_item((int32_t)c.r[0], NST_GRAPHICS, TYPE_BITMAP);
+    if (!bm) { c.r[0] = GRAFERR_BADITEM; return 0; }
+    if (pf_r32(bm + 28) != task_item() && pf_item_opened((int32_t)task_item(), (int32_t)c.r[0]) < 0) {
+        c.r[0] = GRAFERR_NOTOWNER;
+        return 0;
+    }
+    return bm;
+}
+
+// Graphics -52: Err SetReadAddress(Item bitmap, ubyte* buffer, int32 width) -- 20.45's 0x2af8:
+// a width the cel engine has (the table at 0x86a4, exactly), else GRAFERR_BUFWIDTH; the buffer
+// readable over ((bm_ClipHeight + 1) / 2 - 1) * width + bm_ClipWidth words -- the clip's line
+// pairs at that width -- (the kernel's IsMemReadable), else BADPTR; then the width's byte into
+// REGCTL0's low byte (the read side; the high byte, the write side's, stays) and the buffer
+// into REGCTL2.
+static void g_setreadaddress(ArmCpu& c) {
+    uint32_t bm = read_address_bitmap(c);
+    if (!bm) return;
+    uint32_t buffer = c.r[1], width = c.r[2], r0 = regctl0(width);
+    if (!r0) { c.r[0] = GRAFERR_BUFWIDTH; return; }
+    int32_t pairs = ((int32_t)pf_r32(bm + BM_CLIPHEIGHT) + 1) >> 1;
+    uint32_t words = (uint32_t)((pairs - 1) * (int32_t)width + (int32_t)pf_r32(bm + BM_CLIPWIDTH));
+    if (!pf_mem_readable(buffer, words << 2)) { c.r[0] = 0xD55B9009u; return; }     // BADPTR
+    pf_w32(bm + BM_REGCTL0, (pf_r32(bm + BM_REGCTL0) & ~0xFFu) | (r0 & 0xFF));
+    pf_w32(bm + BM_REGCTL2, buffer);
+    c.r[0] = 0;
+}
+
+// Graphics -56: Err ResetReadAddress(Item bitmap) -- 20.45's 0x2a50: the read side back to the
+// write side's: REGCTL0's low byte its high byte, REGCTL2 the write address (REGCTL3).
+static void g_resetreadaddress(ArmCpu& c) {
+    uint32_t bm = read_address_bitmap(c);
+    if (!bm) return;
+    uint32_t r0 = pf_r32(bm + BM_REGCTL0) & 0xFF00;
+    pf_w32(bm + BM_REGCTL0, r0 | r0 >> 8);
+    pf_w32(bm + BM_REGCTL2, pf_r32(bm + BM_REGCTL3));
+    c.r[0] = 0;
+}
+
+// ---- pixels ----------------------------------------------------------------------------------
+// A pixel's address in a bitmap's buffer of line pairs: row pair y / 2 at bm_Width words a row
+// pair, the pixel's word x, its half y & 1. x and y must lie inside the clip's size (from 0, not
+// from the clip's origin) -- the user functions of 20.45 below.
+static bool pixel_at(uint32_t bm, int32_t x, int32_t y, uint32_t& at) {
+    if (x < 0 || x >= (int32_t)pf_r32(bm + BM_CLIPWIDTH) || y < 0 || y >= (int32_t)pf_r32(bm + BM_CLIPHEIGHT))
+        return false;
+    at = pf_r32(bm + BM_BUFFER) + (uint32_t)((y >> 1) * (int32_t)pf_r32(bm + BM_WIDTH)) * 4 + (uint32_t)(y & 1) * 2 +
+         (uint32_t)x * 4;
+    return true;
+}
+
+static void need_2045(ArmCpu& c, const char* what) {
+    if (pf_system_version("/System/Folios/GRAPHIX") < PF_VERSION(20, 45)) pf_stop(c, what);
+}
+
+// Graphics -16: void* GetPixelAddress(Item screen, Coord x, Coord y) -- 20.45's 0x1a28: a screen
+// (CheckItem; a bitmap will not do), its bitmap (scr_TempBitmap), the address of (x, y) in it;
+// NULL for no screen or a pixel outside.
+static void g_getpixeladdress(ArmCpu& c) {
+    need_2045(c, "GetPixelAddress before GRAPHIX 20.45: not yet");
+    uint32_t scr = pf_check_item((int32_t)c.r[0], NST_GRAPHICS, TYPE_SCREEN), at = 0;
+    if (!scr || !pixel_at(pf_r32(scr + SCR_TEMPBITMAP), (int32_t)c.r[1], (int32_t)c.r[2], at)) at = 0;
+    c.r[0] = at;
+}
+
+// Graphics -8: Color ReadPixel(Item bitmap, GrafCon* gc, Coord x, Coord y) -- 20.45's 0x2cf8: a
+// bitmap (CheckItem, else GRAFERR_BADITEM; whoever owns it); outside the clip GRAFERR_COORDRANGE;
+// else the pixel's 16 bits.
+static void g_readpixel(ArmCpu& c) {
+    need_2045(c, "ReadPixel before GRAPHIX 20.45: not yet");
+    uint32_t bm = pf_check_item((int32_t)c.r[0], NST_GRAPHICS, TYPE_BITMAP), at;
+    if (!bm) { c.r[0] = GRAFERR_BADITEM; return; }
+    if (!pixel_at(bm, (int32_t)c.r[2], (int32_t)c.r[3], at)) { c.r[0] = GRAFERR_COORDRANGE; return; }
+    c.r[0] = pf_r8(at) << 8 | pf_r8(at + 1);
+}
+
+// Graphics -20: Err WritePixel(Item bitmap, GrafCon* gc, Coord x, Coord y) -- 20.45's 0x2c08: the
+// bitmap as SetClipOrigin takes it (GRAFERR_BADITEM, GRAFERR_NOTOWNER); outside the clip
+// GRAFERR_COORDRANGE; else the pen moved there (gc_PenX +0x1c, gc_PenY +0x20) and the foreground
+// pen's low 16 bits (gc_FGPen +0x14) written to the pixel.
+static void g_writepixel(ArmCpu& c) {
+    need_2045(c, "WritePixel before GRAPHIX 20.45: not yet");
+    uint32_t bm = pf_check_item((int32_t)c.r[0], NST_GRAPHICS, TYPE_BITMAP), at, gc = c.r[1];
+    if (!bm) { c.r[0] = GRAFERR_BADITEM; return; }
+    if (pf_r32(bm + 28) != task_item() && pf_item_opened((int32_t)task_item(), (int32_t)c.r[0]) < 0) {
+        c.r[0] = GRAFERR_NOTOWNER;
+        return;
+    }
+    if (!pixel_at(bm, (int32_t)c.r[2], (int32_t)c.r[3], at)) { c.r[0] = GRAFERR_COORDRANGE; return; }
+    pf_w32(gc + 0x20, c.r[3]);
+    pf_w32(gc + 0x1c, c.r[2]);
+    uint32_t pen = pf_r32(gc + 0x14);
+    pf_w8(at, pen >> 8 & 0xFF);
+    pf_w8(at + 1, pen & 0xFF);
+    c.r[0] = 0;
+}
+
+// Graphics -12: RGB888 ReadCLUTColor(uint32 index) -- 20.45's 0x29e8 is `return 0`.
+static void g_readclutcolor(ArmCpu& c) {
+    need_2045(c, "ReadCLUTColor before GRAPHIX 20.45: not yet");
+    c.r[0] = 0;
+}
+
 // GRAPHIX's division (0x424, Norcroft's __rt_sdiv unrolled): n / d truncated toward zero, the
 // quotient's bits 30 to 0 found by restoring subtraction on the magnitudes -- so d = 0 gives
 // 0x7FFFFFFF with the sign of n, and nothing stops.
@@ -1120,7 +1230,13 @@ static void g_querygraphics(ArmCpu& c) {
 static void graphics_slots() {
     pf_on_slot(PF_GRAPHICS, -192, g_querygraphics);
     pf_on_slot(PF_GRAPHICS, -4, g_mapcel);
+    pf_on_slot(PF_GRAPHICS, -8, g_readpixel);
+    pf_on_slot(PF_GRAPHICS, -12, g_readclutcolor);
+    pf_on_slot(PF_GRAPHICS, -16, g_getpixeladdress);
+    pf_on_slot(PF_GRAPHICS, -20, g_writepixel);
     pf_on_slot(PF_GRAPHICS, -48, g_createscreengroup);
+    pf_on_slot(PF_GRAPHICS, -52, g_setreadaddress);
+    pf_on_slot(PF_GRAPHICS, -56, g_resetreadaddress);
     pf_on_slot(PF_GRAPHICS, -60, g_setcliporigin);
     pf_on_slot(PF_GRAPHICS, -112, g_setclipwidth);
     pf_on_slot(PF_GRAPHICS, -116, g_setclipheight);

@@ -102,6 +102,18 @@ int32_t pf_task_can_write(uint32_t task, uint32_t p, int32_t size) {
     return 0;
 }
 
+// IsMemReadable(p, size) of the 21.10 kernel (0x12070, the 47th of its table at 0x1c8e0, which
+// GRAPHIX 20.45 calls): true for a size of 0; else true when neither the size nor p + size passes
+// the top of memory -- VRAM's MemHdr's memh_MemTop, which the kernel keeps at +0x160 of its own
+// data (0x11e50) --, compared unsigned. Nothing about who owns the memory.
+bool pf_mem_readable(uint32_t p, uint32_t size) {
+    if (!size) return true;
+    uint32_t top = 0, l = kb(KB_MEMHDRLIST);
+    FOR_NODES(mh, l)
+        if (pf_r32(mh + MH_TYPES) & MEMTYPE_VRAM) top = pf_r32(mh + MH_MEMTOP);
+    return size <= top && p + size <= top;
+}
+
 // The unit an allocation is aligned to: the MemHdr's page, or for VRAM its VRAM page unless
 // MEMTYPE_SYSTEMPAGESIZE asks for the other.
 static uint32_t align_unit(uint32_t mh, uint32_t flags) {

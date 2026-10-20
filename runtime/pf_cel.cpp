@@ -112,7 +112,8 @@ struct Cel {
 // 3-bit multipliers (AMV, red 6-8, green 3-5, blue 0-2; 0x49 -- all 1 -- when the pixel has none).
 // Coded pixels look up the PLUT: 1, 2 and 4 bits take the missing high index bits from the CCB's
 // PLUTA; 6 bits the low five, bit 5 becoming bit 15; 8 bits the low five, the top three an AMV for
-// all three; 16 bits the low five, bits 5-13 the AMVs, bit 15 kept. Uncoded 16 bits are the colour.
+// all three; 16 bits the low five, bits 5-13 the AMVs, bit 15 kept. Uncoded 16 bits are the colour,
+// uncoded 8 bits RRRGGGBB widened.
 uint32_t decode(ArmCpu& c, const Cel& cel, uint32_t v, uint32_t& amv) {
     amv = 0x49;
     uint32_t pluta = cel.flags & 15;
@@ -122,7 +123,12 @@ uint32_t decode(ArmCpu& c, const Cel& cel, uint32_t v, uint32_t& amv) {
     case 4: return g_ce.plut[((pluta & 8) << 1 | v) & 31];
     case 6: return (g_ce.plut[v & 31] & 0x7FFFu) | (v >> 5 & 1) << 15;
     case 8:
-        if (!cel.coded) pf_stop(c, "the cel engine: an uncoded 8-bit cel: not yet");
+        if (!cel.coded) {
+            // RRRGGGBB, each component widened to five bits as MADAM does (cel.py's rule, Opera's):
+            // red and green r * 4 + r / 2, blue b * 10 + b / 2; no AMV, bit 15 clear
+            uint32_t r = v >> 5 & 7, g = v >> 2 & 7, b = v & 3;
+            return (r * 4 + r / 2) << 10 | (g * 4 + g / 2) << 5 | (b * 10 + b / 2);
+        }
         amv = (v >> 5) * 0x49;
         return g_ce.plut[v & 31];
     default:

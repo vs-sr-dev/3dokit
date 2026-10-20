@@ -1200,6 +1200,14 @@ void pf_dsp_dma_arm(int32_t ins, uint32_t rsrc) {
 void pf_dsp_dma_quiet(int32_t ins, uint32_t rsrc) {
     if (Fifo* f = fifo_of(ins, rsrc)) f->pending = f->armed = false;
 }
+// CLIO's current address of the channel (0x3300400 + 16 * channel): the next byte it fetches, the
+// current chunk's address plus what has been read of it (no FIFO buffering ahead, as the reads);
+// the folio's silence at `silence`; 0 for a channel never set.
+uint32_t pf_dsp_dma_address(int32_t ins, uint32_t rsrc, uint32_t silence) {
+    Fifo* f = fifo_of(ins, rsrc);
+    if (!f) return 0;
+    return (f->cur.silence ? silence : f->cur.addr) + f->pos;
+}
 
 // Every frame up to the guest's present, and what they make to the WAV and the window.
 void pf_dsp_sync() {
