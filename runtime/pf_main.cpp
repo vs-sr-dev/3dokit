@@ -2,7 +2,7 @@
 // runtime, tracing its OS calls.
 //
 //     pfboot PROGRAM [--trace N] [--lenient] [--max-calls N] [--snap N DIR] [--disc DIR] [--nvram DIR]
-//                    [--cmdline LINE]
+//                    [--nvram-blank] [--cmdline LINE]
 //                    [--frames DIR [--frames-at FIRST[-LAST][/EVERY]]] [--pad BUTTONS@FIELD[xN][/E][+H]]...
 //                    [--window [--record FILE]] [--wav FILE] [--dsp-code] [--dsp-check]
 //
@@ -16,7 +16,8 @@
 // disc's root, where the program's files are; by default the program's own
 // directory. --nvram DIR keeps the console's NVRAM in DIR/nvram.bin between
 // runs (pf_nvram.cpp); without it the NVRAM is blank at each start, as a
-// fresh console's. --cmdline LINE gives PROGRAM the command line the shell
+// fresh console's; with it, --boot on a blank one runs the disc's own FORMAT
+// first, as a console comes formatted, unless --nvram-blank. --cmdline LINE gives PROGRAM the command line the shell
 // would (its name first: "format ram 3 0 nvram", the disc's FORMAT making a
 // blank NVRAM a filesystem, which 21.10's LMADM does not do). --frames DIR
 // writes what the display shows, at each vertical blank that changes it, as a
@@ -184,6 +185,7 @@ int main(int argc, char** argv) {
         }
         else if (!std::strcmp(argv[i], "--disc") && i + 1 < argc) disc = argv[++i];
         else if (!std::strcmp(argv[i], "--nvram") && i + 1 < argc) pf_nvram_dir(argv[++i]);
+        else if (!std::strcmp(argv[i], "--nvram-blank")) g_pf_nvram_keep_blank = true;
         else if (!std::strcmp(argv[i], "--frames") && i + 1 < argc) g_pf_frames_dir = argv[++i];
         else if (!std::strcmp(argv[i], "--frames-at") && i + 1 < argc) {
             if (!frames_at_option(argv[++i])) {

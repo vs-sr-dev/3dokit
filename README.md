@@ -30,8 +30,7 @@ in the ports.
 | [pc-crashnburn](https://github.com/vs-sr-dev/pc-crashnburn) | Crash 'n Burn (1993, 3DO; the launch OS) | the route itself: the ARM60 decoder and interpreter, the static recompiler and its self-test, and the Portfolio runtime built call by call on the 1993 OS's own code -- the kernel, the File folio and the shell, the Graphics folio and the cel engine, the audio folio and the DSP, the event broker and the pad, `pfcheck` against the OS's own code. **Playable**, at par with the Phoenix emulator |
 | [pc-doctorhauzer](https://github.com/vs-sr-dev/pc-doctorhauzer) | Doctor Hauzer (1994, 3DO; Portfolio 20.21) | the OS between the other two: each folio's own version deciding the runtime's way rather than the kernel's release, and the folios' nodes carrying the versions the kernel gives them; a kernel with no relocation list (`aif`); the System images' decompressor in C++, GRAPHIX laid in the OS's memory and its built-in font, `GetSysErr` from the disc's own texts; the save -- the `ram` device, the console's NVRAM and the File folio 20.30's linked-memory filesystem, the disc's own `LMADM` and `FORMAT` run by the shell --; OPERAMATH 20.53, `SleepAudioTicks`, the timer's microseconds, an AIFF's rate read as the folio reads it, and the kernel's quantum. **Playable**: the opening, the menu and the real-time 3D rooms, in the window with their music |
 | [pc-escapefrommonstermanor](https://github.com/vs-sr-dev/pc-escapefrommonstermanor) | Escape from Monster Manor (1993, 3DO; Portfolio 21.10) | the fourth release of the OS: a function reached only by a pointer from a literal pool (`recomp.discover`), cels whose preamble opens their pixel data and DataStreams with no header in the file readers, Operamath's `MulMat33Mat33_F16`, Graphics' `FillRect`, the audio folio's envelopes, and a folio's build as well as its version (GRAPHIX 20.45's two builds, the font laid by build; `pfcheck` on both). **Playable**: the first level in the window with its music; the monsters animate at twice the console's pace, the cel engine's time not yet charged |
-
-| [pc-theneedforspeed](https://github.com/vs-sr-dev/pc-theneedforspeed) | The Need for Speed (1994, 3DO; Portfolio 21.10, Escape from Monster Manor's images) | code the game loads itself: an overlay read into memory and entered at its AIF header, which it has patched (`mov rN, pc` as a call through rN; a module known by its read-only area past the header, and the header run); discovery's computed jumps (`add pc, pc, rX`) and the entries only pointers name (a hook's variable, a table of services, wrappers, frameless callbacks); the game's own VDLs (`SubmitVDL`'s proof and copy, `SetVDL`) and bitmaps; the audio folio's pause and samples from AIFF images in memory; `Cross3_F16`; a DataStream led by a block of `FILL`; the disc's name in `GetDirectory`; the event broker's queue. **Runs to the race**: the films, the menus, and the race, headless at about 2.5 times the console's speed |
+| [pc-theneedforspeed](https://github.com/vs-sr-dev/pc-theneedforspeed) | The Need for Speed (1994, 3DO; Portfolio 21.10, Escape from Monster Manor's images) | code the game loads itself: an overlay read into memory and entered at its AIF header, which it has patched (`mov rN, pc` as a call through rN; a module known by its read-only area past the header, and the header run); discovery's computed jumps (`add pc, pc, rX`) and the entries only pointers name (a hook's variable, a table of services, wrappers, frameless callbacks); the game's own VDLs (`SubmitVDL`'s proof and copy, `SetVDL`) and bitmaps; the audio folio's pause and samples from AIFF images in memory; `Cross3_F16`; a DataStream led by a block of `FILL`; the disc's name in `GetDirectory`; the event broker's queue. **Playable**: the films, the menus and the race in the window, at the console's speed and smooth (the user's first race); the race waits for the first gear, as the game does |
 
 The five ports keep their game's knowledge to themselves and hold every
 kit change against each other: a commit to the kit is checked on every
@@ -100,6 +99,7 @@ build/recomp-build/pfboot DISC --boot --window             # the disc as the con
 build/recomp-build/pfboot GAME --max-calls N --wav out.wav # the sound, in the guest's time (the window plays it too)
 build/recomp-build/pfboot GAME --dsp-check                 # every DSP model held against its own code, frame by frame
 build/recomp-build/pfboot DISC --boot --nvram DIR          # the console's NVRAM kept in DIR/nvram.bin between runs
+                                                           # (blank: the disc's FORMAT first, as a console comes; --nvram-blank keeps it so)
 build/recomp-build/pfboot DISC/System/Programs/FORMAT --disc DISC --nvram DIR --cmdline "format ram 3 0 nvram"   # a program given its command line
 python -m 3dokit.pfcheck DISC/System/Kernel/os_code DIR --graphix DISC/System/Folios/GRAPHIX   # ...on the folio's
 python -m 3dokit.aif --decompress DISC/System/Folios/GRAPHIX graphix.bin   # by its own decompressor
@@ -461,7 +461,8 @@ Of the runtime it asked the game's own VDLs and bitmaps, the audio folio's
 pause and samples from AIFF images in memory, the cross product, the
 event broker's queue (whose old note was wrong), and the disc's name in
 `GetDirectory` ("/CD-ROM", as the console mounts it), which moved three
-other ports' traces the console's way. Its race runs.
+other ports' traces the console's way -- and a blank NVRAM formatted by
+the disc's own FORMAT before the boot, as a console comes. Its race plays.
 
 ## Licence
 

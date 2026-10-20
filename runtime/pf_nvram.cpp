@@ -66,6 +66,15 @@ std::vector<uint8_t>& pf_nvram() {
     return g_nvram;
 }
 
+bool g_pf_nvram_keep_blank;
+
+bool pf_nvram_kept_blank() {
+    if (g_dir.empty()) return false;
+    for (uint8_t b : pf_nvram())
+        if (b) return false;
+    return true;
+}
+
 void pf_nvram_written() {
     if (g_dir.empty()) return;
     std::ofstream f(file_of(), std::ios::binary);

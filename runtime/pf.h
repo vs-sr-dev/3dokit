@@ -259,6 +259,11 @@ uint32_t pf_ram_device();                       // its node
 void     pf_nvram_dir(const char* dir);
 std::vector<uint8_t>& pf_nvram();
 void     pf_nvram_written();
+// A kept NVRAM (pf_nvram_dir) that is blank, every byte 0: a console never has one -- it leaves
+// the factory formatted -- and pfboot --boot has the disc's own FORMAT lay its filesystem out
+// first (pf_shell_boot), unless g_pf_nvram_keep_blank (pfboot --nvram-blank).
+bool     pf_nvram_kept_blank();
+extern bool g_pf_nvram_keep_blank;
 // What the OS's own code asks of the kernel, as a program's SWI would: CreateIOReq on a device
 // (CREATEIOREQ_TAG_DEVICE alone), SendIO with the IOInfo at guest address `info`, DeleteItem.
 int32_t  pf_create_ioreq(ArmCpu& c, int32_t device);

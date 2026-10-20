@@ -2137,6 +2137,16 @@ int pf_shell_boot(int (*run)(const std::string& host, const std::string& cmdline
     g_aliases.clear();
     g_aliases[0]["boot"] = "/";
     std::string at;
+    // A kept NVRAM that is blank: as the factory leaves a console's, the disc's own FORMAT makes it a
+    // linked-memory filesystem first, with the command line LMADM gives it ("format ram 3 0 nvram":
+    // Doctor Hauzer's LMADM 20.x does that itself on a blank one; Escape from Monster Manor's and
+    // The Need for Speed's 21.10 does not, and the game finds no /nvram). Only when this build has
+    // the program's module; pfboot --nvram-blank keeps it blank.
+    if (pf_nvram_kept_blank() && !g_pf_nvram_keep_blank && !walk("/System/Programs/FORMAT", at) && !is_dir(at) &&
+        has_module(host_of(at).string())) {
+        pf_log("the shell: the NVRAM is blank -- the disc's FORMAT lays its filesystem out, as a console's comes\n");
+        run(host_of(at).string(), "format ram 3 0 nvram");
+    }
     if (!walk("^/system/scripts/startopera", at)) shell_carry_out(at, 0);
     else pf_log("the shell: no ^/system/scripts/startopera\n");
     g_cwd = "/";
