@@ -12,7 +12,7 @@ the DSP, the drive and the Control Port's pad and light gun.
 
 The same idea as [wiikit](https://github.com/vs-sr-dev/wiikit),
 [saturnkit](https://github.com/vs-sr-dev/saturnkit),
-[ps2kit](https://github.com/vs-sr-dev/pc-extermination/tree/main/ps2kit)
+[ps2kit](https://github.com/vs-sr-dev/ps2kit)
 and jaguarkit, for the 3DO. Each 3DO game has its own engine and formats,
 but a large part of every port is the *same* work: the same Opera disc, the
 same AIF executables loaded by the same Portfolio, the same CEL engine
